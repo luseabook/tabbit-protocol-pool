@@ -1,0 +1,16 @@
+{
+  "name": "tabbit-protocol-pool",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Protocol-first Tabbit account pool gateway foundation.",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "tabbit-pool": "./bin/tabbit-pool.js"
+  }
+}
