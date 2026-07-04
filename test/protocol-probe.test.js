@@ -9,6 +9,7 @@ import {
   ProtocolProbeRunner,
   buildProtocolProbeFixture,
 } from "../src/protocol-probe.js";
+import { buildProtocolFixtureAudit } from "../src/observability.js";
 
 const NOW = "2026-07-02T03:00:00.000Z";
 
@@ -295,6 +296,441 @@ test("ProtocolProbeRunner dispatches uploadAttachment with hydrated session and 
   assert.equal(serialized.includes("tabbit_session=upload-secret"), false);
   assert.equal(serialized.includes("secret-token"), false);
   assert.equal(serialized.includes("base64-probe-payload"), false);
+});
+
+test("ProtocolProbeRunner preserves safe upstream evidence markers for live sendMessage fixtures", async () => {
+  const events = [];
+  const runner = new ProtocolProbeRunner({
+    accountStore: memoryAccountStore([{ id: "acct_stream", status: "active", email: "stream@example.test", cookieJarRef: "secrets/acct_stream.cookie" }]),
+    secretStore: memorySecretStore({ "secrets/acct_stream.cookie": "placeholder-stream-session" }),
+    fixtureStore: memoryFixtureStore(events),
+    now: () => NOW,
+    protocolClientFactory(account) {
+      return {
+        async sendMessage({ account: runtimeAccount, messages, stream }) {
+          events.push(["sendMessage", account.id, runtimeAccount.cookieHeader, messages[0].content, stream]);
+          return {
+            ok: true,
+            upstreamEvidence: {
+              source: "tabbit-live",
+              real: true,
+              stream: true,
+              format: "sse",
+              backpressure: true,
+              firstTokenFlush: true,
+              delayedSecondChunk: true,
+            },
+            raw: {
+              kind: "stream",
+              format: "sse",
+              events: [{ event: "message", data: "private upstream text" }],
+            },
+            streamDeltas: ["private upstream text"],
+          };
+        },
+      };
+    },
+  });
+
+  const result = await runner.probeAccount({
+    accountId: "acct_stream",
+    operation: "sendMessage",
+    input: {
+      model: "tabbit/priority",
+      messages: [{ role: "user", content: "private prompt should not persist" }],
+      stream: true,
+    },
+    writeFixture: true,
+  });
+
+  assert.equal(result.status, "success");
+  assert.deepEqual(events[0], ["sendMessage", "acct_stream", "placeholder-stream-session", "private prompt should not persist", true]);
+  assert.equal(events[1][0], "writeFixture");
+  const fixture = events[1][1];
+  assert.equal(fixture.operation, "sendMessage");
+  assert.deepEqual(fixture.result.upstreamEvidence, {
+    source: "tabbit-live",
+    real: true,
+    stream: true,
+    format: "sse",
+    backpressure: true,
+    firstTokenFlush: true,
+    delayedSecondChunk: true,
+  });
+  assert.deepEqual(fixture.result.streamDeltas, ["***"]);
+  const serialized = JSON.stringify(fixture);
+  assert.doesNotMatch(serialized, /stream-secret|private prompt|private upstream text/);
+
+  const audit = buildProtocolFixtureAudit({ scope: "upstream", fixtures: [fixture], now: () => NOW });
+  assert.equal(audit.counts.realUpstream, 1);
+  assert.equal(audit.counts.upstreamBackpressure, 1);
+  assert.equal(audit.coverage.upstreamBackpressure.status, "ready");
+});
+
+test("ProtocolProbeRunner uses redacted default sendMessage content when input is omitted", async () => {
+  const events = [];
+  const runner = new ProtocolProbeRunner({
+    accountStore: memoryAccountStore([{ id: "acct_default_send", status: "active", email: "default-send@example.test", cookieJarRef: "secrets/acct_default_send.cookie" }]),
+    secretStore: memorySecretStore({ "secrets/acct_default_send.cookie": "placeholder-default-send-session" }),
+    now: () => NOW,
+    protocolClientFactory() {
+      return {
+        async sendMessage({ account: runtimeAccount, messages, stream }) {
+          events.push(["sendMessage", runtimeAccount.cookieHeader, messages[0].content, stream]);
+          return { ok: true, content: "private upstream text" };
+        },
+      };
+    },
+  });
+
+  const result = await runner.probeAccount({
+    accountId: "acct_default_send",
+    operation: "sendMessage",
+  });
+
+  assert.equal(result.status, "success");
+  assert.deepEqual(events[0], ["sendMessage", "placeholder-default-send-session", "<redacted-message-content>", false]);
+  const serialized = JSON.stringify(result.fixture);
+  assert.doesNotMatch(serialized, /\bping\b|placeholder-default-send-session|private upstream text/);
+});
+
+test("ProtocolProbeRunner captures bounded async stream backpressure evidence without raw text", async () => {
+  const events = [];
+  const consumed = [];
+  let closed = false;
+  const streamDeltas = {
+    async *[Symbol.asyncIterator]() {
+      try {
+        consumed.push("first");
+        yield "private first token";
+        consumed.push("second");
+        yield "private second token";
+        consumed.push("third");
+        yield "private third token";
+      } finally {
+        closed = true;
+      }
+    },
+  };
+  const runner = new ProtocolProbeRunner({
+    accountStore: memoryAccountStore([{ id: "acct_stream_capture", status: "active", email: "stream-capture@example.test", cookieJarRef: "secrets/acct_stream_capture.cookie" }]),
+    secretStore: memorySecretStore({ "secrets/acct_stream_capture.cookie": "placeholder-stream-capture-session" }),
+    fixtureStore: memoryFixtureStore(events),
+    now: () => NOW,
+    protocolClientFactory(account) {
+      return {
+        async sendMessage({ account: runtimeAccount, messages, stream }) {
+          events.push(["sendMessage", account.id, runtimeAccount.cookieHeader, messages[0].content, stream]);
+          return {
+            ok: true,
+            upstreamEvidence: {
+              source: "tabbit-live",
+              real: true,
+              stream: true,
+              format: "sse",
+            },
+            raw: { kind: "stream", format: "sse", async: true, events: [] },
+            streamDeltas,
+          };
+        },
+      };
+    },
+  });
+
+  const result = await runner.probeAccount({
+    accountId: "acct_stream_capture",
+    operation: "sendMessage",
+    input: {
+      model: "tabbit/priority",
+      messages: [{ role: "user", content: "private prompt should not persist" }],
+      stream: true,
+      streamEvidence: {
+        mode: "first_token_backpressure",
+        maxDeltas: 2,
+      },
+    },
+    writeFixture: true,
+  });
+
+  assert.equal(result.status, "success");
+  assert.deepEqual(consumed, ["first", "second"]);
+  assert.equal(closed, true);
+  assert.equal(events[1][0], "writeFixture");
+  const fixture = events[1][1];
+  assert.equal(fixture.operation, "sendMessage");
+  assert.equal(fixture.result.upstreamEvidence.backpressure, true);
+  assert.equal(fixture.result.upstreamEvidence.firstTokenFlush, true);
+  assert.equal(fixture.result.upstreamEvidence.delayedSecondChunk, true);
+  const serialized = JSON.stringify(fixture);
+  assert.doesNotMatch(serialized, /stream-capture-secret|private prompt|private first token|private second token|private third token/);
+
+  const audit = buildProtocolFixtureAudit({ scope: "upstream", fixtures: [fixture], now: () => NOW });
+  assert.equal(audit.counts.upstreamBackpressure, 1);
+  assert.equal(audit.coverage.upstreamBackpressure.status, "ready");
+});
+
+test("ProtocolProbeRunner fails streamEvidence probes without a real async upstream marker", async () => {
+  const events = [];
+  const streamDeltas = {
+    async *[Symbol.asyncIterator]() {
+      yield "private unmarked stream text";
+    },
+  };
+  const runner = new ProtocolProbeRunner({
+    accountStore: memoryAccountStore([{ id: "acct_stream_unmarked", status: "active", email: "stream-unmarked@example.test", cookieJarRef: "secrets/acct_stream_unmarked.cookie" }]),
+    secretStore: memorySecretStore({ "secrets/acct_stream_unmarked.cookie": "placeholder-stream-unmarked-session" }),
+    fixtureStore: memoryFixtureStore(events),
+    now: () => NOW,
+    protocolClientFactory() {
+      return {
+        async sendMessage({ account: runtimeAccount, messages }) {
+          events.push(["sendMessage", runtimeAccount.cookieHeader, messages[0].content]);
+          return {
+            ok: true,
+            raw: { kind: "stream", format: "sse", async: true, events: [] },
+            streamDeltas,
+          };
+        },
+      };
+    },
+  });
+
+  const result = await runner.probeAccount({
+    accountId: "acct_stream_unmarked",
+    operation: "sendMessage",
+    input: {
+      model: "tabbit/priority",
+      messages: [{ role: "user", content: "private unmarked prompt should not persist" }],
+      stream: true,
+      streamEvidence: {
+        mode: "cancel_after_first_delta",
+        maxDeltas: 2,
+      },
+    },
+    writeFixture: true,
+  });
+
+  assert.equal(result.status, "failed");
+  assert.equal(events[1][0], "writeFixture");
+  const fixture = events[1][1];
+  assert.equal(fixture.error.code, "STREAM_EVIDENCE_NOT_CAPTURED");
+  assert.equal(fixture.result.upstreamEvidence, undefined);
+  const audit = buildProtocolFixtureAudit({ scope: "upstream", fixtures: [fixture], now: () => NOW });
+  assert.equal(audit.counts.realUpstream, 0);
+  assert.equal(audit.counts.upstreamCancellation, 0);
+  const serialized = JSON.stringify(fixture);
+  assert.doesNotMatch(serialized, /stream-unmarked-secret|private unmarked prompt|private unmarked stream text/);
+});
+
+test("ProtocolProbeRunner fails backpressure streamEvidence when the second delta is missing", async () => {
+  const events = [];
+  const consumed = [];
+  const streamDeltas = {
+    async *[Symbol.asyncIterator]() {
+      consumed.push("first");
+      yield "private lone token";
+    },
+  };
+  const runner = new ProtocolProbeRunner({
+    accountStore: memoryAccountStore([{ id: "acct_stream_short", status: "active", email: "stream-short@example.test", cookieJarRef: "secrets/acct_stream_short.cookie" }]),
+    secretStore: memorySecretStore({ "secrets/acct_stream_short.cookie": "placeholder-stream-short-session" }),
+    fixtureStore: memoryFixtureStore(events),
+    now: () => NOW,
+    protocolClientFactory() {
+      return {
+        async sendMessage({ account: runtimeAccount, messages }) {
+          events.push(["sendMessage", runtimeAccount.cookieHeader, messages[0].content]);
+          return {
+            ok: true,
+            upstreamEvidence: {
+              source: "tabbit-live",
+              real: true,
+              stream: true,
+              format: "sse",
+            },
+            raw: { kind: "stream", format: "sse", async: true, events: [] },
+            streamDeltas,
+          };
+        },
+      };
+    },
+  });
+
+  const result = await runner.probeAccount({
+    accountId: "acct_stream_short",
+    operation: "sendMessage",
+    input: {
+      model: "tabbit/priority",
+      messages: [{ role: "user", content: "private short stream prompt should not persist" }],
+      stream: true,
+      streamEvidence: {
+        mode: "first_token_backpressure",
+        maxDeltas: 2,
+      },
+    },
+    writeFixture: true,
+  });
+
+  assert.equal(result.status, "failed");
+  assert.deepEqual(consumed, ["first"]);
+  assert.equal(events[1][0], "writeFixture");
+  const fixture = events[1][1];
+  assert.equal(fixture.error.code, "STREAM_EVIDENCE_NOT_CAPTURED");
+  assert.equal(fixture.result.upstreamEvidence.backpressure, undefined);
+  assert.equal(fixture.result.upstreamEvidence.firstTokenFlush, undefined);
+  assert.equal(fixture.result.upstreamEvidence.delayedSecondChunk, undefined);
+  const audit = buildProtocolFixtureAudit({ scope: "upstream", fixtures: [fixture], now: () => NOW });
+  assert.equal(audit.counts.realUpstream, 1);
+  assert.equal(audit.counts.upstreamBackpressure, 0);
+  const serialized = JSON.stringify(fixture);
+  assert.doesNotMatch(serialized, /stream-short-secret|private short stream prompt|private lone token/);
+});
+
+test("ProtocolProbeRunner captures async stream cancellation evidence without raw text", async () => {
+  const events = [];
+  const consumed = [];
+  let closed = false;
+  const streamDeltas = {
+    async *[Symbol.asyncIterator]() {
+      try {
+        consumed.push("first");
+        yield "private first cancellation token";
+        consumed.push("second");
+        yield "private second cancellation token";
+      } finally {
+        closed = true;
+      }
+    },
+  };
+  const runner = new ProtocolProbeRunner({
+    accountStore: memoryAccountStore([{ id: "acct_stream_cancel", status: "active", email: "stream-cancel@example.test", cookieJarRef: "secrets/acct_stream_cancel.cookie" }]),
+    secretStore: memorySecretStore({ "secrets/acct_stream_cancel.cookie": "placeholder-stream-cancel-session" }),
+    fixtureStore: memoryFixtureStore(events),
+    now: () => NOW,
+    protocolClientFactory(account) {
+      return {
+        async sendMessage({ account: runtimeAccount, messages, stream }) {
+          events.push(["sendMessage", account.id, runtimeAccount.cookieHeader, messages[0].content, stream]);
+          return {
+            ok: true,
+            upstreamEvidence: {
+              source: "tabbit-live",
+              real: true,
+              stream: true,
+              format: "sse",
+            },
+            raw: { kind: "stream", format: "sse", async: true, events: [] },
+            streamDeltas,
+          };
+        },
+      };
+    },
+  });
+
+  const result = await runner.probeAccount({
+    accountId: "acct_stream_cancel",
+    operation: "sendMessage",
+    input: {
+      model: "tabbit/priority",
+      messages: [{ role: "user", content: "private cancellation prompt should not persist" }],
+      stream: true,
+      streamEvidence: {
+        mode: "cancel_after_first_delta",
+        maxDeltas: 2,
+      },
+    },
+    writeFixture: true,
+  });
+
+  assert.equal(result.status, "success");
+  assert.deepEqual(consumed, ["first"]);
+  assert.equal(closed, true);
+  assert.equal(events[1][0], "writeFixture");
+  const fixture = events[1][1];
+  assert.equal(fixture.operation, "sendMessage");
+  assert.equal(fixture.result.upstreamEvidence.cancellation, true);
+  const serialized = JSON.stringify(fixture);
+  assert.doesNotMatch(serialized, /stream-cancel-secret|private cancellation prompt|private first cancellation token|private second cancellation token/);
+
+  const audit = buildProtocolFixtureAudit({ scope: "upstream", fixtures: [fixture], now: () => NOW });
+  assert.equal(audit.counts.upstreamCancellation, 1);
+  assert.equal(audit.coverage.upstreamCancellation.status, "ready");
+});
+
+test("ProtocolProbeRunner captures async stream error-frame evidence without raw text", async () => {
+  const events = [];
+  const consumed = [];
+  const streamDeltas = {
+    async *[Symbol.asyncIterator]() {
+      consumed.push("first");
+      yield "private first error token";
+      const error = new Error("private upstream error frame should not persist");
+      error.category = "protocol_changed";
+      error.code = "UPSTREAM_STREAM_ERROR";
+      error.status = 502;
+      throw error;
+    },
+  };
+  const runner = new ProtocolProbeRunner({
+    accountStore: memoryAccountStore([{ id: "acct_stream_error", status: "active", email: "stream-error@example.test", cookieJarRef: "secrets/acct_stream_error.cookie" }]),
+    secretStore: memorySecretStore({ "secrets/acct_stream_error.cookie": "placeholder-stream-error-session" }),
+    fixtureStore: memoryFixtureStore(events),
+    now: () => NOW,
+    protocolClientFactory(account) {
+      return {
+        async sendMessage({ account: runtimeAccount, messages, stream }) {
+          events.push(["sendMessage", account.id, runtimeAccount.cookieHeader, messages[0].content, stream]);
+          return {
+            ok: true,
+            upstreamEvidence: {
+              source: "tabbit-live",
+              real: true,
+              stream: true,
+              format: "sse",
+            },
+            raw: {
+              kind: "stream",
+              format: "sse",
+              async: true,
+              events: [{ event: "error", data: "private raw error frame should not persist" }],
+            },
+            streamDeltas,
+          };
+        },
+      };
+    },
+  });
+
+  const result = await runner.probeAccount({
+    accountId: "acct_stream_error",
+    operation: "sendMessage",
+    input: {
+      model: "tabbit/priority",
+      messages: [{ role: "user", content: "private error prompt should not persist" }],
+      stream: true,
+      streamEvidence: {
+        mode: "error_frame",
+        maxDeltas: 2,
+      },
+    },
+    writeFixture: true,
+  });
+
+  assert.equal(result.status, "failed");
+  assert.deepEqual(consumed, ["first"]);
+  assert.equal(events[1][0], "writeFixture");
+  const fixture = events[1][1];
+  assert.equal(fixture.operation, "sendMessage");
+  assert.equal(fixture.result.upstreamEvidence.streamErrorFrame, true);
+  assert.equal(fixture.error.category, "protocol_changed");
+  assert.equal(fixture.error.code, "UPSTREAM_STREAM_ERROR");
+  assert.equal(fixture.error.status, 502);
+  const serialized = JSON.stringify(fixture);
+  assert.doesNotMatch(serialized, /stream-error-secret|private error prompt|private first error token|private upstream error frame|private raw error frame/);
+
+  const audit = buildProtocolFixtureAudit({ scope: "upstream", fixtures: [fixture], now: () => NOW });
+  assert.equal(audit.counts.upstreamErrorFrame, 1);
+  assert.equal(audit.coverage.upstreamErrorFrame.status, "ready");
 });
 
 test("ProtocolProbeRunner dispatches read-only benefits probes with hydrated session", async () => {

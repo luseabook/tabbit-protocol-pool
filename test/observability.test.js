@@ -693,6 +693,13 @@ test("buildProtocolFixtureAudit supports session lifecycle fixture scope", () =>
   assert.equal(audit.recoveryStrategy.status, "blocked");
   assert.equal(audit.recoveryStrategy.current, "manual_reimport_then_probe");
   assert.equal(audit.recoveryStrategy.automatedRefresh, "not_calibrated");
+  assert.equal(audit.manualCookieOperations.status, "ready");
+  assert.equal(audit.manualCookieOperations.mode, "manual_reimport_then_probe");
+  assert.equal(audit.manualCookieOperations.expiredSessionAction, "login_expired_then_manual_reimport");
+  assert.equal(audit.manualCookieOperations.automatedRefreshRequired, false);
+  assert.deepEqual(audit.manualCookieOperations.missing, []);
+  assert.deepEqual(audit.manualCookieOperations.blockingMissing, []);
+  assert.deepEqual(audit.manualCookieOperations.backlogMissing, ["automated_session_refresh_strategy"]);
   assert.deepEqual(audit.missing, ["automated_session_refresh_strategy"]);
   assert.ok(audit.nextActions.some((action) => action.includes("session refresh")));
   const serialized = JSON.stringify(audit);
@@ -728,6 +735,10 @@ test("buildProtocolFixtureAudit keeps session scope blocked until refresh strate
   assert.equal(audit.recoveryStrategy.automatedRefresh, "not_calibrated");
   assert.equal(audit.recoveryStrategy.status, "blocked");
   assert.equal(audit.status, "blocked");
+  assert.equal(audit.manualCookieOperations.status, "ready");
+  assert.deepEqual(audit.manualCookieOperations.missing, []);
+  assert.deepEqual(audit.manualCookieOperations.blockingMissing, []);
+  assert.deepEqual(audit.manualCookieOperations.backlogMissing, ["automated_session_refresh_strategy"]);
   assert.deepEqual(audit.missing, ["automated_session_refresh_strategy"]);
   assert.ok(audit.nextActions.some((action) => action.includes("refresh")));
   const serialized = JSON.stringify(audit);
@@ -759,9 +770,15 @@ test("buildProtocolFixtureAudit accepts explicit session recovery strategy evide
         evidence: {
           strategy: "automated_reauth",
           automatedRefresh: "calibrated_reauth_probe",
+          observedWindowMs: 86400000,
+          resultHash: "sha256:recovery-result-shape",
           safe: true,
           sanitized: true,
           rawPayload: false,
+        },
+        result: {
+          expiredBeforeRecovery: true,
+          recoveredVerifySession: true,
         },
       },
     ],
@@ -777,11 +794,115 @@ test("buildProtocolFixtureAudit accepts explicit session recovery strategy evide
   assert.equal(audit.recoveryStrategy.status, "ready");
   assert.equal(audit.recoveryStrategy.current, "automated_reauth");
   assert.equal(audit.recoveryStrategy.automatedRefresh, "calibrated_reauth_probe");
+  assert.equal(audit.recoveryStrategy.observedWindowMs, 86_400_000);
+  assert.equal(audit.manualCookieOperations.status, "ready");
+  assert.deepEqual(audit.manualCookieOperations.missing, []);
   assert.deepEqual(audit.missing, []);
   assert.deepEqual(audit.nextActions, []);
   const serialized = JSON.stringify(audit);
   assert.equal(serialized.includes("user_123"), false);
   assert.equal(serialized.includes("token=secret"), false);
+});
+
+test("buildProtocolFixtureAudit rejects marker-only session recovery evidence", () => {
+  const audit = buildProtocolFixtureAudit({
+    scope: "session",
+    fixtures: [
+      {
+        operation: "verifySession",
+        status: "success",
+        observedAt: "2026-07-02T03:00:00.000Z",
+        result: { ok: true, userId: "user_123" },
+      },
+      {
+        operation: "verifySession",
+        status: "failed",
+        observedAt: "2026-07-03T03:00:00.000Z",
+        error: { category: "login_required", status: 401, message: "expired token=secret" },
+      },
+      {
+        kind: "session_recovery_strategy",
+        operation: "recoverSession",
+        status: "success",
+        evidence: {
+          strategy: "automated_reauth",
+          automatedRefresh: "calibrated_reauth_probe",
+          safe: true,
+          sanitized: true,
+          rawPayload: false,
+        },
+        result: {
+          raw: { cookie: "***" },
+        },
+      },
+    ],
+    now: () => NOW,
+  });
+
+  assert.equal(audit.scope, "session");
+  assert.equal(audit.status, "blocked");
+  assert.equal(audit.coverage.successfulSessionVerify.status, "ready");
+  assert.equal(audit.coverage.expiredSessionSignal.status, "ready");
+  assert.equal(audit.counts.recoveryStrategyEvidence, 0);
+  assert.equal(audit.recoveryStrategy.status, "blocked");
+  assert.equal(audit.recoveryStrategy.current, "manual_reimport_then_probe");
+  assert.equal(audit.recoveryStrategy.automatedRefresh, "not_calibrated");
+  assert.equal(audit.manualCookieOperations.status, "ready");
+  assert.deepEqual(audit.manualCookieOperations.missing, []);
+  assert.deepEqual(audit.missing, ["automated_session_refresh_strategy"]);
+  const serialized = JSON.stringify(audit);
+  assert.equal(serialized.includes("user_123"), false);
+  assert.equal(serialized.includes("token=secret"), false);
+  assert.equal(serialized.includes("tabbit_session=secret"), false);
+});
+
+test("buildProtocolFixtureAudit reports rejected session recovery evidence without satisfying recovery readiness", () => {
+  const audit = buildProtocolFixtureAudit({
+    scope: "session",
+    fixtures: [
+      {
+        operation: "verifySession",
+        status: "success",
+        observedAt: "2026-07-02T03:00:00.000Z",
+        result: { ok: true, userId: "user_123" },
+      },
+      {
+        operation: "verifySession",
+        status: "failed",
+        observedAt: "2026-07-03T03:00:00.000Z",
+        error: { category: "login_required", status: 401, message: "expired token=secret" },
+      },
+      {
+        kind: "session_recovery_strategy",
+        operation: "recoverSession",
+        status: "success",
+        evidence: {
+          strategy: "automated_reauth",
+          automatedRefresh: "calibrated_reauth_probe",
+          safe: true,
+          sanitized: true,
+          rawPayload: false,
+        },
+        result: {
+          raw: { cookie: "***" },
+        },
+      },
+    ],
+    now: () => NOW,
+  });
+
+  assert.equal(audit.scope, "session");
+  assert.equal(audit.status, "blocked");
+  assert.equal(audit.coverage.successfulSessionVerify.status, "ready");
+  assert.equal(audit.coverage.expiredSessionSignal.status, "ready");
+  assert.equal(audit.counts.recoveryStrategyEvidence, 0);
+  assert.equal(audit.counts.rejectedRecoveryStrategyEvidence, 1);
+  assert.equal(audit.recoveryStrategy.status, "blocked");
+  assert.equal(audit.recoveryStrategy.current, "manual_reimport_then_probe");
+  assert.equal(audit.recoveryStrategy.automatedRefresh, "not_calibrated");
+  assert.deepEqual(audit.missing, ["automated_session_refresh_strategy"]);
+  const serialized = JSON.stringify(audit);
+  assert.doesNotMatch(serialized, /user_123|token=secret|tabbit_session=secret/);
 });
 
 test("buildProtocolFixtureAudit keeps local session_missing separate from upstream expiration", () => {
@@ -818,6 +939,8 @@ test("buildProtocolFixtureAudit keeps local session_missing separate from upstre
   assert.equal(audit.counts.success, 1);
   assert.equal(audit.counts.failed, 1);
   assert.equal(audit.coverage.expiredSessionSignal.status, "missing");
+  assert.deepEqual(audit.manualCookieOperations.blockingMissing, ["expired_verifySession_fixture"]);
+  assert.deepEqual(audit.manualCookieOperations.backlogMissing, ["automated_session_refresh_strategy"]);
   assert.deepEqual(audit.missing, ["expired_verifySession_fixture", "automated_session_refresh_strategy"]);
 });
 
@@ -914,6 +1037,83 @@ test("buildProtocolFixtureAudit requires stream metadata for real upstream bound
   assert.doesNotMatch(JSON.stringify(audit), /secret upstream text/);
 });
 
+test("buildProtocolFixtureAudit requires explicit upstream marker for stream boundary evidence", () => {
+  const audit = buildProtocolFixtureAudit({
+    scope: "upstream",
+    fixtures: [
+      {
+        kind: "protocol_probe",
+        operation: "sendMessage",
+        status: "success",
+        result: {
+          raw: {
+            kind: "stream",
+            format: "sse",
+            events: [{ event: "message", data: "secret stream text" }],
+          },
+          streamDeltas: ["secret stream text"],
+        },
+      },
+    ],
+    now: () => NOW,
+  });
+
+  assert.equal(audit.scope, "upstream");
+  assert.equal(audit.status, "blocked");
+  assert.equal(audit.counts.total, 1);
+  assert.equal(audit.counts.realUpstream, 0);
+  assert.equal(audit.counts.upstreamErrorFrame, 0);
+  assert.equal(audit.counts.upstreamCancellation, 0);
+  assert.equal(audit.counts.upstreamBackpressure, 0);
+  assert.equal(audit.coverage.upstreamErrorFrame.status, "missing");
+  assert.equal(audit.coverage.upstreamCancellation.status, "missing");
+  assert.equal(audit.coverage.upstreamBackpressure.status, "missing");
+  assert.deepEqual(audit.missing, [
+    "real_upstream_error_frame_fixture",
+    "real_upstream_cancellation_fixture",
+    "real_upstream_backpressure_fixture",
+  ]);
+  assert.doesNotMatch(JSON.stringify(audit), /secret stream text/);
+});
+
+test("buildProtocolFixtureAudit rejects generic protocol source as real upstream marker", () => {
+  const audit = buildProtocolFixtureAudit({
+    scope: "upstream",
+    fixtures: [
+      {
+        operation: "sendMessage",
+        status: "success",
+        source: "protocol-client",
+        upstreamEvidence: { cancellation: true },
+        result: {
+          raw: {
+            kind: "stream",
+            format: "sse",
+            events: [{ event: "message", data: "secret protocol-client stream" }],
+          },
+          streamDeltas: ["secret protocol-client stream"],
+        },
+      },
+    ],
+    now: () => NOW,
+  });
+
+  assert.equal(audit.scope, "upstream");
+  assert.equal(audit.status, "blocked");
+  assert.equal(audit.counts.total, 1);
+  assert.equal(audit.counts.realUpstream, 0);
+  assert.equal(audit.counts.upstreamCancellation, 0);
+  assert.equal(audit.coverage.upstreamErrorFrame.status, "missing");
+  assert.equal(audit.coverage.upstreamCancellation.status, "missing");
+  assert.equal(audit.coverage.upstreamBackpressure.status, "missing");
+  assert.deepEqual(audit.missing, [
+    "real_upstream_error_frame_fixture",
+    "real_upstream_cancellation_fixture",
+    "real_upstream_backpressure_fixture",
+  ]);
+  assert.doesNotMatch(JSON.stringify(audit), /secret protocol-client stream/);
+});
+
 test("buildProtocolFixtureAudit keeps upstream scope blocked for local-only streams", () => {
   const audit = buildProtocolFixtureAudit({
     scope: "upstream",
@@ -941,6 +1141,53 @@ test("buildProtocolFixtureAudit keeps upstream scope blocked for local-only stre
     "real_upstream_backpressure_fixture",
   ]);
   assert.doesNotMatch(JSON.stringify(audit), /local/);
+});
+
+test("buildProtocolFixtureAudit reports missed stream evidence captures without satisfying upstream coverage", () => {
+  const audit = buildProtocolFixtureAudit({
+    scope: "upstream",
+    fixtures: [
+      {
+        kind: "protocol_probe",
+        operation: "sendMessage",
+        status: "failed",
+        input: { messages: [{ role: "user", content: "private diagnostic prompt" }] },
+        result: {
+          raw: {
+            kind: "stream",
+            format: "sse",
+            async: true,
+            events: [{ event: "message", data: "private missed stream text" }],
+          },
+          upstreamEvidence: { source: "tabbit-live", real: true, stream: true },
+        },
+        error: {
+          category: "protocol_changed",
+          code: "STREAM_EVIDENCE_NOT_CAPTURED",
+          message: "stream evidence was requested but not captured for token=secret",
+        },
+      },
+    ],
+    now: () => NOW,
+  });
+
+  assert.equal(audit.scope, "upstream");
+  assert.equal(audit.status, "blocked");
+  assert.equal(audit.counts.total, 1);
+  assert.equal(audit.counts.realUpstream, 1);
+  assert.equal(audit.counts.streamEvidenceNotCaptured, 1);
+  assert.equal(audit.counts.upstreamErrorFrame, 0);
+  assert.equal(audit.counts.upstreamCancellation, 0);
+  assert.equal(audit.counts.upstreamBackpressure, 0);
+  assert.equal(audit.coverage.upstreamErrorFrame.status, "missing");
+  assert.equal(audit.coverage.upstreamCancellation.status, "missing");
+  assert.equal(audit.coverage.upstreamBackpressure.status, "missing");
+  assert.deepEqual(audit.missing, [
+    "real_upstream_error_frame_fixture",
+    "real_upstream_cancellation_fixture",
+    "real_upstream_backpressure_fixture",
+  ]);
+  assert.doesNotMatch(JSON.stringify(audit), /private diagnostic prompt|private missed stream text|token=secret/);
 });
 
 test("buildProtocolFixtureAudit treats explicit unsupported native tool evidence as tool coverage", () => {
@@ -1229,6 +1476,13 @@ test("buildReadinessDoctorReport exposes auth and benefits calibration backlog s
 
   assert.equal(report.status, "ready");
   assert.deepEqual(report.remainingWork, []);
+  assert.equal(report.manualCookieMode.status, "blocked");
+  assert.equal(report.manualCookieMode.mode, "manual_reimport_then_probe");
+  assert.deepEqual(report.manualCookieMode.missing, ["expired_verifySession_fixture"]);
+  assert.deepEqual(report.manualCookieMode.blockingMissing, ["expired_verifySession_fixture"]);
+  assert.deepEqual(report.manualCookieMode.backlogMissing, ["automated_session_refresh_strategy"]);
+  assert.equal(report.manualCookieMode.automatedSessionRefresh.requiredForCurrentRelease, false);
+  assert.equal(report.manualCookieMode.automatedSessionRefresh.status, "backlog");
   assert.equal(report.calibrationBacklog?.status, "blocked");
   assert.equal(report.calibrationBacklog.scopes.auth.status, "blocked");
   assert.equal(report.calibrationBacklog.scopes.benefits.status, "blocked");
@@ -1256,6 +1510,67 @@ test("buildReadinessDoctorReport exposes auth and benefits calibration backlog s
   const text = JSON.stringify(report);
   assert.doesNotMatch(text, /alpha-user@example\.test|cooldown-user@example\.test|quota-user@example\.test/);
   assert.doesNotMatch(text, /tabbit_session|secret-local-key|browser-context-secret|secrets\/acct_active\.cookie|secret-token|secret-session/);
+  assert.doesNotMatch(text, /lookup_private_data/);
+});
+
+test("buildReadinessDoctorReport marks manual cookie mode ready without automated refresh evidence", () => {
+  const report = buildReadinessDoctorReport({
+    accounts,
+    config: {
+      stateDir: "E:\\tabbit2api\\output\\tabbit-live-state",
+      apiKey: "secret-local-key",
+      compat: {
+        stripClientTools: true,
+        toolLoopMode: "client_executes_tools_first",
+      },
+      protocol: {
+        enabled: true,
+        baseUrl: "https://web.tabbit.ai",
+        sendPath: "/api/v1/chat/completion",
+        sessionVerifyPath: "/api/v0/user/base-info",
+        reqCtx: "browser-context-secret",
+      },
+    },
+    fixtures: [
+      { operation: "verifySession", status: "success", observedAt: "2026-07-02T03:00:00.000Z", result: { ok: true, userId: "user_123" } },
+      {
+        operation: "verifySession",
+        status: "failed",
+        observedAt: "2026-07-03T03:00:00.000Z",
+        result: { ok: false, error: { category: "login_required", status: 401, message: "expired beta-user@example.test token=secret" } },
+      },
+      { operation: "sendMessage", status: "success", result: { raw: { kind: "stream" }, streamDeltas: ["ok"] } },
+      {
+        operation: "sendMessage",
+        status: "failed",
+        input: { tools: [{ type: "function", function: { name: "lookup_private_data" } }] },
+        result: { ok: false, error: { category: "unsupported_feature", code: "***" } },
+      },
+      { operation: "sendMessage", status: "failed", result: { ok: false, error: { category: "forbidden", status: 403 } } },
+    ],
+    readinessState: {
+      codex: { verified: true },
+      claude: { verified: true },
+    },
+    now: () => NOW,
+  });
+
+  assert.equal(report.status, "ready");
+  assert.deepEqual(report.remainingWork, []);
+  assert.equal(report.manualCookieMode.status, "ready");
+  assert.equal(report.manualCookieMode.mode, "manual_reimport_then_probe");
+  assert.deepEqual(report.manualCookieMode.missing, []);
+  assert.deepEqual(report.manualCookieMode.blockingMissing, []);
+  assert.deepEqual(report.manualCookieMode.backlogMissing, ["automated_session_refresh_strategy"]);
+  assert.equal(report.manualCookieMode.automatedSessionRefresh.requiredForCurrentRelease, false);
+  assert.equal(report.manualCookieMode.automatedSessionRefresh.status, "backlog");
+  assert.deepEqual(report.manualCookieMode.automatedSessionRefresh.missing, ["automated_session_refresh_strategy"]);
+  assert.equal(report.calibrationBacklog.status, "blocked");
+  assert.ok(report.calibrationBacklog.missing.includes("automated_session_refresh_strategy"));
+
+  const text = JSON.stringify(report);
+  assert.doesNotMatch(text, /alpha-user@example\.test|beta-user@example\.test|cooldown-user@example\.test|quota-user@example\.test/);
+  assert.doesNotMatch(text, /tabbit_session|secret-local-key|browser-context-secret|secrets\/acct_active\.cookie|secret-token|token=secret|secret-session/);
   assert.doesNotMatch(text, /lookup_private_data/);
 });
 
@@ -1297,6 +1612,10 @@ test("buildReadinessDoctorReport includes safe calibration capture commands", ()
 
   assert.equal(report.status, "ready");
   assert.deepEqual(report.remainingWork, []);
+  assert.equal(
+    report.commands.accountPreflightReadOnly,
+    "node bin\\tabbit-pool.js accounts probe <account-id> --read-only --json",
+  );
   assert.equal(report.calibrationBacklog.status, "blocked");
   assert.deepEqual(report.calibrationBacklog.missing, [
     "successful_sendVerificationCode_fixture",
@@ -1394,10 +1713,16 @@ test("buildReadinessDoctorReport includes safe calibration capture commands", ()
   assert.equal(byMissing.real_upstream_error_frame_fixture.scope, "upstream");
   assert.equal(byMissing.real_upstream_error_frame_fixture.operation, "sendMessage");
   assert.equal(byMissing.real_upstream_error_frame_fixture.sideEffect, false);
-  assert.match(byMissing.real_upstream_error_frame_fixture.templateCommand, /probe template --operation sendMessage --json/);
+  assert.match(byMissing.real_upstream_error_frame_fixture.templateCommand, /probe template --operation sendMessage --stream-evidence error_frame --json/);
   assert.match(byMissing.real_upstream_error_frame_fixture.validateCommand, /probe validate --operation sendMessage --input-file <redacted-input\.json> --json/);
   assert.equal(byMissing.real_upstream_error_frame_fixture.confirmedValidateCommand, null);
   assert.match(byMissing.real_upstream_error_frame_fixture.probeCommand, /probe protocol --account <account-id> --operation sendMessage --input-file <redacted-input\.json> --write-fixture --json/);
+  assert.equal(byMissing.real_upstream_error_frame_fixture.requiresReviewedInput, true);
+  assert.equal(byMissing.real_upstream_error_frame_fixture.reviewRequirement, "replace_redacted_message_content");
+  assert.deepEqual(byMissing.real_upstream_error_frame_fixture.recommendedInput, {
+    stream: true,
+    streamEvidence: { mode: "error_frame", maxDeltas: 2 },
+  });
   assert.equal(byMissing.real_upstream_error_frame_fixture.prerequisitesStatus, "ready");
   assert.deepEqual(byMissing.real_upstream_error_frame_fixture.prerequisites, [{
     name: "protocol_send_endpoint",
@@ -1406,6 +1731,13 @@ test("buildReadinessDoctorReport includes safe calibration capture commands", ()
   }]);
   assert.equal(byMissing.real_upstream_cancellation_fixture.scope, "upstream");
   assert.equal(byMissing.real_upstream_cancellation_fixture.operation, "sendMessage");
+  assert.match(byMissing.real_upstream_cancellation_fixture.templateCommand, /probe template --operation sendMessage --stream-evidence cancel_after_first_delta --json/);
+  assert.equal(byMissing.real_upstream_cancellation_fixture.requiresReviewedInput, true);
+  assert.equal(byMissing.real_upstream_cancellation_fixture.reviewRequirement, "replace_redacted_message_content");
+  assert.deepEqual(byMissing.real_upstream_cancellation_fixture.recommendedInput, {
+    stream: true,
+    streamEvidence: { mode: "cancel_after_first_delta", maxDeltas: 2 },
+  });
   assert.equal(byMissing.real_upstream_cancellation_fixture.prerequisitesStatus, "ready");
   assert.deepEqual(byMissing.real_upstream_cancellation_fixture.prerequisites, [{
     name: "protocol_send_endpoint",
@@ -1414,6 +1746,13 @@ test("buildReadinessDoctorReport includes safe calibration capture commands", ()
   }]);
   assert.equal(byMissing.real_upstream_backpressure_fixture.scope, "upstream");
   assert.equal(byMissing.real_upstream_backpressure_fixture.operation, "sendMessage");
+  assert.match(byMissing.real_upstream_backpressure_fixture.templateCommand, /probe template --operation sendMessage --stream-evidence first_token_backpressure --json/);
+  assert.equal(byMissing.real_upstream_backpressure_fixture.requiresReviewedInput, true);
+  assert.equal(byMissing.real_upstream_backpressure_fixture.reviewRequirement, "replace_redacted_message_content");
+  assert.deepEqual(byMissing.real_upstream_backpressure_fixture.recommendedInput, {
+    stream: true,
+    streamEvidence: { mode: "first_token_backpressure", maxDeltas: 2 },
+  });
   assert.equal(byMissing.real_upstream_backpressure_fixture.prerequisitesStatus, "ready");
   assert.deepEqual(byMissing.real_upstream_backpressure_fixture.prerequisites, [{
     name: "protocol_send_endpoint",
@@ -1425,6 +1764,161 @@ test("buildReadinessDoctorReport includes safe calibration capture commands", ()
   assert.doesNotMatch(text, /alpha-user@example\.test|cooldown-user@example\.test|quota-user@example\.test/);
   assert.doesNotMatch(text, /tabbit_session|secret-local-key|browser-context-secret|secrets\/acct_active\.cookie|secret-token|secret-session|Bearer\s+/);
   assert.doesNotMatch(text, /lookup_private_data/);
+});
+
+test("buildReadinessDoctorReport includes forbidden 403 capture command", () => {
+  const report = buildReadinessDoctorReport({
+    accounts,
+    config: {
+      stateDir: "E:\\tabbit2api\\output\\tabbit-live-state",
+      apiKey: "secret-local-key",
+      compat: {
+        stripClientTools: true,
+        toolLoopMode: "client_executes_tools_first",
+      },
+      protocol: {
+        enabled: true,
+        baseUrl: "https://web.tabbit.ai",
+        sendPath: "/api/v1/chat/completion",
+        sessionVerifyPath: "/api/v0/user/base-info",
+        reqCtx: "browser-context-secret",
+      },
+    },
+    fixtures: [
+      { operation: "verifySession", status: "success", result: { ok: true, userId: "user_123" } },
+      { operation: "sendMessage", status: "success", result: { raw: { kind: "stream" }, streamDeltas: ["ok"] } },
+      {
+        operation: "sendMessage",
+        status: "failed",
+        input: { tools: [{ type: "function", function: { name: "lookup_private_data" } }] },
+        result: { ok: false, error: { category: "unsupported_feature", code: "***" } },
+      },
+    ],
+    readinessState: {
+      codex: { verified: true },
+      claude: { verified: true },
+    },
+    now: () => NOW,
+  });
+
+  assert.equal(report.fixtureAudit.coverage.forbidden403.status, "missing");
+  const command = report.calibrationBacklog.captureCommands.find((item) => item.missing === "forbidden_403_fixture");
+  assert.ok(command);
+  assert.equal(command.scope, "protocol");
+  assert.equal(command.operation, "verifySession");
+  assert.equal(command.sideEffect, false);
+  assert.match(command.templateCommand, /probe template --operation verifySession --json/);
+  assert.match(command.validateCommand, /probe validate --operation verifySession --input-file <redacted-input\.json> --json/);
+  assert.equal(command.confirmedValidateCommand, null);
+  assert.match(command.probeCommand, /probe protocol --account <account-id> --operation verifySession --input-file <redacted-input\.json> --write-fixture --json/);
+  assert.equal(command.writeFixtureCommand, null);
+  assert.equal(command.prerequisitesStatus, "ready");
+  assert.deepEqual(command.prerequisites, [{
+    name: "session_verify_endpoint",
+    env: "TABBIT_POOL_PROTOCOL_SESSION_VERIFY_PATH",
+    status: "configured",
+  }]);
+  const text = JSON.stringify(command);
+  assert.doesNotMatch(text, /https:\/\/web\.tabbit\.ai|\/api\/v0\/user\/base-info|secret-local-key|browser-context-secret|tabbit_session|Bearer\s+|lookup_private_data/i);
+});
+
+test("buildReadinessDoctorReport includes default send capture commands", () => {
+  const report = buildReadinessDoctorReport({
+    accounts,
+    config: {
+      stateDir: "E:\\tabbit2api\\output\\tabbit-live-state",
+      apiKey: "secret-local-key",
+      compat: {
+        stripClientTools: true,
+        toolLoopMode: "client_executes_tools_first",
+      },
+      protocol: {
+        enabled: true,
+        baseUrl: "https://web.tabbit.ai",
+        sendPath: "/api/v1/chat/completion",
+        sessionVerifyPath: "/api/v0/user/base-info",
+        reqCtx: "browser-context-secret",
+      },
+    },
+    fixtures: [
+      { operation: "verifySession", status: "success", result: { ok: true, userId: "user_123" } },
+      { operation: "sendMessage", status: "failed", result: { ok: false, error: { category: "forbidden", status: 403 } } },
+    ],
+    readinessState: {
+      codex: { verified: true },
+      claude: { verified: true },
+    },
+    now: () => NOW,
+  });
+
+  assert.deepEqual(report.fixtureAudit.missing, [
+    "successful_sendMessage_fixture",
+    "streaming_text_fixture",
+    "tool_call_fixture",
+  ]);
+  const byMissing = Object.fromEntries(report.calibrationBacklog.captureCommands.map((item) => [item.missing, item]));
+
+  for (const missing of ["successful_sendMessage_fixture", "streaming_text_fixture", "tool_call_fixture"]) {
+    assert.ok(byMissing[missing]);
+    assert.equal(byMissing[missing].scope, "protocol");
+    assert.equal(byMissing[missing].operation, "sendMessage");
+    assert.equal(byMissing[missing].sideEffect, false);
+    assert.match(byMissing[missing].validateCommand, /probe validate --operation sendMessage --input-file <redacted-input\.json> --json/);
+    assert.match(byMissing[missing].probeCommand, /probe protocol --account <account-id> --operation sendMessage --input-file <redacted-input\.json> --write-fixture --json/);
+    assert.equal(byMissing[missing].confirmedValidateCommand, null);
+    assert.equal(byMissing[missing].writeFixtureCommand, null);
+    assert.equal(byMissing[missing].requiresReviewedInput, true);
+    assert.equal(byMissing[missing].reviewRequirement, "replace_redacted_message_content");
+    assert.equal(byMissing[missing].prerequisitesStatus, "ready");
+    assert.deepEqual(byMissing[missing].prerequisites, [{
+      name: "protocol_send_endpoint",
+      env: "TABBIT_POOL_PROTOCOL_SEND_PATH",
+      status: "configured",
+    }]);
+  }
+
+  assert.match(byMissing.successful_sendMessage_fixture.templateCommand, /probe template --operation sendMessage --json/);
+  assert.match(byMissing.streaming_text_fixture.templateCommand, /probe template --operation sendMessage --json/);
+  assert.deepEqual(byMissing.streaming_text_fixture.recommendedInput, { stream: true });
+  assert.match(byMissing.tool_call_fixture.templateCommand, /probe template --operation sendMessage --json/);
+  assert.match(byMissing.tool_call_fixture.reason, /unsupported-native-tool/i);
+  assert.deepEqual(byMissing.tool_call_fixture.recommendedInput, { toolEvidence: "tool_call_or_unsupported_native_tool" });
+
+  const text = JSON.stringify(report.calibrationBacklog.captureCommands);
+  assert.doesNotMatch(text, /https:\/\/web\.tabbit\.ai|\/api\/v1\/chat\/completion|\/api\/v0\/user\/base-info|secret-local-key|browser-context-secret|tabbit_session|Bearer\s+|lookup_private_data/i);
+});
+
+test("buildReadinessDoctorReport includes E2E mark commands", () => {
+  const report = buildReadinessDoctorReport({
+    accounts,
+    config: {
+      stateDir: "E:\\tabbit2api\\output\\tabbit-live-state",
+      apiKey: "secret-local-key",
+      protocol: {
+        enabled: true,
+        baseUrl: "https://web.tabbit.ai",
+        sendPath: "/api/v1/chat/completion",
+        sessionVerifyPath: "/api/v0/user/base-info",
+        reqCtx: "browser-context-secret",
+      },
+    },
+    fixtures: [
+      { operation: "verifySession", status: "success", result: { ok: true, userId: "user_123" } },
+      { operation: "sendMessage", status: "success", result: { raw: { kind: "stream" }, streamDeltas: ["ok"] } },
+      { operation: "sendMessage", status: "failed", result: { ok: false, error: { category: "forbidden", status: 403 } } },
+    ],
+    readinessState: {},
+    now: () => NOW,
+  });
+
+  assert.equal(report.readiness.checks.codexClaudeE2E.status, "blocked");
+  assert.deepEqual(report.readiness.checks.codexClaudeE2E.missing, ["codex_e2e_verified", "claude_code_e2e_verified"]);
+  assert.equal(report.commands.codexE2EMark, "node bin\\tabbit-pool.js readiness mark --codex-verified --json");
+  assert.equal(report.commands.claudeE2EMark, "node bin\\tabbit-pool.js readiness mark --claude-verified --json");
+  assert.equal(report.commands.combinedE2EMark, "node bin\\tabbit-pool.js readiness mark --codex-verified --claude-verified --json");
+
+  const text = JSON.stringify(report.commands);
+  assert.doesNotMatch(text, /https:\/\/web\.tabbit\.ai|\/api\/v1\/chat\/completion|\/api\/v0\/user\/base-info|secret-local-key|browser-context-secret|tabbit_session|Bearer\s+|user_123/i);
 });
 
 test("createGatewayHealthProvider reads AccountPool safely", async () => {

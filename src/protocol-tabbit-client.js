@@ -772,12 +772,13 @@ async function* parseNdjsonDeltaStream(body, raw) {
   }
 }
 
-function normalizeAsyncMessageResponse(body, format, selectedModel) {
+function normalizeAsyncMessageResponse(body, format, selectedModel, { upstreamEvidence = null } = {}) {
   const raw = { kind: "stream", format, async: true, events: [] };
   return {
     ok: true,
     contentBlocks: [{ type: "text", text: "" }],
     selectedModel,
+    ...(upstreamEvidence ? { upstreamEvidence } : {}),
     raw,
     streamDeltas: format === "sse" ? parseSseDeltaStream(body, raw) : parseNdjsonDeltaStream(body, raw),
   };
@@ -2323,7 +2324,11 @@ export class ProtocolTabbitClient {
       const contentType = response.headers?.get?.("content-type") || "";
       const streamFormat = stream ? streamFormatFromContentType(contentType) : null;
       if (response.ok && streamFormat && isReadableBody(response.body)) {
-        return normalizeAsyncMessageResponse(response.body, streamFormat, restoredChatCompletion ? body.selected_model : model);
+        return normalizeAsyncMessageResponse(response.body, streamFormat, restoredChatCompletion ? body.selected_model : model, {
+          upstreamEvidence: restoredChatCompletion
+            ? { source: "tabbit-live", real: true, stream: true, format: streamFormat }
+            : null,
+        });
       }
       const responseBody = await parseBody(response);
       if (!response.ok) return resultFromError(protocolResponseError(response, responseBody));

@@ -65,6 +65,43 @@ function action(name, status, { changed = false, detail = null, error = null } =
   };
 }
 
+function accountsDiffer(left = {}, right = {}) {
+  return JSON.stringify(cloneAccount(left)) !== JSON.stringify(cloneAccount(right));
+}
+
+async function verifyProjection(provisioner, currentAccount, projectedAccount, {
+  readOnly = false,
+  status,
+  error = null,
+  detail = null,
+} = {}) {
+  if (readOnly) {
+    const projected = cloneAccount(projectedAccount);
+    return {
+      account: projected,
+      changed: false,
+      wouldChange: accountsDiffer(currentAccount, projected),
+      readOnly: true,
+      actions: [action("verifySession", status, {
+        changed: false,
+        detail,
+        error,
+      })],
+    };
+  }
+
+  const updated = await provisioner.upsertAccount(projectedAccount);
+  return {
+    account: updated,
+    changed: true,
+    actions: [action("verifySession", status, {
+      changed: true,
+      detail,
+      error,
+    })],
+  };
+}
+
 function stripDirectSecrets(account = {}) {
   const clean = {};
   for (const [key, value] of Object.entries(account)) {
@@ -418,29 +455,39 @@ export class AccountProvisioner {
     }
   }
 
-  async verifyAccount(accountId) {
+  async verifyAccount(accountId, options = {}) {
+    const readOnly = Boolean(options?.readOnly);
     const account = await this.findAccount(accountId);
     if (!account) {
       const error = provisionerError(`account not found: ${accountId}`, { code: "ACCOUNT_NOT_FOUND", category: "account_not_found" });
-      return { account: null, changed: false, actions: [action("verifySession", "failed", { error: errorSummary(error) })] };
+      return {
+        account: null,
+        changed: false,
+        ...(readOnly ? { readOnly: true, wouldChange: false } : {}),
+        actions: [action("verifySession", "failed", { error: errorSummary(error) })],
+      };
     }
 
     const session = account.cookieJarRef ? await this.secretStore.readSecret(account.cookieJarRef) : null;
     if (!session) {
       const error = provisionerError("stored session material is missing", { code: "SESSION_MISSING", category: "session_missing" });
-      const updated = await this.upsertAccount({
+      return await verifyProjection(this, account, {
         ...account,
         status: "login_expired",
         lastVerifiedAt: this.nowIso(),
         lastError: { ...errorSummary(error), stage: "verifySession" },
+      }, {
+        readOnly,
+        status: "failed",
+        error: errorSummary(error),
       });
-      return { account: updated, changed: true, actions: [action("verifySession", "failed", { error: errorSummary(error) })] };
     }
 
     if (typeof this.protocolClient.verifySession !== "function") {
       return {
         account,
         changed: false,
+        ...(readOnly ? { readOnly: true, wouldChange: false } : {}),
         actions: [action("verifySession", "skipped", { detail: "protocol operation is not configured" })],
       };
     }
@@ -452,33 +499,41 @@ export class AccountProvisioner {
           code: result.code || "SESSION_INVALID",
           category: result.category || "login_required",
         });
-        const updated = await this.upsertAccount({
+        return await verifyProjection(this, account, {
           ...account,
           status: verifierAccountStatus(result),
           lastVerifiedAt: this.nowIso(),
           lastError: { ...errorSummary(error), stage: "verifySession" },
+        }, {
+          readOnly,
+          status: "failed",
+          error: errorSummary(error),
         });
-        return { account: updated, changed: true, actions: [action("verifySession", "failed", { error: errorSummary(error) })] };
       }
 
-      const updated = await this.upsertAccount({
+      return await verifyProjection(this, account, {
         ...account,
         status: "active",
         userId: result?.userId || account.userId || null,
         accessTier: result?.accessTier || account.accessTier || "unknown",
         lastVerifiedAt: this.nowIso(),
         lastError: null,
+      }, {
+        readOnly,
+        status: "success",
       });
-      return { account: updated, changed: true, actions: [action("verifySession", "success", { changed: true })] };
     } catch (error) {
       const status = error?.category === "login_required" ? "login_expired" : "suspect";
-      const updated = await this.upsertAccount({
+      return await verifyProjection(this, account, {
         ...account,
         status,
         lastVerifiedAt: this.nowIso(),
         lastError: { ...errorSummary(error), stage: "verifySession" },
+      }, {
+        readOnly,
+        status: "failed",
+        error: errorSummary(error),
       });
-      return { account: updated, changed: true, actions: [action("verifySession", "failed", { error: errorSummary(error) })] };
     }
   }
 }

@@ -439,6 +439,24 @@ test("verifyAccount marks login_expired when stored session is missing", async (
   assert.equal(accountStore.accounts[0].status, "login_expired");
 });
 
+test("verifyAccount read-only projects missing session status without saving accounts", async () => {
+  const events = [];
+  const accountStore = memoryAccountStore([{ id: "acct_probe_readonly", status: "active", email: "readonly@example.test", cookieJarRef: "secrets/missing.cookie" }], events);
+  const provisioner = new AccountProvisioner(provisionerOptions({ events, accountStore, secretStore: memorySecretStore(events), protocolClient: {} }));
+
+  const result = await provisioner.verifyAccount("acct_probe_readonly", { readOnly: true });
+
+  assert.equal(result.changed, false);
+  assert.equal(result.wouldChange, true);
+  assert.equal(result.readOnly, true);
+  assert.equal(result.account.status, "login_expired");
+  assert.equal(result.actions[0].status, "failed");
+  assert.equal(result.actions[0].error.code, "SESSION_MISSING");
+  assert.ok(events.some((event) => event[0] === "readSecret"));
+  assert.equal(events.some((event) => event[0] === "saveAccounts"), false);
+  assert.equal(accountStore.accounts[0].status, "active");
+});
+
 test("AccountProvisioner validates required account and secret stores", () => {
   assert.throws(() => new AccountProvisioner(), AccountProvisionerError);
   assert.throws(() => new AccountProvisioner({ accountStore: memoryAccountStore() }), AccountProvisionerError);

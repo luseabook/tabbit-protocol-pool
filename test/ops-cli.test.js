@@ -655,6 +655,8 @@ test("readiness doctor prints calibration backlog in plain output", async () => 
   assert.match(text, /^auth_send_endpoint\tconfigured/m);
   assert.match(text, /^auth_submit_endpoint\tconfigured/m);
   assert.match(text, /^remaining_work\t0/m);
+  assert.match(text, /^manual_cookie_mode\tblocked\tmode=manual_reimport_then_probe\tautomated_refresh=backlog\tmissing=expired_verifySession_fixture\trelease_blocking_missing=expired_verifySession_fixture\tbacklog_missing=automated_session_refresh_strategy/m);
+  assert.match(text, /^preflight_command\taccount_read_only\tnode bin\\tabbit-pool\.js accounts probe <account-id> --read-only --json/m);
   assert.match(text, /^calibration_backlog\tblocked\tmissing=11/m);
   assert.match(text, /^auth_backlog\tblocked\tmissing=2/m);
   assert.match(text, /^benefits_backlog\tblocked\tmissing=4/m);
@@ -665,15 +667,196 @@ test("readiness doctor prints calibration backlog in plain output", async () => 
   assert.match(text, /^capture_command\tsuccessful_pro_activity_fixture.*\tprereq=TABBIT_POOL_PROTOCOL_ACTIVITY_PARTICIPATE_PATH:configured/m);
   assert.match(text, /^capture_command\tsuccessful_lottery_draw_fixture.*\tprereq=TABBIT_POOL_PROTOCOL_LOTTERY_DRAW_PATH:configured/m);
   assert.match(text, /^capture_command\texpired_verifySession_fixture.*\tprereq=TABBIT_POOL_PROTOCOL_SESSION_VERIFY_PATH:configured/m);
-  assert.match(text, /^capture_command\treal_upstream_error_frame_fixture\tupstream\tside_effect=false.*\tprereq=TABBIT_POOL_PROTOCOL_SEND_PATH:configured/m);
-  assert.match(text, /^capture_command\treal_upstream_cancellation_fixture\tupstream\tside_effect=false.*\tprereq=TABBIT_POOL_PROTOCOL_SEND_PATH:configured/m);
-  assert.match(text, /^capture_command\treal_upstream_backpressure_fixture\tupstream\tside_effect=false.*\tprereq=TABBIT_POOL_PROTOCOL_SEND_PATH:configured/m);
+  assert.match(text, /^capture_command\treal_upstream_error_frame_fixture\tupstream\tside_effect=false\ttemplate=node bin\\tabbit-pool\.js probe template --operation sendMessage --stream-evidence error_frame --json.*\tstream_evidence=error_frame:2\treview=replace_redacted_message_content\tprereq=TABBIT_POOL_PROTOCOL_SEND_PATH:configured/m);
+  assert.match(text, /^capture_command\treal_upstream_cancellation_fixture\tupstream\tside_effect=false\ttemplate=node bin\\tabbit-pool\.js probe template --operation sendMessage --stream-evidence cancel_after_first_delta --json.*\tstream_evidence=cancel_after_first_delta:2\treview=replace_redacted_message_content\tprereq=TABBIT_POOL_PROTOCOL_SEND_PATH:configured/m);
+  assert.match(text, /^capture_command\treal_upstream_backpressure_fixture\tupstream\tside_effect=false\ttemplate=node bin\\tabbit-pool\.js probe template --operation sendMessage --stream-evidence first_token_backpressure --json.*\tstream_evidence=first_token_backpressure:2\treview=replace_redacted_message_content\tprereq=TABBIT_POOL_PROTOCOL_SEND_PATH:configured/m);
   assert.match(text, /^capture_command\tsuccessful_sendVerificationCode_fixture\tauth\tside_effect=true\ttemplate=node bin\\tabbit-pool\.js probe template --operation sendVerificationCode --json\tvalidate=node bin\\tabbit-pool\.js probe validate --operation sendVerificationCode --input-file <redacted-input\.json> --json\tconfirm_validate=node bin\\tabbit-pool\.js probe validate --operation sendVerificationCode --input-file <redacted-input\.json> --require-confirmed-side-effect --json\tprobe=node bin\\tabbit-pool\.js probe protocol --account <account-id> --operation sendVerificationCode --input-file <redacted-input\.json> --write-fixture --json/m);
   assert.match(text, /^capture_command\tsuccessful_reset_coupon_consumption_fixture\tbenefits\tside_effect=true\ttemplate=node bin\\tabbit-pool\.js probe template --operation useResetCoupon --json\tvalidate=node bin\\tabbit-pool\.js probe validate --operation useResetCoupon --input-file <redacted-input\.json> --json\tconfirm_validate=node bin\\tabbit-pool\.js probe validate --operation useResetCoupon --input-file <redacted-input\.json> --require-confirmed-side-effect --json\tprobe=node bin\\tabbit-pool\.js probe protocol --account <account-id> --operation useResetCoupon --input-file <redacted-input\.json> --write-fixture --json\twrite_fixture=\tprereq=TABBIT_POOL_PROTOCOL_BENEFIT_COUPON_USE_PATH:configured\treason=/m);
   assert.match(text, /^capture_command\tautomated_session_refresh_strategy\tsession\tside_effect=false\ttemplate=node bin\\tabbit-pool\.js probe template --operation recoverSession --json\tvalidate=node bin\\tabbit-pool\.js probe validate --operation recoverSession --input-file <redacted-input\.json> --json\tconfirm_validate=\tprobe=\twrite_fixture=node bin\\tabbit-pool\.js probe validate --operation recoverSession --input-file <redacted-input\.json> --write-fixture --json\tprereq=\treason=/m);
   assert.doesNotMatch(text, /alpha-user@example\.test|beta-user@example\.test/);
   assert.doesNotMatch(text, /tabbit_session|secret-token|secret-local-key|browser-context-secret|cookieJarRef/);
   assert.doesNotMatch(text, /lookup_private_data/);
+});
+
+test("readiness doctor prints forbidden 403 capture command in plain output", async () => {
+  const stream = io();
+  const calls = [];
+  const stateDir = path.join(tmpdir(), "tabbit-readiness-doctor-forbidden-capture-test");
+  const result = await runProtocolPoolCli(["readiness", "doctor"], {
+    config: {
+      stateDir,
+      apiKey: "secret-local-key",
+      compat: {
+        stripClientTools: true,
+        toolLoopMode: "client_executes_tools_first",
+      },
+      protocol: {
+        enabled: true,
+        baseUrl: "https://web.tabbit.ai",
+        sendPath: "/api/v1/chat/completion",
+        sessionVerifyPath: "/api/v0/user/base-info",
+        reqCtx: "browser-context-secret",
+      },
+    },
+    accountStore: memoryStore(baseAccounts(), calls),
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push(["listFixtures"]);
+        return [
+          { operation: "verifySession", status: "success", result: { ok: true, userId: "user_123" } },
+          { operation: "sendMessage", status: "success", result: { raw: { kind: "stream" }, streamDeltas: ["ok"] } },
+          {
+            operation: "sendMessage",
+            status: "failed",
+            input: { tools: [{ type: "function", function: { name: "lookup_private_data" } }] },
+            result: { ok: false, error: { category: "unsupported_feature", code: "***" } },
+          },
+        ];
+      },
+    },
+    readinessStateStore: memoryReadinessStore({
+      codex: { verified: true },
+      claude: { verified: true },
+    }, calls),
+    accountVerifier: {
+      async verifyAccount() {
+        calls.push(["verifyAccount"]);
+        throw new Error("readiness doctor must not verify accounts");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push(["probeAccount"]);
+        throw new Error("readiness doctor must not run protocol probes");
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stream.stderr.length, 0);
+  assert.deepEqual(calls, [["loadAccounts"], ["listFixtures"], ["readReadinessState"]]);
+  const text = stream.stdout.join("");
+  assert.match(text, /^capture_command\tforbidden_403_fixture\tprotocol\tside_effect=false\ttemplate=node bin\\tabbit-pool\.js probe template --operation verifySession --json\tvalidate=node bin\\tabbit-pool\.js probe validate --operation verifySession --input-file <redacted-input\.json> --json\tconfirm_validate=\tprobe=node bin\\tabbit-pool\.js probe protocol --account <account-id> --operation verifySession --input-file <redacted-input\.json> --write-fixture --json\twrite_fixture=\tprereq=TABBIT_POOL_PROTOCOL_SESSION_VERIFY_PATH:configured\treason=/m);
+  assert.doesNotMatch(text, /https:\/\/web\.tabbit\.ai|\/api\/v0\/user\/base-info|secret-local-key|browser-context-secret|tabbit_session|Bearer\s+|lookup_private_data/i);
+});
+
+test("readiness doctor prints default send capture commands in plain output", async () => {
+  const stream = io();
+  const calls = [];
+  const stateDir = path.join(tmpdir(), "tabbit-readiness-doctor-default-send-capture-test");
+  const result = await runProtocolPoolCli(["readiness", "doctor"], {
+    config: {
+      stateDir,
+      apiKey: "secret-local-key",
+      compat: {
+        stripClientTools: true,
+        toolLoopMode: "client_executes_tools_first",
+      },
+      protocol: {
+        enabled: true,
+        baseUrl: "https://web.tabbit.ai",
+        sendPath: "/api/v1/chat/completion",
+        sessionVerifyPath: "/api/v0/user/base-info",
+        reqCtx: "browser-context-secret",
+      },
+    },
+    accountStore: memoryStore(baseAccounts(), calls),
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push(["listFixtures"]);
+        return [
+          { operation: "verifySession", status: "success", result: { ok: true, userId: "user_123" } },
+          { operation: "sendMessage", status: "failed", result: { ok: false, error: { category: "forbidden", status: 403 } } },
+        ];
+      },
+    },
+    readinessStateStore: memoryReadinessStore({
+      codex: { verified: true },
+      claude: { verified: true },
+    }, calls),
+    accountVerifier: {
+      async verifyAccount() {
+        calls.push(["verifyAccount"]);
+        throw new Error("readiness doctor must not verify accounts");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push(["probeAccount"]);
+        throw new Error("readiness doctor must not run protocol probes");
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stream.stderr.length, 0);
+  assert.deepEqual(calls, [["loadAccounts"], ["listFixtures"], ["readReadinessState"]]);
+  const text = stream.stdout.join("");
+  assert.match(text, /^capture_command\tsuccessful_sendMessage_fixture\tprotocol\tside_effect=false\ttemplate=node bin\\tabbit-pool\.js probe template --operation sendMessage --json\tvalidate=node bin\\tabbit-pool\.js probe validate --operation sendMessage --input-file <redacted-input\.json> --json\tconfirm_validate=\tprobe=node bin\\tabbit-pool\.js probe protocol --account <account-id> --operation sendMessage --input-file <redacted-input\.json> --write-fixture --json\twrite_fixture=\treview=replace_redacted_message_content\tprereq=TABBIT_POOL_PROTOCOL_SEND_PATH:configured\treason=/m);
+  assert.match(text, /^capture_command\tstreaming_text_fixture\tprotocol\tside_effect=false\ttemplate=node bin\\tabbit-pool\.js probe template --operation sendMessage --json\tvalidate=node bin\\tabbit-pool\.js probe validate --operation sendMessage --input-file <redacted-input\.json> --json\tconfirm_validate=\tprobe=node bin\\tabbit-pool\.js probe protocol --account <account-id> --operation sendMessage --input-file <redacted-input\.json> --write-fixture --json\twrite_fixture=\treview=replace_redacted_message_content\tprereq=TABBIT_POOL_PROTOCOL_SEND_PATH:configured\treason=/m);
+  assert.match(text, /^capture_command\ttool_call_fixture\tprotocol\tside_effect=false\ttemplate=node bin\\tabbit-pool\.js probe template --operation sendMessage --json\tvalidate=node bin\\tabbit-pool\.js probe validate --operation sendMessage --input-file <redacted-input\.json> --json\tconfirm_validate=\tprobe=node bin\\tabbit-pool\.js probe protocol --account <account-id> --operation sendMessage --input-file <redacted-input\.json> --write-fixture --json\twrite_fixture=\treview=replace_redacted_message_content\tprereq=TABBIT_POOL_PROTOCOL_SEND_PATH:configured\treason=.*unsupported-native-tool/m);
+  assert.doesNotMatch(text, /https:\/\/web\.tabbit\.ai|\/api\/v1\/chat\/completion|\/api\/v0\/user\/base-info|secret-local-key|browser-context-secret|tabbit_session|Bearer\s+|lookup_private_data/i);
+});
+
+test("readiness doctor prints E2E mark commands in plain output", async () => {
+  const stream = io();
+  const calls = [];
+  const stateDir = path.join(tmpdir(), "tabbit-readiness-doctor-e2e-mark-test");
+  const result = await runProtocolPoolCli(["readiness", "doctor"], {
+    config: {
+      stateDir,
+      apiKey: "secret-local-key",
+      protocol: {
+        enabled: true,
+        baseUrl: "https://web.tabbit.ai",
+        sendPath: "/api/v1/chat/completion",
+        sessionVerifyPath: "/api/v0/user/base-info",
+        reqCtx: "browser-context-secret",
+      },
+    },
+    accountStore: memoryStore(baseAccounts(), calls),
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push(["listFixtures"]);
+        return [
+          { operation: "verifySession", status: "success", result: { ok: true, userId: "user_123" } },
+          { operation: "sendMessage", status: "success", result: { raw: { kind: "stream" }, streamDeltas: ["ok"] } },
+          { operation: "sendMessage", status: "failed", result: { ok: false, error: { category: "forbidden", status: 403 } } },
+        ];
+      },
+    },
+    readinessStateStore: memoryReadinessStore({}, calls),
+    accountVerifier: {
+      async verifyAccount() {
+        calls.push(["verifyAccount"]);
+        throw new Error("readiness doctor must not verify accounts");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push(["probeAccount"]);
+        throw new Error("readiness doctor must not run protocol probes");
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stream.stderr.length, 0);
+  assert.deepEqual(calls, [["loadAccounts"], ["listFixtures"], ["readReadinessState"]]);
+  const text = stream.stdout.join("");
+  assert.match(text, /^mark_command\tcodex_e2e\tnode bin\\tabbit-pool\.js readiness mark --codex-verified --json/m);
+  assert.match(text, /^mark_command\tclaude_code_e2e\tnode bin\\tabbit-pool\.js readiness mark --claude-verified --json/m);
+  assert.match(text, /^mark_command\tcombined_e2e\tnode bin\\tabbit-pool\.js readiness mark --codex-verified --claude-verified --json/m);
+  assert.doesNotMatch(text, /writeReadinessState|https:\/\/web\.tabbit\.ai|\/api\/v1\/chat\/completion|\/api\/v0\/user\/base-info|secret-local-key|browser-context-secret|tabbit_session|Bearer\s+|user_123/i);
 });
 
 
@@ -1090,11 +1273,97 @@ test("probe template --operation sendMessage prints a safe starter input object"
   const body = JSON.parse(stream.stdout.join(""));
   assert.deepEqual(body, {
     model: "tabbit/priority",
-    messages: [{ role: "user", content: "ping" }],
+    messages: [{ role: "user", content: "<redacted-message-content>" }],
     stream: true,
   });
   assert.equal(JSON.stringify(body).includes("token"), false);
   assert.equal(JSON.stringify(body).includes("cookie"), false);
+  assert.equal(JSON.stringify(body).includes("ping"), false);
+});
+
+test("probe template --operation sendMessage can include streamEvidence mode", async () => {
+  const templateStream = io();
+  const templateResult = await runProtocolPoolCli([
+    "probe",
+    "template",
+    "--operation",
+    "sendMessage",
+    "--stream-evidence",
+    "error_frame",
+    "--json",
+  ], {
+    stdout: (line) => templateStream.stdout.push(line),
+    stderr: (line) => templateStream.stderr.push(line),
+  });
+
+  assert.equal(templateResult.exitCode, 0);
+  assert.equal(templateStream.stderr.length, 0);
+  const template = JSON.parse(templateStream.stdout.join(""));
+  assert.deepEqual(template, {
+    model: "tabbit/priority",
+    messages: [{ role: "user", content: "<redacted-message-content>" }],
+    stream: true,
+    streamEvidence: { mode: "error_frame", maxDeltas: 2 },
+  });
+
+  const validateStream = io();
+  const validateResult = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "sendMessage",
+    "--input-json",
+    JSON.stringify(template),
+    "--json",
+  ], {
+    stdout: (line) => validateStream.stdout.push(line),
+    stderr: (line) => validateStream.stderr.push(line),
+  });
+
+  assert.equal(validateResult.exitCode, 0);
+  assert.equal(validateStream.stderr.length, 0);
+  const preview = JSON.parse(validateStream.stdout.join(""));
+  assert.equal(preview.status, "valid");
+  assert.equal(preview.operation, "sendMessage");
+  assert.deepEqual(preview.streamEvidence, { mode: "error_frame", maxDeltas: 2 });
+
+  const serialized = templateStream.stdout.join("") + validateStream.stdout.join("");
+  assert.doesNotMatch(serialized, /cookie|session|token|api[_-]?key|Bearer\s+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.|rawPayload|prompt|user@example/i);
+  assert.doesNotMatch(serialized, /\bping\b/);
+});
+
+test("probe template rejects invalid streamEvidence template options", async () => {
+  const cases = [
+    {
+      args: ["probe", "template", "--operation", "sendMessage", "--stream-evidence", "full_raw_stream", "--json"],
+      message: /streamEvidence\.mode/,
+    },
+    {
+      args: ["probe", "template", "--operation", "sendMessage", "--stream-evidence", "error_frame", "--max-deltas", "0", "--json"],
+      message: /maxDeltas/,
+    },
+    {
+      args: ["probe", "template", "--operation", "verifySession", "--stream-evidence", "error_frame", "--json"],
+      message: /sendMessage/,
+    },
+    {
+      args: ["probe", "template", "--operation", "sendMessage", "--max-deltas", "2", "--json"],
+      message: /--stream-evidence/,
+    },
+  ];
+
+  for (const item of cases) {
+    const stream = io();
+    const result = await runProtocolPoolCli(item.args, {
+      stdout: (line) => stream.stdout.push(line),
+      stderr: (line) => stream.stderr.push(line),
+    });
+
+    assert.equal(result.exitCode, 2);
+    assert.equal(stream.stdout.length, 0);
+    assert.match(stream.stderr.join(""), item.message);
+    assert.doesNotMatch(stream.stderr.join(""), /cookie|session|api[_-]?key|Bearer\s+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.|rawPayload|prompt|user@example|token=|secret-token/i);
+  }
 });
 
 test("probe template --operation listModels prints a refresh input object", async () => {
@@ -1228,7 +1497,7 @@ test("probe template for sendMessage defaults to stream capture input", async ()
   const template = JSON.parse(templateStream.stdout.join(""));
   assert.deepEqual(template, {
     model: "tabbit/priority",
-    messages: [{ role: "user", content: "ping" }],
+    messages: [{ role: "user", content: "<redacted-message-content>" }],
     stream: true,
   });
 
@@ -1254,6 +1523,188 @@ test("probe template for sendMessage defaults to stream capture input", async ()
 
   const serialized = templateStream.stdout.join("") + validateStream.stdout.join("");
   assert.doesNotMatch(serialized, /cookie|session|token|api[_-]?key|Bearer\s+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.|rawPayload|prompt|user@example/i);
+  assert.doesNotMatch(serialized, /\bping\b/);
+});
+
+test("probe validate --operation sendMessage accepts streamEvidence capture options", async () => {
+  const stream = io();
+  const result = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "sendMessage",
+    "--input-json",
+    JSON.stringify({
+      model: "tabbit/priority",
+      messages: [{ role: "user", content: "private prompt should not print" }],
+      stream: true,
+      streamEvidence: {
+        mode: "first_token_backpressure",
+        maxDeltas: 2,
+      },
+    }),
+    "--json",
+  ], {
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stream.stderr.length, 0);
+  const body = JSON.parse(stream.stdout.join(""));
+  assert.equal(body.status, "valid");
+  assert.equal(body.operation, "sendMessage");
+  assert.deepEqual(body.sendMessageReview, {
+    requiresReviewedInput: true,
+    reviewRequirement: "replace_redacted_message_content",
+    redactedMessageContentPresent: false,
+    protocolDispatchReady: true,
+  });
+  assert.deepEqual(body.streamEvidence, {
+    mode: "first_token_backpressure",
+    maxDeltas: 2,
+  });
+  assert.doesNotMatch(stream.stdout.join(""), /private prompt/);
+});
+
+test("probe validate accepts sendMessage placeholder templates but protocol rejects them before dispatch", async () => {
+  const template = {
+    model: "tabbit/priority",
+    messages: [{ role: "user", content: "<redacted-message-content>" }],
+    stream: true,
+  };
+  const validateStream = io();
+  const validateResult = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "sendMessage",
+    "--input-json",
+    JSON.stringify(template),
+    "--json",
+  ], {
+    stdout: (line) => validateStream.stdout.push(line),
+    stderr: (line) => validateStream.stderr.push(line),
+  });
+
+  assert.equal(validateResult.exitCode, 0);
+  assert.equal(validateStream.stderr.length, 0);
+  const validateBody = JSON.parse(validateStream.stdout.join(""));
+  assert.equal(validateBody.status, "valid");
+  assert.deepEqual(validateBody.sendMessageReview, {
+    requiresReviewedInput: true,
+    reviewRequirement: "replace_redacted_message_content",
+    redactedMessageContentPresent: true,
+    protocolDispatchReady: false,
+  });
+  assert.doesNotMatch(validateStream.stdout.join(""), /tabbit\/priority|<redacted-message-content>|cookie|session|token|Bearer|api[_-]?key/i);
+
+  const protocolStream = io();
+  const calls = [];
+  const protocolResult = await runProtocolPoolCli([
+    "probe",
+    "protocol",
+    "--account",
+    "acct_placeholder",
+    "--operation",
+    "sendMessage",
+    "--input-json",
+    JSON.stringify(template),
+    "--write-fixture",
+    "--json",
+  ], {
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("placeholder sendMessage input must be rejected before dispatch");
+      },
+    },
+    stdout: (line) => protocolStream.stdout.push(line),
+    stderr: (line) => protocolStream.stderr.push(line),
+  });
+
+  assert.equal(protocolResult.exitCode, 2);
+  assert.deepEqual(calls, []);
+  assert.equal(protocolStream.stdout.length, 0);
+  assert.match(protocolStream.stderr.join(""), /replac.*redacted message content/i);
+  assert.doesNotMatch(protocolStream.stderr.join(""), /tabbit\/priority|<redacted-message-content>|cookie|session|token|Bearer|api[_-]?key/i);
+});
+
+test("probe protocol rejects omitted sendMessage input before dispatch", async () => {
+  const stream = io();
+  const calls = [];
+  const result = await runProtocolPoolCli([
+    "probe",
+    "protocol",
+    "--account",
+    "acct_placeholder",
+    "--operation",
+    "sendMessage",
+    "--json",
+  ], {
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("omitted sendMessage input must be rejected before dispatch");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 2);
+  assert.deepEqual(calls, []);
+  assert.equal(stream.stdout.length, 0);
+  assert.match(stream.stderr.join(""), /explicit reviewed messages/i);
+  assert.doesNotMatch(stream.stderr.join(""), /tabbit\/priority|cookie|session|token|Bearer|api[_-]?key/i);
+});
+
+test("probe validate --operation sendMessage rejects invalid streamEvidence capture options", async () => {
+  const invalidInputs = [
+    {
+      input: { streamEvidence: { mode: "full_raw_stream", maxDeltas: 2 } },
+      message: /streamEvidence\.mode/,
+    },
+    {
+      input: { streamEvidence: { mode: "first_token_backpressure", maxDeltas: 0 } },
+      message: /streamEvidence\.maxDeltas/,
+    },
+    {
+      input: { streamEvidence: { mode: "first_token_backpressure", maxDeltas: 6 } },
+      message: /streamEvidence\.maxDeltas/,
+    },
+  ];
+
+  for (const { input, message } of invalidInputs) {
+    const stream = io();
+    const result = await runProtocolPoolCli([
+      "probe",
+      "validate",
+      "--operation",
+      "sendMessage",
+      "--input-json",
+      JSON.stringify({
+        model: "tabbit/priority",
+        messages: [{ role: "user", content: "private prompt should not print" }],
+        stream: true,
+        ...input,
+      }),
+      "--json",
+    ], {
+      protocolProbeRunner: {
+        async probeAccount() {
+          throw new Error("probe validate must not run protocol probes");
+        },
+      },
+      stdout: (line) => stream.stdout.push(line),
+      stderr: (line) => stream.stderr.push(line),
+    });
+
+    assert.equal(result.exitCode, 2);
+    assert.equal(stream.stdout.length, 0);
+    assert.match(stream.stderr.join(""), message);
+    assert.doesNotMatch(stream.stderr.join(""), /private prompt/);
+  }
 });
 
 test("probe template prints auth inputs with confirmation disabled", async () => {
@@ -1365,9 +1816,15 @@ test("probe template --operation recoverSession prints safe session recovery evi
     evidence: {
       strategy: "automated_reauth",
       automatedRefresh: "calibrated_reauth_probe",
+      observedWindowMs: 86400000,
+      resultHash: "sha256:<redacted-recovery-result>",
       safe: true,
       sanitized: true,
       rawPayload: false,
+    },
+    result: {
+      expiredBeforeRecovery: true,
+      recoveredVerifySession: true,
     },
   });
   const serialized = stream.stdout.join("");
@@ -1485,6 +1942,54 @@ test("accounts probe --json verifies one account and prints redacted advice", as
   assert.equal(body.events[0].error.message, "be***@example.test token=*** code ***");
   assert.equal(body.advice.category, "login_required");
   assert.match(body.advice.recommendation, /refresh or import/i);
+  assert.equal(JSON.stringify(body).includes("beta-user@example.test"), false);
+  assert.equal(JSON.stringify(body).includes("secret-token"), false);
+});
+
+test("accounts probe --read-only --json verifies without persisting account changes", async () => {
+  const calls = [];
+  const stream = io();
+  const result = await runProtocolPoolCli(["accounts", "probe", "acct_b", "--read-only", "--json"], {
+    accountStore: memoryStore(baseAccounts()),
+    accountVerifier: {
+      async verifyAccount(accountId, options = {}) {
+        calls.push([accountId, options]);
+        return {
+          readOnly: Boolean(options.readOnly),
+          changed: false,
+          wouldChange: true,
+          account: {
+            id: accountId,
+            email: "beta-user@example.test",
+            status: "login_expired",
+            cookieJarRef: "secrets/acct_b.cookie",
+            token: "secret-token",
+            lastError: { category: "login_required", code: "LOGIN", message: "beta-user@example.test token=secret code 123456" },
+          },
+          actions: [{
+            name: "verifySession",
+            status: "failed",
+            changed: false,
+            error: { category: "login_required", code: "LOGIN", message: "beta-user@example.test token=secret code 123456" },
+          }],
+        };
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [["acct_b", { readOnly: true }]]);
+  const body = JSON.parse(stream.stdout.join(""));
+  assert.equal(body.readOnly, true);
+  assert.equal(body.changed, false);
+  assert.equal(body.wouldChange, true);
+  assert.equal(body.account.status, "login_expired");
+  assert.equal(body.account.cookieJarRef, undefined);
+  assert.equal(body.account.token, undefined);
+  assert.equal(body.events[0].error.message, "be***@example.test token=*** code ***");
   assert.equal(JSON.stringify(body).includes("beta-user@example.test"), false);
   assert.equal(JSON.stringify(body).includes("secret-token"), false);
 });
@@ -2464,12 +2969,18 @@ test("probe validate --operation recoverSession validates offline evidence witho
     evidence: {
       strategy: "automated_reauth",
       automatedRefresh: "calibrated_reauth_probe",
+      observedWindowMs: 86400000,
+      resultHash: "sha256:recovery-result-shape",
       safe: true,
       sanitized: true,
       rawPayload: false,
     },
+    result: {
+      expiredBeforeRecovery: true,
+      recoveredVerifySession: true,
+    },
     ignoredRaw: {
-      cookie: "tabbit_session=secret",
+      cookie: "<raw-cookie-redacted>",
       prompt: "placeholder prompt should stay hidden",
       recoveredValue: "placeholder-recovered-value",
     },
@@ -2523,15 +3034,87 @@ test("probe validate --operation recoverSession validates offline evidence witho
   assert.equal(body.fields.kind, "present");
   assert.equal(body.fields.status, "present");
   assert.equal(body.fields.evidence, "object");
-  assert.deepEqual(body.evidenceKeys, ["automatedRefresh", "rawPayload", "safe", "sanitized", "strategy"]);
+  assert.deepEqual(body.evidenceKeys, ["automatedRefresh", "observedWindowMs", "rawPayload", "resultHash", "safe", "sanitized", "strategy"]);
   assert.deepEqual(body.sessionRecovery, {
     strategy: "automated_reauth",
     automatedRefresh: "calibrated_reauth_probe",
+    observedWindowMs: true,
+    resultHash: true,
     safe: true,
     sanitized: true,
     rawPayload: false,
+    expiredBeforeRecovery: true,
+    recoveredVerifySession: true,
   });
   assert.doesNotMatch(text, /tabbit_session=secret|placeholder prompt|placeholder-recovered-value/);
+});
+
+test("probe validate --operation recoverSession rejects marker-only evidence", async () => {
+  const stream = io();
+  const calls = [];
+  const inputFile = path.join(await mkdtemp(path.join(tmpdir(), "tabbit-probe-recover-session-marker-only-")), "recover-session.json");
+  await writeFile(inputFile, JSON.stringify({
+    kind: "session_recovery_strategy",
+    operation: "recoverSession",
+    status: "success",
+    evidence: {
+      strategy: "automated_reauth",
+      automatedRefresh: "calibrated_reauth_probe",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+    ignoredRaw: {
+      cookie: "<raw-cookie-redacted>",
+      prompt: "unsafe placeholder prompt",
+    },
+  }), "utf8");
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "recoverSession",
+    "--input-file",
+    inputFile,
+    "--json",
+  ], {
+    accountStore: {
+      async loadAccounts() {
+        calls.push("loadAccounts");
+        throw new Error("probe validate must not read accounts");
+      },
+    },
+    secretStore: {
+      async readSecret() {
+        calls.push("readSecret");
+        throw new Error("probe validate must not read secrets");
+      },
+    },
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        throw new Error("probe validate must not read fixtures");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("probe validate must not run protocol probes");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 2);
+  assert.deepEqual(calls, []);
+  assert.equal(stream.stdout.length, 0);
+  const errorText = stream.stderr.join("");
+  assert.match(errorText, /observedWindowMs/);
+  assert.match(errorText, /resultHash/);
+  assert.match(errorText, /post-recovery verifySession/);
+  assert.doesNotMatch(errorText, /tabbit_session=secret|unsafe placeholder prompt/);
 });
 
 test("probe validate --operation recoverSession rejects unsafe evidence before touching dependencies", async () => {
@@ -2908,9 +3491,15 @@ test("probe validate --write-fixture persists recoverSession offline evidence wi
     evidence: {
       strategy: "automated_reauth",
       automatedRefresh: "calibrated_reauth_probe",
+      observedWindowMs: 86400000,
+      resultHash: "sha256:recovery-result-shape",
       safe: true,
       sanitized: true,
       rawPayload: false,
+    },
+    result: {
+      expiredBeforeRecovery: true,
+      recoveredVerifySession: true,
     },
     ignoredRaw: {
       cookie: "tabbit_session=secret",
@@ -2978,9 +3567,15 @@ test("probe validate --write-fixture persists recoverSession offline evidence wi
     evidence: {
       strategy: "automated_reauth",
       automatedRefresh: "calibrated_reauth_probe",
+      observedWindowMs: 86400000,
+      resultHash: "sha256:recovery-result-shape",
       safe: true,
       sanitized: true,
       rawPayload: false,
+    },
+    result: {
+      expiredBeforeRecovery: true,
+      recoveredVerifySession: true,
     },
   }]);
   const text = stream.stdout.join("");
@@ -3148,9 +3743,15 @@ test("probe validate --write-fixture prints plain offline fixture refs without r
     evidence: {
       strategy: "automated_reauth",
       automatedRefresh: "calibrated_reauth_probe",
+      observedWindowMs: 86400000,
+      resultHash: "sha256:recovery-result-shape",
       safe: true,
       sanitized: true,
       rawPayload: false,
+    },
+    result: {
+      expiredBeforeRecovery: true,
+      recoveredVerifySession: true,
     },
     ignoredRaw: {
       cookie: "tabbit_session=secret",
@@ -3195,9 +3796,15 @@ test("probe protocol --operation recoverSession rejects offline evidence dispatc
     evidence: {
       strategy: "automated_reauth",
       automatedRefresh: "calibrated_reauth_probe",
+      observedWindowMs: 86400000,
+      resultHash: "sha256:recovery-result-shape",
       safe: true,
       sanitized: true,
       rawPayload: false,
+    },
+    result: {
+      expiredBeforeRecovery: true,
+      recoveredVerifySession: true,
     },
   };
 
@@ -3320,6 +3927,74 @@ test("probe protocol --json runs injected protocol probe runner", async () => {
   assert.equal(body.fixture.operation, "verifySession");
   assert.equal(body.advice.category, "protocol_changed");
   assert.equal(JSON.stringify(body).includes("secret-token"), false);
+});
+
+test("probe protocol --json sanitizes runner output before printing", async () => {
+  const stream = io();
+  const result = await runProtocolPoolCli([
+    "probe",
+    "protocol",
+    "--account",
+    "acct_a",
+    "--operation",
+    "sendMessage",
+    "--input-json",
+    JSON.stringify({
+      model: "tabbit/priority",
+      messages: [{ role: "user", content: "private prompt should not print" }],
+      stream: true,
+    }),
+    "--json",
+  ], {
+    accountStore: memoryStore(baseAccounts()),
+    protocolProbeRunner: {
+      async probeAccount(input) {
+        return {
+          status: "success",
+          advice: { category: "unknown", severity: "info", recommendation: "ok" },
+          fixtureRef: "fixtures/protocol-probes/live.json",
+          fixture: {
+            version: 1,
+            kind: "protocol_probe",
+            operation: input.operation,
+            status: "success",
+            input: {
+              messages: [{ role: "user", content: "private prompt should not print" }],
+              body: { prompt: "nested private prompt should not print" },
+            },
+            result: {
+              content: "private assistant text should not print",
+              streamDeltas: ["private", " stream", " text"],
+              raw: {
+                events: [{ event: "message", data: "private SSE data should not print" }],
+              },
+            },
+          },
+          rawDebug: {
+            authorization: "Bearer abc",
+            cookieHeader: "session=abc",
+            session: "raw-session",
+          },
+        };
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stream.stderr.length, 0);
+  const body = JSON.parse(stream.stdout.join(""));
+  assert.equal(body.status, "success");
+  assert.equal(body.fixtureRef, "fixtures/protocol-probes/live.json");
+  const serialized = JSON.stringify(body);
+  assert.doesNotMatch(serialized, /private prompt|nested private prompt|private assistant|private SSE data/);
+  assert.doesNotMatch(serialized, /Bearer abc|session=abc|raw-session/);
+  assert.equal(body.fixture.input.messages[0].content, "***");
+  assert.deepEqual(body.fixture.result.streamDeltas, ["***", "***", "***"]);
+  assert.equal(body.rawDebug.authorization, "***");
+  assert.equal(body.rawDebug.cookieHeader, "***");
+  assert.equal(body.rawDebug.session, "***");
 });
 
 test("probe protocol --input-json passes parsed input to the probe runner", async () => {
@@ -4269,6 +4944,13 @@ test("fixtures audit --scope session reports session lifecycle evidence", async 
   assert.equal(body.counts.failed, 1);
   assert.equal(body.lifecycle.observedWindowMs, 86_400_000);
   assert.equal(body.recoveryStrategy.status, "blocked");
+  assert.equal(body.manualCookieOperations.status, "ready");
+  assert.equal(body.manualCookieOperations.mode, "manual_reimport_then_probe");
+  assert.equal(body.manualCookieOperations.expiredSessionAction, "login_expired_then_manual_reimport");
+  assert.equal(body.manualCookieOperations.automatedRefreshRequired, false);
+  assert.deepEqual(body.manualCookieOperations.missing, []);
+  assert.deepEqual(body.manualCookieOperations.blockingMissing, []);
+  assert.deepEqual(body.manualCookieOperations.backlogMissing, ["automated_session_refresh_strategy"]);
   assert.deepEqual(body.missing, ["automated_session_refresh_strategy"]);
   assert.doesNotMatch(text, /beta-user@example.test|secret-token|token=secret|user_123/);
 });
@@ -4296,11 +4978,17 @@ test("fixtures audit --scope session reports calibrated recovery strategy eviden
       evidence: {
         strategy: "automated_reauth",
         automatedRefresh: "calibrated_reauth_probe",
+        observedWindowMs: 86400000,
+        resultHash: "sha256:recovery-result-shape",
         safe: true,
         sanitized: true,
         rawPayload: false,
       },
-      result: { raw: { cookie: "tabbit_session=secret" } },
+      result: {
+        expiredBeforeRecovery: true,
+        recoveredVerifySession: true,
+        raw: { cookie: "***" },
+      },
     }],
     ["fixtures/protocol-probes/send-success.json", {
       operation: "sendMessage",
@@ -4378,11 +5066,17 @@ test("fixtures audit --scope session uses real fixture store session recovery ev
     evidence: {
       strategy: "automated_reauth",
       automatedRefresh: "calibrated_reauth_probe",
+      observedWindowMs: 86400000,
+      resultHash: "sha256:recovery-result-shape",
       safe: true,
       sanitized: true,
       rawPayload: false,
     },
-    result: { raw: { cookie: "tabbit_session=secret" } },
+    result: {
+      expiredBeforeRecovery: true,
+      recoveredVerifySession: true,
+      raw: { cookie: "***" },
+    },
   }), "utf8");
   await writeFile(path.join(fixtureDir, "send-success.json"), JSON.stringify({
     kind: "protocol_probe",
@@ -4430,6 +5124,21 @@ test("fixtures audit --scope session prints refresh strategy gap in plain output
       observedAt: "2026-07-03T03:00:00.000Z",
       result: { ok: false, error: { category: "login_required", status: 401, message: "expired beta-user@example.test token=secret" } },
     }],
+    ["fixtures/protocol-probes/session-recovery-marker-only.json", {
+      kind: "session_recovery_strategy",
+      operation: "recoverSession",
+      status: "success",
+      evidence: {
+        strategy: "automated_reauth",
+        automatedRefresh: "calibrated_reauth_probe",
+        safe: true,
+        sanitized: true,
+        rawPayload: false,
+      },
+      result: {
+        raw: { cookie: "***" },
+      },
+    }],
     ["fixtures/protocol-probes/send-success.json", {
       operation: "sendMessage",
       status: "success",
@@ -4463,15 +5172,19 @@ test("fixtures audit --scope session prints refresh strategy gap in plain output
     "listFixtures",
     "readFixture:fixtures/protocol-probes/session-success.json",
     "readFixture:fixtures/protocol-probes/session-expired.json",
+    "readFixture:fixtures/protocol-probes/session-recovery-marker-only.json",
   ]);
   assert.equal(stream.stderr.length, 0);
   const text = stream.stdout.join("");
   assert.match(text, /^status\tblocked/m);
   assert.match(text, /^successful_verifySession_fixture\tready\t1/m);
   assert.match(text, /^expired_verifySession_fixture\tready\t1/m);
+  assert.match(text, /^session_lifecycle\tlast_successful_at=2026-07-02T03:00:00.000Z\tlast_expired_at=2026-07-03T03:00:00.000Z\tobserved_window_ms=86400000/m);
+  assert.match(text, /^manual_cookie_mode\tready\tmode=manual_reimport_then_probe\texpired_session_action=login_expired_then_manual_reimport\tautomated_refresh_required=false\trelease_blocking_missing=\tbacklog_missing=automated_session_refresh_strategy/m);
   assert.match(text, /^recovery_strategy\tblocked\tmanual_reimport_then_probe\tnot_calibrated/m);
+  assert.match(text, /^recovery_strategy_rejected\t1/m);
   assert.match(text, /^missing\tautomated_session_refresh_strategy/m);
-  assert.doesNotMatch(text, /beta-user@example.test|secret-token|token=secret|user_123|non-session fixture/);
+  assert.doesNotMatch(text, /beta-user@example.test|secret-token|token=secret|user_123|tabbit_session|non-session fixture/);
 });
 
 test("fixtures audit --scope upstream reports real upstream boundary evidence", async () => {
@@ -4649,6 +5362,26 @@ test("fixtures audit --scope upstream prints boundary counts in plain output", a
       source: "local-http-test",
       result: { raw: { kind: "stream", format: "sse" }, streamDeltas: ["local-only fixture"] },
     }],
+    ["fixtures/protocol-probes/missed-stream-evidence.json", {
+      kind: "protocol_probe",
+      operation: "sendMessage",
+      status: "failed",
+      input: { messages: [{ role: "user", content: "private diagnostic prompt" }] },
+      result: {
+        raw: {
+          kind: "stream",
+          format: "sse",
+          async: true,
+          events: [{ event: "message", data: "private missed stream text" }],
+        },
+        upstreamEvidence: { source: "tabbit-live", real: true, stream: true },
+      },
+      error: {
+        category: "protocol_changed",
+        code: "STREAM_EVIDENCE_NOT_CAPTURED",
+        message: "stream evidence was requested but not captured for token=secret",
+      },
+    }],
     ["fixtures/protocol-probes/session-success.json", {
       operation: "verifySession",
       status: "success",
@@ -4681,6 +5414,7 @@ test("fixtures audit --scope upstream prints boundary counts in plain output", a
     "listFixtures",
     "readFixture:fixtures/protocol-probes/upstream-error.json",
     "readFixture:fixtures/protocol-probes/local-stream.json",
+    "readFixture:fixtures/protocol-probes/missed-stream-evidence.json",
   ]);
   assert.equal(stream.stderr.length, 0);
   const text = stream.stdout.join("");
@@ -4688,12 +5422,13 @@ test("fixtures audit --scope upstream prints boundary counts in plain output", a
   assert.match(text, /^real_upstream_error_frame_fixture\tready\t1/m);
   assert.match(text, /^real_upstream_cancellation_fixture\tmissing\t0/m);
   assert.match(text, /^real_upstream_backpressure_fixture\tmissing\t0/m);
-  assert.match(text, /^real_upstream\t1/m);
+  assert.match(text, /^real_upstream\t2/m);
   assert.match(text, /^upstream_error_frame\t1/m);
   assert.match(text, /^upstream_cancellation\t0/m);
   assert.match(text, /^upstream_backpressure\t0/m);
+  assert.match(text, /^stream_evidence_not_captured\t1/m);
   assert.match(text, /^missing\treal_upstream_cancellation_fixture,real_upstream_backpressure_fixture/m);
-  assert.doesNotMatch(text, /local-only fixture|user_123|QUOTA_EXHAUSTED/);
+  assert.doesNotMatch(text, /local-only fixture|user_123|QUOTA_EXHAUSTED|private diagnostic prompt|private missed stream text|token=secret/);
 });
 
 test("fixtures audit rejects unsupported scopes before reading fixtures", async () => {
