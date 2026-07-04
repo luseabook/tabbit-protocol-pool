@@ -1224,6 +1224,250 @@ test("verifySession rejects missing session material before fetching sign-key", 
   assert.equal(calls.length, 0);
 });
 
+test("auth verification-code operations report missing configuration before network", async () => {
+  const calls = [];
+  const client = new ProtocolTabbitClient({
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({ ok: true });
+    },
+  });
+
+  const send = await client.sendVerificationCode({ email: "new-user@example.test" });
+  const submit = await client.submitRegistrationOrLogin({ email: "new-user@example.test", code: "CODE-PLACEHOLDER" });
+
+  assert.equal(send.ok, false);
+  assert.equal(send.error.category, "protocol_missing");
+  assert.equal(send.error.code, "MISSING_AUTH_SEND_CODE_PATH");
+  assert.equal(submit.ok, false);
+  assert.equal(submit.error.category, "protocol_missing");
+  assert.equal(submit.error.code, "MISSING_AUTH_SUBMIT_CODE_PATH");
+  assert.equal(calls.length, 0);
+});
+
+test("auth verification-code operations validate required input before network", async () => {
+  const calls = [];
+  const client = new ProtocolTabbitClient({
+    authSendCodePath: "/api/auth/send-code",
+    authSubmitCodePath: "/api/auth/submit-code",
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({ ok: true });
+    },
+  });
+
+  const missingEmail = await client.sendVerificationCode({ email: "" });
+  const missingCode = await client.submitRegistrationOrLogin({ email: "new-user@example.test" });
+
+  assert.equal(missingEmail.ok, false);
+  assert.equal(missingEmail.error.category, "invalid_request");
+  assert.equal(missingEmail.error.code, "MISSING_EMAIL");
+  assert.equal(missingCode.ok, false);
+  assert.equal(missingCode.error.category, "invalid_request");
+  assert.equal(missingCode.error.code, "MISSING_VERIFICATION_CODE");
+  assert.equal(calls.length, 0);
+});
+
+test("sendVerificationCode posts signed JSON body to configured auth endpoint", async () => {
+  const calls = [];
+  const client = new ProtocolTabbitClient({
+    authSendCodePath: "/api/auth/send-code",
+    now: () => 1700000000000,
+    signature: () => "signature-send-code",
+    uniqueUuid: () => "00000000-0000-4000-8000-000000000010",
+    reqCtx: "fixture-req-ctx",
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      if (calls.length === 1) return jsonResponse("sign-key-auth");
+      return jsonResponse({ success: true }, { headers: { "content-type": "application/json" } });
+    },
+  });
+
+  const result = await client.sendVerificationCode({ email: "new-user@example.test" });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.raw.success, true);
+  assert.equal(calls[0].url, "https://web.tabbit.ai/chat/sign-key");
+  assert.equal(calls[1].url, "https://web.tabbit.ai/api/auth/send-code");
+  assert.equal(calls[1].options.method, "POST");
+  assert.deepEqual(JSON.parse(calls[1].options.body), { email: "new-user@example.test" });
+  assert.equal(calls[1].options.headers.Cookie, undefined);
+  assert.equal(calls[1].options.headers["Content-Type"], "application/json");
+  assert.equal(calls[1].options.headers["x-req-ctx"], "fixture-req-ctx");
+  assert.equal(calls[1].options.headers["unique-uuid"], "00000000-0000-4000-8000-000000000010");
+  assert.equal(calls[1].options.headers["x-timestamp"], "1700000000000");
+  assert.equal(calls[1].options.headers["x-signature"], "signature-send-code");
+  assert.equal(typeof calls[1].options.headers["x-nonce"], "string");
+});
+
+test("proxy oauth auth endpoints post browser JSON without sign-key headers", async () => {
+  const calls = [];
+  const client = new ProtocolTabbitClient({
+    authSendCodePath: "/proxy/v0/oauth/send-verification-code",
+    authSubmitCodePath: "/proxy/v0/oauth/login",
+    reqCtx: "fixture-req-ctx",
+    uniqueUuid: () => "00000000-0000-4000-8000-000000000012",
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({ ok: true });
+    },
+  });
+
+  await client.sendVerificationCode({
+    email: "new-user@example.test",
+    body: { mobile: "10000000000", type: "login", uuid: "00000000-0000-4000-8000-000000000000" },
+  });
+  await client.submitRegistrationOrLogin({
+    email: "new-user@example.test",
+    code: "CODE-PLACEHOLDER",
+    body: { mobile: "10000000000", smsCode: "CODE-PLACEHOLDER", type: "login", uuid: "00000000-0000-4000-8000-000000000000" },
+  });
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].url, "https://web.tabbit.ai/proxy/v0/oauth/send-verification-code");
+  assert.equal(calls[1].url, "https://web.tabbit.ai/proxy/v0/oauth/login");
+  for (const call of calls) {
+    assert.equal(call.options.method, "POST");
+    assert.equal(call.options.headers["Content-Type"], "application/json");
+    assert.equal(call.options.headers.accept, "application/json");
+    assert.equal(call.options.headers["x-req-ctx"], "fixture-req-ctx");
+    assert.equal(call.options.headers["unique-uuid"], "00000000-0000-4000-8000-000000000012");
+    assert.equal(call.options.headers["x-signature"], undefined);
+    assert.equal(call.options.headers["x-nonce"], undefined);
+    assert.equal(call.options.headers["x-timestamp"], undefined);
+  }
+});
+
+test("proxy oauth auth endpoints build calibrated mobile JSON body with shared auth uuid", async () => {
+  const calls = [];
+  let authUuidCalls = 0;
+  const authUuid = "Aa0".repeat(21) + "Z";
+  const client = new ProtocolTabbitClient({
+    authSendCodePath: "/proxy/v0/oauth/send-verification-code",
+    authSubmitCodePath: "/proxy/v0/oauth/login",
+    authClientUuid: () => {
+      authUuidCalls += 1;
+      return authUuid;
+    },
+    uniqueUuid: () => "00000000-0000-4000-8000-000000000013",
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({ success: true });
+    },
+  });
+
+  const send = await client.sendVerificationCode({ mobile: "10000000000" });
+  const submit = await client.submitRegistrationOrLogin({
+    mobile: "10000000000",
+    code: "123456",
+    input: { channel: "desktop" },
+  });
+
+  assert.equal(send.ok, true);
+  assert.equal(submit.ok, true);
+  assert.equal(authUuidCalls, 1);
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    uuid: authUuid,
+    platform: "1",
+    version: "",
+    app: "1000",
+    mobile: "10000000000",
+  });
+  assert.deepEqual(JSON.parse(calls[1].options.body), {
+    uuid: authUuid,
+    platform: "1",
+    version: "",
+    app: "1000",
+    mobile: "10000000000",
+    smsCode: "123456",
+    channel: "desktop",
+  });
+  assert.equal(calls[0].options.headers["x-signature"], undefined);
+  assert.equal(calls[1].options.headers["x-signature"], undefined);
+});
+
+test("proxy oauth auth validation errors expose top-level probe classification", async () => {
+  const client = new ProtocolTabbitClient({
+    authSendCodePath: "/proxy/v0/oauth/send-verification-code",
+    fetch: async () => jsonResponse({
+      detail: [{ loc: ["body", "uuid"], type: "missing" }],
+    }, { status: 422 }),
+  });
+
+  const result = await client.sendVerificationCode({
+    email: "new-user@example.test",
+    body: { mobile: "10000000000", type: "login" },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.category, "invalid_request");
+  assert.equal(result.httpStatus, 422);
+  assert.equal(result.retryable, false);
+  assert.equal(result.error.category, "invalid_request");
+  assert.equal(result.error.status, 422);
+});
+
+test("auth operations allow explicit captured request bodies", async () => {
+  const calls = [];
+  const client = new ProtocolTabbitClient({
+    authSendCodePath: "/api/auth/send-code",
+    authSubmitCodePath: "/api/auth/submit-code",
+    now: () => 1700000000000,
+    signature: () => "signature-auth-body",
+    uniqueUuid: () => "00000000-0000-4000-8000-000000000011",
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      if (url.endsWith("/chat/sign-key")) return jsonResponse("sign-key-auth");
+      return jsonResponse({ data: { cookie: "tabbit_session=pa", user_id: "user_auth", access_tier: "free" } });
+    },
+  });
+
+  await client.sendVerificationCode({
+    email: "new-user@example.test",
+    body: { email_address: "new-user@example.test", scene: "login" },
+  });
+  const submit = await client.submitRegistrationOrLogin({
+    email: "new-user@example.test",
+    code: "CODE-PLACEHOLDER",
+    body: { email_address: "new-user@example.test", verify_code: "CODE-PLACEHOLDER", scene: "login" },
+  });
+
+  assert.equal(submit.ok, true);
+  assert.equal(submit.cookie, "tabbit_session=pa");
+  assert.equal(submit.userId, "user_auth");
+  assert.equal(submit.accessTier, "free");
+  const postCalls = calls.filter((call) => !call.url.endsWith("/chat/sign-key"));
+  assert.deepEqual(JSON.parse(postCalls[0].options.body), { email_address: "new-user@example.test", scene: "login" });
+  assert.deepEqual(JSON.parse(postCalls[1].options.body), { email_address: "new-user@example.test", verify_code: "CODE-PLACEHOLDER", scene: "login" });
+});
+
+test("submitRegistrationOrLogin normalizes safe session material variants", async () => {
+  const variants = [
+    [{ cookieHeader: "tabbit_session=pc", userId: "user_a", accessTier: "pro" }, "cookieHeader", "user_a", "pro"],
+    [{ data: { cookie: "tabbit_session=pc", user_id: "user_b", access_tier: "free" } }, "cookie", "user_b", "free"],
+    [{ data: { sessionToken: "pst" } }, "sessionToken", undefined, undefined],
+  ];
+
+  for (const [body, sessionField, userId, accessTier] of variants) {
+    const client = new ProtocolTabbitClient({
+      authSubmitCodePath: "/api/auth/submit-code",
+      fetch: async (url) => url.endsWith("/chat/sign-key")
+        ? jsonResponse("sign-key-auth")
+        : jsonResponse(body),
+    });
+
+    const result = await client.submitRegistrationOrLogin({
+      email: "new-user@example.test",
+      code: "CODE-PLACEHOLDER",
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(typeof result[sessionField], "string");
+    assert.equal(result.userId, userId);
+    assert.equal(result.accessTier, accessTier);
+  }
+});
+
 test("refreshQuota calls the real quota usage endpoint with user_id and browser uuid header", async () => {
   const calls = [];
   const client = new ProtocolTabbitClient({
@@ -1729,6 +1973,62 @@ test("reset coupon list and participate use calibrated commerce headers", async 
     },
   );
   assert.equal(calls.length, 2);
+});
+
+test("useResetCoupon posts calibrated coupon-use body with explicit confirmation", async () => {
+  const calls = [];
+  const client = new ProtocolTabbitClient({
+    benefitCouponUsePath: "/api/commerce/benefit/v1/coupon/use",
+    uniqueUuid: () => "00000000-0000-4000-8000-000000000017",
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        request_no: "coupon-use-probe",
+        use_result: "success",
+      });
+    },
+  });
+
+  await assert.rejects(
+    () => client.useResetCoupon({
+      account: { userId: "user_coupon", cookie: "tabbit_session=coupon" },
+      couponCode: "coupon-code",
+      requestNo: "coupon-use-probe",
+    }),
+    (error) => {
+      assert.equal(error.code, "SIDE_EFFECT_CONFIRMATION_REQUIRED");
+      return true;
+    },
+  );
+  assert.equal(calls.length, 0);
+
+  const result = await client.useResetCoupon({
+    account: { userId: "user_coupon", cookie: "tabbit_session=coupon" },
+    couponCode: "coupon-code",
+    requestNo: "coupon-use-probe",
+    confirmSideEffect: true,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.source, "tabbit-reset-coupon-use");
+  assert.equal(result.usageResult, "success");
+  assert.deepEqual(Object.keys(result.evidence).sort(), ["bodyHash", "endpointHash", "rawPayload", "resultHash", "safe", "sanitized"]);
+  assert.equal(result.evidence.safe, true);
+  assert.equal(result.evidence.sanitized, true);
+  assert.equal(result.evidence.rawPayload, false);
+  assert.match(result.evidence.endpointHash, /^sha256:/);
+  assert.match(result.evidence.bodyHash, /^sha256:/);
+  assert.match(result.evidence.resultHash, /^sha256:/);
+  assert.equal(calls[0].url, "https://web.tabbit.ai/api/commerce/benefit/v1/coupon/use");
+  assert.equal(calls[0].options.method, "POST");
+  assert.equal(calls[0].options.headers["Content-Type"], "application/json");
+  assert.equal(calls[0].options.headers["unique-uuid"], "00000000-0000-4000-8000-000000000017");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    user_id: "user_coupon",
+    coupon_code: "coupon-code",
+    coupon_type: "weekly_reset_coupon",
+    request_no: "coupon-use-probe",
+  });
 });
 
 test("lottery chance probes keep activity query shape and guard draw side effects", async () => {

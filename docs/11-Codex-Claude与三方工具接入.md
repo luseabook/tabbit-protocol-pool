@@ -8,8 +8,8 @@
 |---|---|
 | “CLI 完善”是什么意思？ | 已做的是本地运维 + gateway 启动 CLI `tabbit-pool`，用于看账号、健康检查、维护、协议探针、脱敏 fixture、记录 Codex/Claude 端到端验收标记、本地 gateway smoke 验收，以及 `serve/start` 启动 protocol-pool 本地兼容网关；它不是前端管理后台，也不是新的聊天客户端。根项目仍保留 `tabbit2api start/login/probe` CLI，负责现有浏览器桥接网关。 |
 | 需不需要前端管理后台？ | MVP 不需要。账号池、风控排障和协议校准优先用 CLI + `/health` + fixture，原因是更容易脱敏、测试和本地化。等真实 endpoint 稳定、账号规模增大后，再把 M08 能力包装成 Web 管理后台。 |
-| 支不支持工具调用？ | 兼容层已经支持官方工具字段透传、工具调用输出映射、工具结果回合输入保真，以及 buffered/async 工具调用流式事件。网关本地自动执行工具已有受控 opt-in loop：默认不启用、不内置工具，只有 `TABBIT_POOL_TOOL_LOOP_MODE=local_executes_tools` 且宿主注入 executor 时才执行。 |
-| 能不能像官方 API 一样给 Codex / Claude Code / 三方工具写代码？ | 对外 API 形状正在按官方 OpenAI / Anthropic 兼容口径实现：本地 `base_url + api_key + model` 可接入。真实 Tabbit 文本 send endpoint、签名、Codex/Claude 文本端到端和 403 fixture 已校准；真实上游原生工具字段已确认不支持。默认策略仍是 `client_executes_tools_first`，让 Codex/Claude 或 SDK 自己执行工具；需要网关代执行时必须显式开启本地 loop 并注入 executor。 |
+| 支不支持工具调用？ | 兼容层已经支持官方工具字段透传、工具调用输出映射、工具结果回合输入保真，以及 buffered/async 工具调用流式事件。网关本地自动执行工具已有受控 opt-in loop：默认不启用、不内置工具，只有 `TABBIT_POOL_TOOL_LOOP_MODE=local_executes_tools` 且宿主注入 executor 时才执行，并受工具 allowlist、最大轮数、单工具超时和结果截断约束。 |
+| 能不能像官方 API 一样给 Codex / Claude Code / 三方工具写代码？ | 对外 API 形状正在按官方 OpenAI / Anthropic 兼容口径实现：本地 `base_url + api_key + model` 可接入。真实 Tabbit 文本 send endpoint、签名、Codex/Claude 文本端到端和 403 fixture 已校准；真实上游原生工具字段已确认不支持。默认策略仍是 `client_executes_tools_first`，让 Codex/Claude 或 SDK 自己执行工具；需要网关代执行时必须显式开启本地 loop、注入 executor，并配置 guardrails。 |
 
 ## 两个 CLI 的边界
 
@@ -102,6 +102,18 @@ $env:TABBIT_POOL_COMPAT_STRIP_CLIENT_TOOLS = "true"
 ~~~
 
 该开关只剥离已知客户端内置协作工具以完成文本请求，不代表真实 Tabbit 上游已经支持工具调用。
+
+本地工具代执行的最小 guardrail 配置示例：
+
+~~~powershell
+$env:TABBIT_POOL_TOOL_LOOP_MODE = "local_executes_tools"
+$env:TABBIT_POOL_LOCAL_TOOL_ALLOWLIST = "lookup_repo,read_note"
+$env:TABBIT_POOL_LOCAL_TOOL_MAX_ROUNDS = "4"
+$env:TABBIT_POOL_LOCAL_TOOL_TIMEOUT_MS = "5000"
+$env:TABBIT_POOL_LOCAL_TOOL_MAX_RESULT_CHARS = "16000"
+~~~
+
+这些变量只约束宿主注入的本地 executor；项目不会自动提供 shell、web、js、fetch 等工具。
 
 ### Codex 工具调用链路
 

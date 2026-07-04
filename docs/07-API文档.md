@@ -5,14 +5,14 @@
 ## 当前状态
 
 - 已实现 OpenAICompat.handleChatCompletions(body)、OpenAICompat.handleResponses(body) 与 AnthropicCompat.handleMessages(body) 纯 handler。
-- 已实现官方工具字段通道、基础 tool call 输出映射、工具回合输入保真与受控本地工具 loop：OpenAI Chat/Responses 的非空 `tools`、`tool_choice`、`parallel_tool_calls` 与 Anthropic Messages 的非空 `tools`、`tool_choice` 默认会从 compat handler 透传到 `PooledRequestRunner`；没有真实工具定义时，compat 会忽略 no-op 工具选项，避免纯文本请求误触发真实工具未支持错误。旧显式 sendPath 骨架会把这些字段写入 `ProtocolTabbitClient.sendMessage()` 的签名请求 body，真实 `/api/v1/chat/completion` 分支明确返回 `unsupported_feature/TOOL_FIELDS_UNSUPPORTED`，避免静默丢工具字段。协议客户端可把 OpenAI `tool_calls` 与 Anthropic `tool_use` 响应归一化为内部 `tool_use` block，buffered OpenAI stream `tool_calls` chunks 与 Anthropic stream `tool_use` / `input_json_delta` chunks 也会聚合为内部 `tool_use` block；compat 会输出 Chat `message.tool_calls`、Responses `function_call` output item、Anthropic `tool_use` content block，Chat SSE adapter 会输出 `tool_calls` delta，Responses SSE adapter 会为 `function_call` 输出 `response.output_item.*` 与 `response.function_call_arguments.*` events；当客户端执行工具后继续提交 OpenAI Chat `role:"tool"` / `tool_call_id`、Responses `function_call` / `function_call_output` input item 或 Anthropic `tool_use` / `tool_result` content block 时，compat 会保留结构并传入 runner。`TABBIT_POOL_TOOL_LOOP_MODE=local_executes_tools` 且宿主注入本地 executor 时，LocalToolLoopRunner 会剥离真实协议不支持的原生工具字段、解析 JSON tool_use 文本、执行注入工具并追加 tool result 继续多轮；默认不启用，也不内置 shell/web/js/fetch 工具。async 上游 OpenAI `tool_calls` 与 Anthropic `tool_use` / `input_json_delta` 已能转换为内部 `tool_call_delta` 并由 HTTP SSE adapter 输出官方风格工具事件。
+- 已实现官方工具字段通道、基础 tool call 输出映射、工具回合输入保真与受控本地工具 loop：OpenAI Chat/Responses 的非空 `tools`、`tool_choice`、`parallel_tool_calls` 与 Anthropic Messages 的非空 `tools`、`tool_choice` 默认会从 compat handler 透传到 `PooledRequestRunner`；没有真实工具定义时，compat 会忽略 no-op 工具选项，避免纯文本请求误触发真实工具未支持错误。旧显式 sendPath 骨架会把这些字段写入 `ProtocolTabbitClient.sendMessage()` 的签名请求 body，真实 `/api/v1/chat/completion` 分支明确返回 `unsupported_feature/TOOL_FIELDS_UNSUPPORTED`，避免静默丢工具字段。协议客户端可把 OpenAI `tool_calls` 与 Anthropic `tool_use` 响应归一化为内部 `tool_use` block，buffered OpenAI stream `tool_calls` chunks 与 Anthropic stream `tool_use` / `input_json_delta` chunks 也会聚合为内部 `tool_use` block；compat 会输出 Chat `message.tool_calls`、Responses `function_call` output item、Anthropic `tool_use` content block，Chat SSE adapter 会输出 `tool_calls` delta，Responses SSE adapter 会为 `function_call` 输出 `response.output_item.*` 与 `response.function_call_arguments.*` events；当客户端执行工具后继续提交 OpenAI Chat `role:"tool"` / `tool_call_id`、Responses `function_call` / `function_call_output` input item 或 Anthropic `tool_use` / `tool_result` content block 时，compat 会保留结构并传入 runner。`TABBIT_POOL_TOOL_LOOP_MODE=local_executes_tools` 且宿主注入本地 executor 时，LocalToolLoopRunner 会剥离真实协议不支持的原生工具字段、解析 JSON tool_use 文本、执行注入工具并追加 tool result 继续多轮；本地执行受 allowlist、最大轮数、单工具超时和结果截断约束，默认不启用，也不内置 shell/web/js/fetch 工具。async 上游 OpenAI `tool_calls` 与 Anthropic `tool_use` / `input_json_delta` 已能转换为内部 `tool_call_delta` 并由 HTTP SSE adapter 输出官方风格工具事件。
 - 已实现 PooledRequestRunner、AccountPool、ProtocolTabbitClient 的离线可测骨架。
-- 已实现 AccountProvisioner 注册/导入/session 验证基础编排层。真实 Tabbit session 验证 endpoint 已校准为 `GET /api/v0/user/base-info`；发送验证码和提交验证码接口仍待还原。
+- 已实现 AccountProvisioner 注册/导入/session 验证基础编排层。真实 Tabbit session 验证 endpoint 已校准为 `GET /api/v0/user/base-info`；发送验证码和提交验证码已有可配置协议入口，但真实 endpoint/body success evidence 仍待还原。
 - 已实现 Observability foundation，并默认接入 protocol-pool gateway `/health` 账号池摘要。
-- 已实现 M08 本地运维 CLI foundation：`tabbit-pool accounts list`、`tabbit-pool accounts import-session`、`tabbit-pool accounts probe`、`tabbit-pool health`、`tabbit-pool readiness`、`tabbit-pool readiness mark`、`tabbit-pool serve/start`、`tabbit-pool smoke gateway`、`tabbit-pool maintain`、`tabbit-pool fixtures list`、`tabbit-pool fixtures audit`、`tabbit-pool fixtures show`、`tabbit-pool probe advice`、`tabbit-pool probe template`、`tabbit-pool probe protocol`（含 `--input-json/--input-file`、refreshQuota/uploadAttachment/只读 commerce 查询/M05 side-effect probe 模板与 operation-aware schema validation）。
+- 已实现 M08 本地运维 CLI foundation：`tabbit-pool accounts list`、`tabbit-pool accounts import-session`、`tabbit-pool accounts probe`、`tabbit-pool health`、`tabbit-pool readiness`、`tabbit-pool readiness doctor`、`tabbit-pool readiness mark`、`tabbit-pool serve/start`、`tabbit-pool smoke gateway`、`tabbit-pool maintain`、`tabbit-pool fixtures list`、`tabbit-pool fixtures audit`、`tabbit-pool fixtures show`、`tabbit-pool probe advice`、`tabbit-pool probe template`、`tabbit-pool probe validate`、`tabbit-pool probe protocol`（含 `--input-json/--input-file`、refreshQuota/uploadAttachment/只读 commerce 查询/M05 side-effect probe 模板、离线 recoverSession evidence 模板/校验/fixture 写入、离线 consumeResetCoupon evidence 模板/校验/fixture 写入、operation-aware schema validation 和 `--require-confirmed-side-effect` 离线副作用确认门禁）。
 - 已实现原生 HTTP server JSON 骨架与 OpenAI/Anthropic SSE adapter：`/health`、`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`。详见 [HTTP 路由层](modules/M06-兼容网关/HTTP路由层.md) 与 [流式 SSE 链路](10-流式SSE链路.md)。
 - 已实现 protocol-pool gateway 启动工厂和 `tabbit-pool serve/start` CLI，可从 config/stateDir 组合 JSON account store、FileSecretStore、StoredAccountPool、runner、OpenAICompat 与 HTTP server，并输出 OpenAI/Anthropic base URL。详见 [启动工厂](modules/M06-兼容网关/启动工厂.md)。
-- 真实 Tabbit 文本发送 endpoint `/api/v1/chat/completion`、session verify endpoint `/api/v0/user/base-info`、quota usage endpoint `/api/commerce/quota/v1/usage`、已验证只读 commerce 状态/资源 endpoint、M05 显式 side-effect probe endpoint、浏览器校准签名头、真实 `display_name` 模型目录、`Default` 可用模型映射、已上传附件引用结构和完整配置上传链时的 raw/base64 附件自动上传已接入；注册/登录、活动 Pro 成功领取 body、真实重置券消耗语义和抽奖成功响应仍待安全 evidence 后接入。`ProtocolTabbitClient.sendMessage()` 已具备真实 SSE/旧显式 sendPath SSE/NDJSON buffered 响应聚合解析、buffered OpenAI stream `tool_calls` 聚合、buffered Anthropic stream `tool_use` / `input_json_delta` 聚合、数组 `streamDeltas` 保留、可读 response.body 的 async `streamDeltas` producer、async OpenAI/Anthropic 工具 delta producer，以及 stream error frame 基础分类传播。`ProtocolTabbitClient.uploadAttachment()` 已具备显式 `attachmentUploadPath` 的签名上传骨架和真实 COS 三步上传；`sendMessage({ attachments })` 在真实分支支持已上传文件引用并映射为 `references[].metadata.file_id`，完整配置上传链时会自动上传 raw/base64 附件后发送。`ProtocolTabbitClient.refreshQuota()` 只有显式 `quotaUsagePath` 时才会用已登录 Cookie + `user_id` 查询 usage 百分比；只读 activity/newbie/placement/reward/lottery 方法只做 GET 查询。默认 `maintain` 不触网；显式配置 quota usage path 后可自动刷新额度，显式配置 sign-in path 后可自动执行已验证每日签到；活动 Pro、抽奖和真实重置券消耗仍不会自动执行。OpenAI Chat/Responses 与 Anthropic Messages handler 会把这些 deltas 作为非公开 `stream.deltas` 元数据交给 HTTP SSE adapter；没有上游 delta 时仍支持基于完整 JSON 结果的 fallback SSE。
+- 真实 Tabbit 文本发送 endpoint `/api/v1/chat/completion`、session verify endpoint `/api/v0/user/base-info`、quota usage endpoint `/api/commerce/quota/v1/usage`、已验证只读 commerce 状态/资源 endpoint、M05 显式 side-effect probe endpoint、真实重置券消耗 endpoint/body/result 语义、浏览器校准签名头、真实 `display_name` 模型目录、`Default` 可用模型映射、已上传附件引用结构和完整配置上传链时的 raw/base64 附件自动上传已接入；注册/登录 auth 入口已有显式配置和响应归一化，但真实 send-code delivery/session-material success evidence、活动 Pro 成功领取 body 和抽奖成功响应仍待安全 evidence 后接入。`ProtocolTabbitClient.sendMessage()` 已具备真实 SSE/旧显式 sendPath SSE/NDJSON buffered 响应聚合解析、buffered OpenAI stream `tool_calls` 聚合、buffered Anthropic stream `tool_use` / `input_json_delta` 聚合、数组 `streamDeltas` 保留、可读 response.body 的 async `streamDeltas` producer、async OpenAI/Anthropic 工具 delta producer，以及 stream error frame 基础分类传播。`ProtocolTabbitClient.uploadAttachment()` 已具备显式 `attachmentUploadPath` 的签名上传骨架和真实 COS 三步上传；`sendMessage({ attachments })` 在真实分支支持已上传文件引用并映射为 `references[].metadata.file_id`，完整配置上传链时会自动上传 raw/base64 附件后发送。`ProtocolTabbitClient.refreshQuota()` 只有显式 `quotaUsagePath` 时才会用已登录 Cookie + `user_id` 查询 usage 百分比；只读 activity/newbie/placement/reward/lottery 方法只做 GET 查询。默认 `maintain` 不触网；显式配置 quota usage path 后可自动刷新额度，显式配置 sign-in path 后可自动执行已验证每日签到；活动 Pro、抽奖和真实重置券消耗仍不会自动执行，真实用券当前只通过显式 `useResetCoupon` probe/gateway 方法触发。OpenAI Chat/Responses 与 Anthropic Messages handler 会把这些 deltas 作为非公开 `stream.deltas` 元数据交给 HTTP SSE adapter；没有上游 delta 时仍支持基于完整 JSON 结果的 fallback SSE。
 
 ## 认证约定
 
@@ -299,7 +299,50 @@ POST https://web.tabbit.ai/api/v1/chat/completion
 - async 路径：当 `stream:true`、上游 2xx、Content-Type 是 SSE/NDJSON 且 `response.body` 可读时，协议客户端立即返回 `{ ok:true, contentBlocks:[{ type:"text", text:"" }], raw:{ kind:"stream", format, async:true, events:[] }, streamDeltas:AsyncIterable<string | tool_call_delta> }`。迭代 `streamDeltas` 时会边读 response.body 边解析 delta，并把结构化事件追加到 `raw.events`；文本 chunk 以字符串 yield，OpenAI `tool_calls` / Anthropic `tool_use` / `input_json_delta` 以 `{ type:"tool_call_delta", index, id?, name?, argumentsDelta? }` yield。
 - 错误帧路径：如果 SSE `event:error`、`type:"error"`、`event:"error"`、`error`、`errorCode` 或 `code + message` 形状出现在 buffered stream 中，`sendMessage()` 会返回 `{ ok:false, error }`；如果出现在 async stream 中，`streamDeltas` 会在记录该 raw event 后抛出 `ProtocolTabbitError`。错误分类复用 `classifyProtocolError()`，因此 quota/usage/credit 耗尽信号会成为 `quota_exhausted`。
 
-真实 `/api/v1/chat/completion` 已通过 `Default` 模型完成文本 SSE 探针，并通过已上传附件 `references[].metadata.file_id` 与 raw/base64 自动上传后发送完成附件探针。真实上游私有工具语义、更多错误帧和取消/backpressure 仍需后续 fixture 校准；官方原生工具字段已确认返回 `TOOL_FIELDS_UNSUPPORTED`。
+真实 `/api/v1/chat/completion` 已通过 `Default` 模型完成文本 SSE 探针，并通过已上传附件 `references[].metadata.file_id` 与 raw/base64 自动上传后发送完成附件探针。真实上游私有工具语义、更多错误帧和取消/backpressure 仍需后续 fixture 校准；官方原生工具字段已确认返回 `TOOL_FIELDS_UNSUPPORTED`，真实上游 stream boundary 缺口可用 `fixtures audit --scope upstream` 只读跟踪。
+
+### ProtocolTabbitClient.sendVerificationCode(input)
+
+~~~ts
+type SendVerificationCodeInput = {
+  email?: string;
+  mobile?: string;
+  uuid?: string;
+  body?: Record<string, unknown> | null;
+  input?: { authSendCodeBody?: Record<string, unknown>; mobile?: string; uuid?: string; authClientUuid?: string };
+};
+~~~
+
+该方法是 M04 注册/登录校准入口，不代表真实验证码投递成功已闭环。必须显式配置 `authSendCodePath` 或 `TABBIT_POOL_PROTOCOL_AUTH_SEND_CODE_PATH`；未配置时返回 `{ ok:false, error.code:"MISSING_AUTH_SEND_CODE_PATH" }` 且不触网。默认 method 是 `POST`，可用 `authSendCodeMethod` / `TABBIT_POOL_PROTOCOL_AUTH_SEND_CODE_METHOD` 覆盖。
+
+非 `/proxy/v0/oauth/*` path 仍使用旧签名 auth 占位 body：
+
+~~~json
+{ "email": "new-user@example.test" }
+~~~
+
+真实登录页 chunk 已校准 `/proxy/v0/oauth/send-verification-code` 的浏览器 body：
+
+~~~json
+{ "uuid": "<64-char-alnum>", "platform": "1", "version": "", "app": "1000", "mobile": "10000000000" }
+~~~
+
+proxy OAuth 分支不获取 sign-key，不发送 `x-signature` / `x-nonce` / `x-timestamp`；`uuid` 是登录组件生成并复用的 64 位字母数字 auth client value。若传入显式 `body` 或 `input.authSendCodeBody`，实现会优先使用显式 body。Yoda/captcha 成功仍 blocked：真实页面在 send-code 错误体含 `data.verifyUrl + data.requestCode` 时调用 `window.YodaSeed(...)`，项目尚未捕获安全验证码投递成功 fixture。
+
+### ProtocolTabbitClient.submitRegistrationOrLogin(input)
+
+~~~ts
+type SubmitRegistrationOrLoginInput = {
+  email?: string;
+  mobile?: string;
+  uuid?: string;
+  code: string;
+  body?: Record<string, unknown> | null;
+  input?: { authSubmitCodeBody?: Record<string, unknown>; mobile?: string; uuid?: string; authClientUuid?: string; channel?: string };
+};
+~~~
+
+必须显式配置 `authSubmitCodePath` 或 `TABBIT_POOL_PROTOCOL_AUTH_SUBMIT_CODE_PATH`；未配置时返回 `{ ok:false, error.code:"MISSING_AUTH_SUBMIT_CODE_PATH" }` 且不触网。非 proxy path 默认 body 是 `{ "email": "...", "code": "..." }`，只用于旧校准占位。真实登录页 chunk 已校准 `/proxy/v0/oauth/login` body 为 `{ "uuid": "<64-char-alnum>", "platform": "1", "version": "", "app": "1000", "mobile": "...", "smsCode": "..." }`，可选 `channel`；proxy OAuth 分支不获取 sign-key。成功响应会归一化 `cookieHeader`、`cookie`、`session`、`sessionToken`、`token`、`userId`、`accessTier`，供 `AccountProvisioner.extractSessionSecret()` 写入 secret store。raw cookie/session/token 不应进入 stdout、文档、fixture 原文或账号 JSON 元数据。
 
 ### ProtocolTabbitClient.uploadAttachment(input)
 
@@ -665,7 +708,7 @@ type MaintainAccountResult = {
 
 批量维护账号。传入 `accounts` 数组时按顺序执行 `maintainAccount()` 并返回 `{ accounts, changed, results }`，不直接写盘。未传入数组时，必须在构造时提供 `accountStore`；方法会先调用 `loadAccounts()`，再在任一账号 `changed:true` 时调用 `saveAccounts()`。全部动作 skipped/failed 且账号未变化时不会写盘。
 
-已校准的真实接口中，quota usage 查询和每日签到可进入默认维护链，但都需要显式配置对应 path。activity/newbie/placement/reward/lottery records 只读 commerce 探针不执行默认维护动作；activity participate、抽奖 POST 等其它 M05 side-effect path 仍只作为显式 probe 接入。活动 Pro 成功领取 body、真实重置券消耗语义、抽奖成功响应和调度策略仍待安全 evidence 与回归 fixture 后再接入维护链。
+已校准的真实接口中，quota usage 查询和每日签到可进入默认维护链，但都需要显式配置对应 path。activity/newbie/placement/reward/lottery records 只读 commerce 探针不执行默认维护动作；activity participate、`useResetCoupon`、抽奖 POST 等其它 M05 side-effect path 仍只作为显式 probe 接入。真实重置券消耗已通过 `useResetCoupon` endpoint/body/result 语义闭环；活动 Pro 成功领取 body、抽奖成功响应和默认调度策略仍待安全 evidence 与回归 fixture 后再接入维护链。
 
 ## 观测运维 API（已实现基础层）
 
@@ -729,7 +772,11 @@ type HealthSnapshot = {
 
 ### buildProtocolFixtureAudit(input)
 
-离线审计 protocol probe fixture 覆盖，输出 `{ status, observedAt, counts, coverage, missing, nextActions }`。覆盖项为成功 verifySession、成功 sendMessage、流式文本、工具调用或明确不支持原生工具字段的证据、403/forbidden fixture。`tabbit-pool fixtures audit --json` 使用该 helper；它只输出聚合结果，不返回 raw payload。
+离线审计 protocol probe fixture 覆盖，输出 `{ status, observedAt, counts, coverage, missing, nextActions }`。默认 scope 为 `protocol`，覆盖项为成功 verifySession、成功 sendMessage、流式文本、工具调用或明确不支持原生工具字段的证据、403/forbidden fixture。`scope:"auth"` 会输出 `scope:"auth"`，只审计成功 `sendVerificationCode` 与成功 `submitRegistrationOrLogin` fixture；其中 send coverage 要求响应形状包含 send/delivery/verification/code-send 专属成功字段，单纯 2xx、`ok:true` 或泛 `status/result:"success"` 只计入 `counts.successfulSendVerificationCode`，不让 coverage ready；submit coverage 还要求响应形状包含 `cookieHeader`、`cookieJar`、`cookie`、`session`、`sessionToken` 或 `token` 等可导入 session material 字段，单纯 2xx/`ok:true` 不计为闭环。`counts.successfulSendVerificationCodeWithDeliverySignal` 表示有投递成功信号的发送验证码成功数；`counts.successfulSubmitRegistrationOrLogin` 保留 submit transport success 数，`counts.successfulSubmitRegistrationOrLoginWithSessionMaterial` 表示可导入 session material 的成功数。`scope:"benefits"` 会输出 `scope:"benefits"`，并只审计每日签到、活动 Pro 成功、真实重置券消耗和抽奖成功 fixture 覆盖；真实用券消耗必须来自消费类 operation，且同时有脱敏 `endpointHash/bodyHash/resultHash`、`safe:true`、`sanitized:true`、`rawPayload:false` evidence 和真实消费成功信号；`participateResetCouponActivity` 只作为活动参与 evidence，永不满足真实用券消耗 coverage；`drawLottery` 只有 draw/lottery 专属成功字段或非空奖品/命中记录才满足 lottery coverage，泛 `ok/status/result:"success"` 不计为抽奖成功；`total/success/failed` 也只统计 M05 side-effect 白名单 operation。`scope:"session"` 会输出 `scope:"session"`，并审计成功 `verifySession`、上游 401/login_required 过期 fixture 和自动恢复策略 evidence；本地 `session_missing` 只计数，不当成上游过期。成功/过期 lifecycle coverage ready 但没有显式脱敏 `session_recovery_strategy` / `recoverSession` evidence 时，session scope 仍因 `automated_session_refresh_strategy` 保持 blocked；恢复 evidence 必须声明安全、已脱敏、无 raw payload 且使用已校准自动 re-auth/refresh 模式。`scope:"upstream"` 会输出 `scope:"upstream"`，只审计 `sendMessage` 真实上游 stream boundary evidence；`real_upstream_error_frame_fixture`、`real_upstream_cancellation_fixture` 和 `real_upstream_backpressure_fixture` 只有在 fixture 同时带显式真实上游 marker 与 stream/SSE/NDJSON 元数据时才 ready，非流式 `protocol_probe` sendMessage 只可满足默认 send readiness，本地 HTTP route、compat handler、unit/fake stream evidence 不计入。`tabbit-pool fixtures audit --json` 使用默认 scope；`tabbit-pool fixtures audit --scope auth --json` 使用 auth scope；`tabbit-pool fixtures audit --scope benefits --json` 使用 benefits scope；`tabbit-pool fixtures audit --scope session --json` 使用 session scope；`tabbit-pool fixtures audit --scope upstream --json` 使用 upstream scope。所有 scope 都只输出聚合结果，不返回 raw payload。
+
+### buildReadinessDoctorReport(input)
+
+组合 `buildCalibrationReadinessSnapshot()` 与 `buildProtocolFixtureAudit()`，输出 `{ status, observedAt, stateDir, protocol, readiness, fixtureAudit, calibrationBacklog, remainingWork, commands }`。`protocol` 只包含布尔配置状态和 `toolLoopMode`，不输出 API key、`TABBIT_POOL_PROTOCOL_REQ_CTX`、cookie、session、`cookieJarRef`、raw request/response 或账号明细。`status` 只有在 readiness 和默认 fixture audit 都 ready 时为 `ready`；任一为 blocked 时为 `blocked`，否则为 `partial`。`calibrationBacklog` 复用 auth、benefits、session 与 upstream scoped audit，用于显示注册/登录、M05 副作用、session lifecycle 和真实上游 stream boundary evidence 缺口，但不改变 top-level `status` 或 core `remainingWork`。`tabbit-pool readiness doctor --json` 使用该 helper。
 
 ### formatMaintenanceActionLog(input)
 
@@ -780,7 +827,7 @@ node bin/tabbit-pool.js accounts import-session --id acct_default --email user@e
 
 ### tabbit-pool readiness [--json]
 
-读取账号 store 和本地 protocol probe fixture，调用 `buildCalibrationReadinessSnapshot()` 输出四项 readiness：真实协议校准、Codex/Claude 端到端、工具 loop 决策和 403 fixture。工具 loop 决策来自 `TABBIT_POOL_TOOL_LOOP_MODE` / `config.compat.toolLoopMode`，只表达运行策略；`local_executes_tools` 仍需要 gateway 宿主注入 executor 才会执行工具。协议校准要求 session verify path 与 verifySession/sendMessage 成功 fixture。命令会对带 `ref` 的 fixture 摘要读取脱敏详情，以便识别 `result.error` 中的工具不支持和 403 证据；它不触发 Tabbit 网络，只帮助判断下一步该跑哪个 probe 或人工验收。
+读取账号 store 和本地 protocol probe fixture，调用 `buildCalibrationReadinessSnapshot()` 输出四项 readiness：真实协议校准、Codex/Claude 端到端、工具 loop 决策和 403 fixture。工具 loop 决策来自 `TABBIT_POOL_TOOL_LOOP_MODE` / `config.compat.toolLoopMode`，只表达运行策略；`local_executes_tools` 仍需要 gateway 宿主注入 executor 才会执行工具，并会应用 `config.compat.localToolLoop` 的 allowlist、轮数、超时和截断策略。协议校准要求 session verify path 与 verifySession/sendMessage 成功 fixture。命令会对带 `ref` 的 fixture 摘要读取脱敏详情，以便识别 `result.error` 中的工具不支持和 403 证据；它不触发 Tabbit 网络，只帮助判断下一步该跑哪个 probe 或人工验收。
 
 JSON 输出包含：
 
@@ -797,31 +844,86 @@ JSON 输出包含：
 }
 ~~~
 
+### tabbit-pool readiness doctor [--json]
+
+读取账号 store、本地 protocol probe fixture 和 `readiness.json`，调用 `buildReadinessDoctorReport()` 输出当前状态目录诊断。它不触发 Tabbit 网络、不调用 `accounts probe`、不调用 `probe protocol`、不写 `readiness.json`。
+
+JSON 输出包含：
+
+~~~json
+{
+  "status": "blocked",
+  "stateDir": "E:\\tabbit2api\\output\\tabbit-live-state",
+  "protocol": {
+    "enabled": true,
+    "baseUrlConfigured": true,
+    "sendPathConfigured": true,
+    "sessionVerifyPathConfigured": true,
+    "compatStripClientTools": true,
+    "toolLoopMode": "client_executes_tools_first"
+  },
+  "readiness": {},
+  "fixtureAudit": {},
+  "calibrationBacklog": {
+    "status": "blocked",
+    "scopes": {
+      "auth": {},
+      "benefits": {},
+      "session": {},
+      "upstream": {}
+    },
+    "missing": [],
+    "nextActions": [],
+    "captureCommands": []
+  },
+  "remainingWork": [],
+  "commands": {
+    "setStateDir": "$env:TABBIT_POOL_STATE_DIR = \"...\"",
+    "readinessDoctor": "node bin\\tabbit-pool.js readiness doctor --json",
+    "readiness": "node bin\\tabbit-pool.js readiness --json",
+    "fixturesAudit": "node bin\\tabbit-pool.js fixtures audit --json",
+    "authFixturesAudit": "node bin\\tabbit-pool.js fixtures audit --scope auth --json",
+    "benefitsFixturesAudit": "node bin\\tabbit-pool.js fixtures audit --scope benefits --json",
+    "sessionFixturesAudit": "node bin\\tabbit-pool.js fixtures audit --scope session --json",
+    "upstreamFixturesAudit": "node bin\\tabbit-pool.js fixtures audit --scope upstream --json",
+    "serveGateway": "node bin\\tabbit-pool.js serve --host 127.0.0.1 --port 50124"
+  }
+}
+~~~
+
+输出不会包含 API key、cookie、session、token、`cookieJarRef`、`TABBIT_POOL_PROTOCOL_REQ_CTX` 或 raw fixture payload。它用于把“默认状态目录 blocked”拆解成可执行下一步，或确认外部脱敏 evidence state 是否已满足 readiness/audit。`remainingWork:[]` 只代表基础 gateway/chat gate 没有剩余阻塞；若 `calibrationBacklog.status:"blocked"`，注册/登录、M05 副作用、session lifecycle 或真实上游 stream boundary 真实校准仍需继续补 evidence。非 JSON 输出除 backlog 计数外，也会为缺口打印 `capture_command` 行；这些行只包含 `<account-id>` / `<redacted-input.json>` 占位符、固定 reason，以及 template/validate/confirm_validate/probe 四段命令。JSON `captureCommands[*].confirmedValidateCommand` 只对已校准 side-effect operation 有值，等价于 `probe validate --require-confirmed-side-effect`；read-only operation 和 offline-only evidence 缺口为 `null`。`validateCommand` 只运行本地 schema 与形状预检，`confirmedValidateCommand` 只离线确认 `confirmSideEffect:true`；二者都不读取账号/secret、不触网、不证明真实 endpoint/body 已校准。真实副作用 probe 仍需先人工审查 input file 与 `confirmSideEffect`。真实用券消耗缺口现在给出 `useResetCoupon` template/validate/confirm_validate/probe 命令，并要求 `TABBIT_POOL_PROTOCOL_BENEFIT_COUPON_USE_PATH` 前置配置；离线 `consumeResetCoupon` 模板仅保留给外部脱敏 evidence 导入。session scope 的当前恢复策略是 `manual_reimport_then_probe`，自动刷新路径仍为 `not_calibrated`；`automated_session_refresh_strategy` 只给出离线 `recoverSession` template/validate 命令且 `probeCommand:null`，不代表刷新 endpoint 已校准。upstream scope 只统计显式真实上游 evidence marker，不把本地 HTTP/compat/fake stream 测试当作真实上游校准。
+
 ### tabbit-pool maintain [--json]
 
 逐个调用 `BenefitsMaintainer.maintainAccount(account)`。有任一账号 `changed:true` 时保存账号数组。默认 maintainer 也可通过 `maintainAllAccounts()` 读取绑定的本地 accountStore；未配置协议 path 时不触发网络，返回 refreshQuota、claimProIfAvailable、dailyCheckin、useResetCoupon 四个 skipped action。配置 `TABBIT_POOL_PROTOCOL_QUOTA_USAGE_PATH=/api/commerce/quota/v1/usage` 后，默认 dependencies 会给 maintainer 注入真实 `refreshQuota`，先从 secret store 读取 `cookieJarRef`，再以账号 `userId` 查询 quota usage。配置 `TABBIT_POOL_PROTOCOL_SIGN_IN_PATH=/api/commerce/activity/v1/sign-in` 后，默认 dependencies 会给 maintainer 注入真实 `dailyCheckin`，使用 `daily-sign-in-YYYYMMDD-<12 hex>` 短 `request_no` 和 `confirmSideEffect:true` 发送签到 POST；若同时配置 `TABBIT_POOL_PROTOCOL_SIGN_IN_STATUS_PATH`，会先查询状态，`signedToday:true` 时不再 POST。`claimProIfAvailable`、`useResetCoupon` 仍不会猜测真实 endpoint。配置只读 activity/newbie/placement/reward/lottery path 不会改变 maintain 动作链。
 
 ### tabbit-pool fixtures list [--json]
 
-调用 `FileProtocolFixtureStore.listFixtures()`，只列出 `stateDir/fixtures/protocol-probes/*.json` 中 `kind === "protocol_probe"` 的文件。`--json` 输出 `{ fixtures }`，每个摘要包含 `ref`、`observedAt?`、`operation?`、`status`、`accountId?`、`adviceCategory?`。不触发网络。
+调用 `FileProtocolFixtureStore.listFixtures()`，只列出 `stateDir/fixtures/protocol-probes/*.json` 中审计允许的 `protocol_probe`、`session_recovery_strategy` 与 `reset_coupon_consumption_evidence` 文件。`--json` 输出 `{ fixtures }`，每个摘要包含 `ref`、`observedAt?`、`operation?`、`status`、`accountId?`、`adviceCategory?`。不触发网络，摘要不包含 evidence/result/raw payload。
 
-### tabbit-pool fixtures audit [--json]
+### tabbit-pool fixtures audit [--scope protocol|auth|benefits|session|upstream] [--json]
 
-调用 `FileProtocolFixtureStore.listFixtures()`，对带 `ref` 的摘要调用 `readFixture(ref)`，再用 `buildProtocolFixtureAudit()` 离线输出成功 verifySession、成功 sendMessage、流式文本、工具调用或明确不支持原生工具字段的证据、403 fixture 覆盖。JSON 输出包含 `status`、`counts`、`coverage`、`missing`、`nextActions`；非 JSON 输出为 tab 分隔摘要。不触发网络，不输出 raw fixture payload。
+调用 `FileProtocolFixtureStore.listFixtures()`，对带 `ref` 的摘要调用 `readFixture(ref)`，再用 `buildProtocolFixtureAudit()` 离线输出 fixture 覆盖。默认 `protocol` scope 输出成功 verifySession、成功 sendMessage、流式文本、工具调用或明确不支持原生工具字段的证据、403 fixture 覆盖；`auth` scope 输出成功发送验证码，以及成功提交验证码且响应形状含可导入 session material 字段的 fixture 覆盖；`benefits` scope 输出成功每日签到、活动 Pro 成功、真实重置券消耗和抽奖成功 fixture 覆盖；`session` scope 输出成功 `verifySession`、上游 401/login_required 过期证据、`session_missing` 本地缺失计数、`lifecycle`、`recoveryStrategy` 和 `automated_session_refresh_strategy` 缺口；session scope 会读取 `verifySession` 与 `recoverSession` 摘要，但只有安全脱敏恢复策略 evidence 能让恢复策略 ready；`upstream` scope 只读取同时具备真实上游 marker 与 stream/SSE/NDJSON 元数据的 `sendMessage` fixture，输出真实上游 error-frame、cancellation 和 backpressure evidence 覆盖。JSON 输出包含 `status`、`counts`、`coverage`、`missing`、`nextActions`；auth/benefits/session/upstream scope 额外包含 `scope`。非 JSON 输出为 tab 分隔摘要。不触发网络，不输出 raw fixture payload；未知 scope 返回 exitCode 2。
 
 ### tabbit-pool fixtures show <ref> [--json]
 
 调用 `FileProtocolFixtureStore.readFixture(ref)` 并通过 `sanitizeProtocolProbeFixture()` 输出脱敏 fixture。ref 必须位于 `stateDir/fixtures/protocol-probes/`；缺少 ref、路径穿越或文件不存在返回 exitCode 2。`--json` 和非 JSON 模式都输出格式化 JSON。
 
+### tabbit-pool probe validate [--operation <name>] [--input-json <json> | --input-file <path>] [--require-confirmed-side-effect] [--write-fixture] [--json]
+
+解析并校验 probe input JSON，复用 `probe protocol` 调用 runner 前的 operation-aware schema validation；默认只读，不读取账号、不读取 secret、不读取 fixture、不触发网络、不写文件。JSON 输出为 `{ status:"valid", operation, source, sideEffect, confirmSideEffect?, fields, bodyKeys, attachmentKeys, evidenceKeys?, sessionRecovery?, resetCouponConsumption?, fixtureRef?, fixture? }`，只包含字段存在性、类型、object key 列表和有限枚举 evidence 摘要，不输出 email、验证码、cookie、session、token、raw payload、prompt、hash 值或 body 值。建议把 `readiness doctor` 的 `capture_command` 占位符落成真实 input file 后，先运行 `probe validate --operation <name> --input-file <redacted-input.json> --json`；若该 operation 是 auth/M05 副作用并准备写 fixture，再运行 `probe validate --operation <name> --input-file <redacted-input.json> --require-confirmed-side-effect --json`，离线确认 `confirmSideEffect:true` 后再决定是否执行 `probe protocol --write-fixture`。`recoverSession` 必须提供显式 `session_recovery_strategy` evidence，并要求 `safe:true`、`sanitized:true`、`rawPayload:false` 和已校准 re-auth/refresh mode。`consumeResetCoupon` 必须提供显式 `reset_coupon_consumption_evidence`，要求消费类 operation、`status:"success"`、`endpointHash/bodyHash/resultHash` 三个 `sha256:` 脱敏哈希、`safe:true`、`sanitized:true`、`rawPayload:false` 和真实消费成功信号；`already_participated` 等非消费信号会被拒绝。`--write-fixture` 只支持 `recoverSession` 与 `consumeResetCoupon` 这两个离线 evidence operation，写入前复用同一校验，写入时只保留白名单 evidence/result 字段，并丢弃 input 中额外 raw payload；非离线 evidence operation 会在触碰 fixture store 前拒绝。该 strict flag 和离线写入都不证明真实 endpoint/body 已校准。
+
 ### tabbit-pool probe protocol --account <id> [--operation <name>] [--input-json <json> | --input-file <path>] [--write-fixture] [--json]
 
-调用 `ProtocolProbeRunner.probeAccount()`。返回 `{ status, account, fixture, advice, fixtureRef? }`。默认 dependencies 不配置 protocol client factory，因此不会触发真实 Tabbit 网络；真实 probe 需要后续注入或配置 protocol client factory。`--write-fixture` 会通过 `FileProtocolFixtureStore` 写入 `stateDir/fixtures/protocol-probes/`。
+调用 `ProtocolProbeRunner.probeAccount()`。返回 `{ status, account, fixture, advice, fixtureRef? }`。默认 dependencies 不配置 protocol client factory，因此不会触发真实 Tabbit 网络；真实 probe 需要后续注入或配置 protocol client factory。`--write-fixture` 会通过 `FileProtocolFixtureStore` 写入 `stateDir/fixtures/protocol-probes/`。对 auth 或 M05 side-effect 输入，建议先运行 `probe validate` 确认 schema 和 `confirmSideEffect` 形状，再用 `--require-confirmed-side-effect` 做最后的只读确认门禁，最后执行真实 probe。`recoverSession` 和 `consumeResetCoupon` 是离线 evidence operation，该命令会返回 exitCode 2 且不调用 runner。
 
-支持的 operation 是 `verifySession`、`sendMessage`、`listModels`、`refreshQuota`、`uploadAttachment`、`getLotteryExplorationMe`、`getNewbieExplorationMe`、`getPlacementResources`、`listRewardCardRecords`、`listLotteryHitRecords`、`getDailySignInStatus`、`dailySignIn`、`listBenefitCoupons`、`participateResetCouponActivity`、`participateActivity`、`getUsageResetCouponSku`、`getAvailableLotteryChanceCount`、`getActiveMainPools`、`listLotteryChanceRecords` 和 `drawLottery`。`--input-json` 与 `--input-file` 可把 JSON object 作为 runner 的 `input` 传入，二者互斥；CLI 在调用 runner 前校验稳定字段：`sendMessage.model` 如出现必须是非空字符串，`sendMessage.messages` 如出现必须是非空数组，`listModels.force` 如出现必须是 boolean，`refreshQuota.userId` 如出现必须是非空字符串，`getNewbieExplorationMe.viewMode` 如出现必须是四个合法值之一，`includeCompletions` / `includeRewards` 如出现必须是 boolean，`getPlacementResources.placementCode` 和 `clientVersion` 如出现必须是非空字符串，记录查询和权益券查询的 `userId` 必须是非空字符串且 `offset` / `limit` 必须是非负整数，side-effect probe 的 `confirmSideEffect` 如出现必须是 boolean，`sceneCodes` 必须是非空字符串数组，`requestNo` 必须是非空字符串且不超过 64 字符，`activityId` 必须是非空字符串，`body` 必须是 object，`uploadAttachment.attachment` 如出现必须是 object，且 `filename`、`mimeType`、`data` 如出现必须是非空字符串。未知字段会原样保留用于真实协议校准。非法 JSON、缺少值、文件不存在、非 object 输入或 schema 非法返回 exitCode 2，stderr 不回显原始 payload，且不调用 runner。fixture 固定包含 `version:1`、`kind:"protocol_probe"`、`observedAt`、`operation`、`status` 和 `advice`；有账号时包含脱敏 `account`，有请求/响应/错误时包含脱敏 `input`、`result`、`error`。POST 型 side-effect operation 缺少 `confirmSideEffect:true` 会在协议客户端触网前失败；`attachment.data` 会在 fixture 中屏蔽，避免保存探针附件 payload。常见结果包括 `failed/session_missing`、`skipped/protocol_missing`、`failed/account_not_found` 和 `success`。
+对需要 `userId` 的只读 commerce probe，runner 会先使用 input 中的 `userId`，其次使用账号元数据中的 `userId`。如果二者都缺失且同一个协议客户端提供 `verifySession()`，runner 会用当前 session 在内存中恢复一次 user id，并只把它用于本次 `refreshQuota`、`listRewardCardRecords`、`listLotteryHitRecords`、`listBenefitCoupons` 或 `getAvailableLotteryChanceCount` 调用；该值不会写回账号 store，也不会在 fixture 或日志中明文输出。若恢复失败，目标 operation 继续按原有协议错误分类返回。
+
+支持的 operation 是 `verifySession`、`sendVerificationCode`、`submitRegistrationOrLogin`、`sendMessage`、`listModels`、`refreshQuota`、`uploadAttachment`、`getLotteryExplorationMe`、`getNewbieExplorationMe`、`getPlacementResources`、`listRewardCardRecords`、`listLotteryHitRecords`、`getDailySignInStatus`、`dailySignIn`、`listBenefitCoupons`、`participateResetCouponActivity`、`participateActivity`、`useResetCoupon`、`getUsageResetCouponSku`、`getAvailableLotteryChanceCount`、`getActiveMainPools`、`listLotteryChanceRecords` 和 `drawLottery`。`--input-json` 与 `--input-file` 可把 JSON object 作为 runner 的 `input` 传入，二者互斥；CLI 在调用 runner 前校验稳定字段：auth send/submit 的 `email` 或 `mobile` 至少一个必须非空，submit 的 `code` 必须非空，auth `uuid` 如出现必须是 64 位字母数字，auth `body` 如出现必须是 object，auth `confirmSideEffect` 如出现必须是 boolean，`sendMessage.model` 如出现必须是非空字符串，`sendMessage.messages` 如出现必须是非空数组，`listModels.force` 如出现必须是 boolean，`refreshQuota.userId` 如出现必须是非空字符串，`getNewbieExplorationMe.viewMode` 如出现必须是四个合法值之一，`includeCompletions` / `includeRewards` 如出现必须是 boolean，`getPlacementResources.placementCode` 和 `clientVersion` 如出现必须是非空字符串，记录查询和权益券查询的 `userId` 必须是非空字符串且 `offset` / `limit` 必须是非负整数，side-effect probe 的 `confirmSideEffect` 如出现必须是 boolean，`sceneCodes` 必须是非空字符串数组，`requestNo` 必须是非空字符串且不超过 64 字符，`activityId` 必须是非空字符串，`body` 必须是 object，`useResetCoupon` 的券码/类型字段必须非空，`uploadAttachment.attachment` 如出现必须是 object，且 `filename`、`mimeType`、`data` 如出现必须是非空字符串。未知字段会原样保留用于真实协议校准。非法 JSON、缺少值、文件不存在、非 object 输入或 schema 非法返回 exitCode 2，stderr 不回显原始 payload，且不调用 runner。fixture 固定包含 `version:1`、`kind:"protocol_probe"`、`observedAt`、`operation`、`status` 和 `advice`；有账号时包含脱敏 `account`，有请求/响应/错误时包含脱敏 `input`、`result`、`error`。Auth operation 缺少 `confirmSideEffect:true` 会在读取 secret 或调用协议客户端前失败，并可使用没有 session secret 的 provisioning 账号；其它 POST 型 side-effect operation 缺少 `confirmSideEffect:true` 会在协议客户端触网前失败；`attachment.data` 会在 fixture 中屏蔽，避免保存探针附件 payload。常见结果包括 `failed/session_missing`、`skipped/protocol_missing`、`failed/account_not_found`、`failed/invalid_request` 和 `success`。
 
 ### tabbit-pool probe template [--operation <name>] [--json]
 
-输出 protocol probe input 模板，便于保存为 JSON 文件后传给 `probe protocol --input-file`。支持 `verifySession`（默认，输出 `{}`）、`sendMessage`（输出 `tabbit/priority` 与一条 `ping` user message）、`listModels`（输出 `{ "force": true }`）、`refreshQuota`（输出 `{}`，默认用账号 `userId`）、`getLotteryExplorationMe`（输出 `{}`）、`getNewbieExplorationMe`（输出 `activity_page` 和 include flags）、`getPlacementResources`（输出 `{ "placementCode": "home.input_below" }`）、`listRewardCardRecords`（输出 offset/limit）、`listLotteryHitRecords`（输出 offset/limit）、`getDailySignInStatus`、`dailySignIn`、`listBenefitCoupons`、`participateResetCouponActivity`、`participateActivity`、`getUsageResetCouponSku`、`getAvailableLotteryChanceCount`、`getActiveMainPools`、`listLotteryChanceRecords`、`drawLottery` 和 `uploadAttachment`（输出 `probe.txt` 文本附件占位 payload）。副作用模板默认 `confirmSideEffect:false`。该命令不读取账号、不触发网络、不输出 secret；不支持的 operation 返回 exitCode 2。
+输出 protocol probe input 模板，便于保存为 JSON 文件后传给 `probe protocol --input-file`；`recoverSession` 和 `consumeResetCoupon` 模板例外，只用于 `probe validate` 和后续脱敏 fixture 准备。支持 `verifySession`（默认，输出 `{}`）、`sendVerificationCode`、`submitRegistrationOrLogin`、`sendMessage`（输出 `tabbit/priority` 与一条 `ping` user message）、`listModels`（输出 `{ "force": true }`）、`refreshQuota`（输出 `{}`，默认用账号 `userId`）、`getLotteryExplorationMe`（输出 `{}`）、`getNewbieExplorationMe`（输出 `activity_page` 和 include flags）、`getPlacementResources`（输出 `{ "placementCode": "home.input_below" }`）、`listRewardCardRecords`（输出 offset/limit）、`listLotteryHitRecords`（输出 offset/limit）、`getDailySignInStatus`、`dailySignIn`、`listBenefitCoupons`、`participateResetCouponActivity`、`participateActivity`、`useResetCoupon`、`getUsageResetCouponSku`、`getAvailableLotteryChanceCount`、`getActiveMainPools`、`listLotteryChanceRecords`、`drawLottery`、`recoverSession`（输出安全 `session_recovery_strategy` evidence 骨架）、`consumeResetCoupon`（输出安全 `reset_coupon_consumption_evidence` endpoint/body/result hash 骨架）和 `uploadAttachment`（输出 `probe.txt` 文本附件占位 payload）。副作用模板默认 `confirmSideEffect:false`，auth 模板也默认 `confirmSideEffect:false`，并使用已逆向的 proxy OAuth 手机号 body 形状和占位 `mobile/code/uuid`。该命令不读取账号、不触发网络、不输出 secret；不支持的 operation 返回 exitCode 2。
 
 ### tabbit-pool probe advice [--category <category>] [--status <status>] [--code <code>] [--message <text>] [--json]
 

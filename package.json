@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Protocol-first Tabbit account pool gateway foundation.",
   "scripts": {
-    "test": "node --test"
+    "test": "node scripts/run-tests.mjs"
   },
   "engines": {
     "node": ">=18"

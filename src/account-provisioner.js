@@ -92,6 +92,16 @@ function missingOperation(name) {
   });
 }
 
+function errorFromFailedResult(result, fallbackMessage) {
+  if (!result || result.ok !== false) return null;
+  if (result.error instanceof Error) return result.error;
+  const detail = result.error && typeof result.error === "object" ? result.error : result;
+  return provisionerError(detail.message || result.message || fallbackMessage, {
+    code: detail.code || result.code || "PROTOCOL_OPERATION_FAILED",
+    category: detail.category || result.category || "protocol_error",
+  });
+}
+
 function accountIdFrom(input = {}, idGenerator) {
   const explicit = String(input.accountId || input.id || "").trim();
   if (explicit) return explicit;
@@ -241,7 +251,9 @@ export class AccountProvisioner {
 
     try {
       if (typeof this.protocolClient.sendVerificationCode !== "function") throw missingOperation("sendVerificationCode");
-      await this.protocolClient.sendVerificationCode({ account: cloneAccount(account), inbox, email, input });
+      const result = await this.protocolClient.sendVerificationCode({ account: cloneAccount(account), inbox, email, input });
+      const failedResult = errorFromFailedResult(result, "send verification code failed");
+      if (failedResult) throw failedResult;
       actions.push(action("sendVerificationCode", "success", { changed: false }));
     } catch (error) {
       const failed = await this.markFailure(account, "sendVerificationCode", error);
@@ -277,6 +289,8 @@ export class AccountProvisioner {
         verification,
         input,
       });
+      const failedResult = errorFromFailedResult(registration, "registration or login failed");
+      if (failedResult) throw failedResult;
       actions.push(action("submitRegistrationOrLogin", "success", { changed: false }));
     } catch (error) {
       const failed = await this.markFailure(account, "submitRegistrationOrLogin", error);

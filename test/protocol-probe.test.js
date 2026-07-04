@@ -83,6 +83,131 @@ test("buildProtocolProbeFixture redacts sensitive request, response, and error f
   assert.doesNotMatch(serialized, /123456/);
 });
 
+test("buildProtocolProbeFixture redacts sendMessage prompt and stream text", () => {
+  const fixture = buildProtocolProbeFixture({
+    observedAt: NOW,
+    accountId: "acct_chat",
+    operation: "sendMessage",
+    status: "success",
+    input: {
+      model: "tabbit/priority",
+      messages: [{ role: "user", content: "private prompt should not be persisted" }],
+      content: "direct private prompt",
+      body: { prompt: "nested private prompt" },
+      metadatas: { html_content: "<p>private prompt should not be persisted</p>" },
+    },
+    result: {
+      content: "private assistant response",
+      contentBlocks: [{ type: "text", text: "private stream text" }],
+      streamDeltas: ["private", " stream", " text"],
+    },
+  });
+
+  const serialized = JSON.stringify(fixture);
+  assert.equal(fixture.input.messages[0].content, "***");
+  assert.equal(fixture.input.content, "***");
+  assert.equal(fixture.input.body.prompt, "***");
+  assert.equal(fixture.input.metadatas.html_content, "***");
+  assert.equal(fixture.result.content, "***");
+  assert.equal(fixture.result.contentBlocks[0].text, "***");
+  assert.deepEqual(fixture.result.streamDeltas, ["***", "***", "***"]);
+  assert.doesNotMatch(serialized, /private prompt|private stream|private assistant/);
+});
+
+test("buildProtocolProbeFixture redacts real user identifiers from payloads", () => {
+  const fixture = buildProtocolProbeFixture({
+    observedAt: NOW,
+    accountId: "acct_session",
+    operation: "verifySession",
+    status: "success",
+    input: {
+      userId: "real-user-input",
+      body: { user_id: "real-user-body" },
+    },
+    result: {
+      ok: true,
+      userId: "real-user-result",
+      raw: {
+        data: {
+          user_info: {
+            id: "real-user-info-id",
+            nickname: "real user nickname",
+          },
+        },
+      },
+    },
+  });
+
+  const serialized = JSON.stringify(fixture);
+  assert.equal(fixture.input.userId, "***");
+  assert.equal(fixture.input.body.user_id, "***");
+  assert.equal(fixture.result.userId, "***");
+  assert.equal(fixture.result.raw.data.user_info.id, "***");
+  assert.equal(fixture.result.raw.data.user_info.nickname, "***");
+  assert.doesNotMatch(serialized, /real-user|real user nickname/);
+});
+
+test("buildProtocolProbeFixture redacts reset coupon codes from payloads", () => {
+  const fixture = buildProtocolProbeFixture({
+    observedAt: NOW,
+    accountId: "acct_coupon",
+    operation: "useResetCoupon",
+    status: "success",
+    input: {
+      couponCode: "real-coupon-code-input",
+      body: { coupon_code: "real-coupon-code-body" },
+    },
+    result: {
+      ok: true,
+      raw: {
+        data: {
+          couponCode: "real-coupon-code-result",
+          coupon_code: "real-coupon-code-raw",
+        },
+      },
+    },
+  });
+
+  const serialized = JSON.stringify(fixture);
+  assert.equal(fixture.input.couponCode, "***");
+  assert.equal(fixture.input.body.coupon_code, "***");
+  assert.equal(fixture.result.raw.data.couponCode, "***");
+  assert.equal(fixture.result.raw.data.coupon_code, "***");
+  assert.doesNotMatch(serialized, /real-coupon-code/);
+});
+
+test("buildProtocolProbeFixture redacts auth captcha challenge fields", () => {
+  const fixture = buildProtocolProbeFixture({
+    observedAt: NOW,
+    accountId: "acct_auth",
+    operation: "sendVerificationCode",
+    status: "failed",
+    input: {
+      body: {
+        mobile: "10000000000",
+        uuid: "00000000-0000-4000-8000-000000000000",
+        smsCode: "000000",
+        captchaToken: "captcha-token-value",
+      },
+    },
+    result: {
+      data: {
+        requestCode: "yoda-request-code-value",
+        verifyUrl: "https://verify.example.test/yoda?requestCode=yoda-request-code-value",
+      },
+    },
+  });
+
+  const serialized = JSON.stringify(fixture);
+  assert.equal(fixture.input.body.mobile, "***");
+  assert.equal(fixture.input.body.uuid, "***");
+  assert.equal(fixture.input.body.smsCode, "***");
+  assert.equal(fixture.input.body.captchaToken, "***");
+  assert.equal(fixture.result.data.requestCode, "***");
+  assert.equal(fixture.result.data.verifyUrl, "***");
+  assert.doesNotMatch(serialized, /10000000000|00000000-0000-4000-8000-000000000000|captcha-token-value|yoda-request-code-value|verify\.example/);
+});
+
 test("ProtocolProbeRunner returns a redacted session_missing fixture when local secret is absent", async () => {
   const runner = new ProtocolProbeRunner({
     accountStore: memoryAccountStore([{ id: "acct_missing", status: "active", email: "missing@example.test", cookieJarRef: "secrets/missing.cookie" }]),
@@ -229,7 +354,7 @@ test("ProtocolProbeRunner dispatches calibrated benefits side-effect probes only
   const events = [];
   const runner = new ProtocolProbeRunner({
     accountStore: memoryAccountStore([{ id: "acct_benefits_post", status: "active", userId: "user_benefits", cookieJarRef: "secrets/acct_benefits_post.cookie" }]),
-    secretStore: memorySecretStore({ "secrets/acct_benefits_post.cookie": "tabbit_session=benefits-post-secret" }),
+    secretStore: memorySecretStore({ "secrets/acct_benefits_post.cookie": "tabbit_session=bp" }),
     now: () => NOW,
     protocolClientFactory(account) {
       return {
@@ -240,6 +365,10 @@ test("ProtocolProbeRunner dispatches calibrated benefits side-effect probes only
         async participateResetCouponActivity({ account: runtimeAccount, userId, requestNo, confirmSideEffect }) {
           events.push(["participateResetCouponActivity", account.id, runtimeAccount.cookieHeader, userId, requestNo, confirmSideEffect]);
           return { ok: true, source: "tabbit-reset-coupon-activity-participate" };
+        },
+        async useResetCoupon({ account: runtimeAccount, userId, couponCode, couponType, requestNo, confirmSideEffect }) {
+          events.push(["useResetCoupon", account.id, runtimeAccount.cookieHeader, userId, couponCode, couponType, requestNo, confirmSideEffect]);
+          return { ok: true, source: "tabbit-reset-coupon-use", used: true };
         },
         async drawLottery({ account: runtimeAccount, body, confirmSideEffect }) {
           events.push(["drawLottery", account.id, runtimeAccount.cookieHeader, body, confirmSideEffect]);
@@ -259,6 +388,11 @@ test("ProtocolProbeRunner dispatches calibrated benefits side-effect probes only
     operation: "participateResetCouponActivity",
     input: { userId: "user_input", requestNo: "reset-probe", confirmSideEffect: true },
   });
+  const useCoupon = await runner.probeAccount({
+    accountId: "acct_benefits_post",
+    operation: "useResetCoupon",
+    input: { couponCode: "coupon-code", couponType: "weekly_reset_coupon", requestNo: "coupon-use-probe", confirmSideEffect: true },
+  });
   const draw = await runner.probeAccount({
     accountId: "acct_benefits_post",
     operation: "drawLottery",
@@ -267,13 +401,322 @@ test("ProtocolProbeRunner dispatches calibrated benefits side-effect probes only
 
   assert.equal(status.status, "success");
   assert.equal(participate.status, "success");
+  assert.equal(useCoupon.status, "success");
   assert.equal(draw.status, "success");
   assert.deepEqual(events, [
-    ["getDailySignInStatus", "acct_benefits_post", "tabbit_session=benefits-post-secret", ["desktop_pet"]],
-    ["participateResetCouponActivity", "acct_benefits_post", "tabbit_session=benefits-post-secret", "user_input", "reset-probe", true],
-    ["drawLottery", "acct_benefits_post", "tabbit_session=benefits-post-secret", { activity_id: "activity_1" }, true],
+    ["getDailySignInStatus", "acct_benefits_post", "tabbit_session=bp", ["desktop_pet"]],
+    ["participateResetCouponActivity", "acct_benefits_post", "tabbit_session=bp", "user_input", "reset-probe", true],
+    ["useResetCoupon", "acct_benefits_post", "tabbit_session=bp", "user_benefits", "coupon-code", "weekly_reset_coupon", "coupon-use-probe", true],
+    ["drawLottery", "acct_benefits_post", "tabbit_session=bp", { activity_id: "activity_1", user_id: "user_benefits" }, true],
   ]);
-  assert.equal(JSON.stringify([status, participate, draw]).includes("tabbit_session=benefits-post-secret"), false);
+  assert.equal(JSON.stringify([status, participate, useCoupon, draw]).includes("tabbit_session=bp"), false);
+});
+
+test("ProtocolProbeRunner hydrates missing userId through verifySession for commerce probes", async () => {
+  const originalAccount = { id: "acct_commerce", status: "active", cookieJarRef: "secrets/commerce.cookie" };
+  const events = [];
+  const runner = new ProtocolProbeRunner({
+    accountStore: memoryAccountStore([originalAccount]),
+    secretStore: memorySecretStore({ "secrets/commerce.cookie": "placeholder-commerce-session" }),
+    now: () => NOW,
+    protocolClientFactory() {
+      return {
+        async verifySession({ account: runtimeAccount, session }) {
+          events.push(["verifySession", runtimeAccount.id, runtimeAccount.cookieHeader, session]);
+          return { ok: true, userId: "user_from_session" };
+        },
+        async listBenefitCoupons({ account: runtimeAccount, userId }) {
+          events.push(["listBenefitCoupons", runtimeAccount.id, runtimeAccount.userId, userId]);
+          return { ok: true, coupons: [] };
+        },
+      };
+    },
+  });
+
+  const result = await runner.probeAccount({ accountId: "acct_commerce", operation: "listBenefitCoupons" });
+
+  assert.equal(result.status, "success");
+  assert.deepEqual(events, [
+    ["verifySession", "acct_commerce", "placeholder-commerce-session", "placeholder-commerce-session"],
+    ["listBenefitCoupons", "acct_commerce", "user_from_session", "user_from_session"],
+  ]);
+  assert.equal(originalAccount.userId, undefined);
+});
+
+test("ProtocolProbeRunner hydrates userId for confirmed commerce side-effect probes", async () => {
+  const events = [];
+  const runner = new ProtocolProbeRunner({
+    accountStore: memoryAccountStore([{ id: "acct_side_effect_user", status: "active", cookieJarRef: "secrets/side-effect.cookie" }]),
+    secretStore: memorySecretStore({ "secrets/side-effect.cookie": "placeholder-side-effect-session" }),
+    now: () => NOW,
+    protocolClientFactory() {
+      return {
+        async verifySession({ account: runtimeAccount, session }) {
+          events.push(["verifySession", runtimeAccount.id, runtimeAccount.cookieHeader, session]);
+          return { ok: true, userId: "user_from_session" };
+        },
+        async participateResetCouponActivity({ account: runtimeAccount, userId, requestNo, confirmSideEffect }) {
+          events.push(["participateResetCouponActivity", runtimeAccount.id, runtimeAccount.userId, userId, requestNo, confirmSideEffect]);
+          return { ok: true, source: "tabbit-reset-coupon-activity-participate" };
+        },
+        async drawLottery({ account: runtimeAccount, body, confirmSideEffect }) {
+          events.push(["drawLottery", runtimeAccount.id, runtimeAccount.userId, body, confirmSideEffect]);
+          return { ok: true, source: "tabbit-lottery-draw" };
+        },
+      };
+    },
+  });
+
+  const participate = await runner.probeAccount({
+    accountId: "acct_side_effect_user",
+    operation: "participateResetCouponActivity",
+    input: { requestNo: "reset-probe", confirmSideEffect: true },
+  });
+  const draw = await runner.probeAccount({
+    accountId: "acct_side_effect_user",
+    operation: "drawLottery",
+    input: { body: { lottery_activity_id: "123", request_no: "draw-probe" }, confirmSideEffect: true },
+  });
+
+  assert.equal(participate.status, "success");
+  assert.equal(draw.status, "success");
+  assert.deepEqual(events, [
+    ["verifySession", "acct_side_effect_user", "placeholder-side-effect-session", "placeholder-side-effect-session"],
+    ["participateResetCouponActivity", "acct_side_effect_user", "user_from_session", "user_from_session", "reset-probe", true],
+    ["verifySession", "acct_side_effect_user", "placeholder-side-effect-session", "placeholder-side-effect-session"],
+    ["drawLottery", "acct_side_effect_user", "user_from_session", { lottery_activity_id: "123", request_no: "draw-probe", user_id: "user_from_session" }, true],
+  ]);
+  assert.equal(JSON.stringify([participate, draw]).includes("placeholder-side-effect-session"), false);
+  assert.equal(JSON.stringify([participate, draw]).includes("user_from_session"), false);
+});
+
+test("ProtocolProbeRunner does not verify session when commerce probe input already has userId", async () => {
+  const events = [];
+  const runner = new ProtocolProbeRunner({
+    accountStore: memoryAccountStore([{ id: "acct_commerce_input", status: "active", cookieJarRef: "secrets/commerce-input.cookie" }]),
+    secretStore: memorySecretStore({ "secrets/commerce-input.cookie": "placeholder-commerce-input-session" }),
+    now: () => NOW,
+    protocolClientFactory() {
+      return {
+        async verifySession() {
+          events.push(["verifySession"]);
+          return { ok: true, userId: "unexpected" };
+        },
+        async listBenefitCoupons({ account: runtimeAccount, userId }) {
+          events.push(["listBenefitCoupons", runtimeAccount.id, runtimeAccount.userId, userId]);
+          return { ok: true, coupons: [] };
+        },
+      };
+    },
+  });
+
+  const result = await runner.probeAccount({
+    accountId: "acct_commerce_input",
+    operation: "listBenefitCoupons",
+    input: { userId: "user_from_input" },
+  });
+
+  assert.equal(result.status, "success");
+  assert.deepEqual(events, [
+    ["listBenefitCoupons", "acct_commerce_input", undefined, "user_from_input"],
+  ]);
+});
+
+test("ProtocolProbeRunner does not hydrate userId before reporting a missing target operation", async () => {
+  const events = [];
+  const runner = new ProtocolProbeRunner({
+    accountStore: memoryAccountStore([{ id: "acct_commerce_missing", status: "active", cookieJarRef: "secrets/commerce-missing.cookie" }]),
+    secretStore: memorySecretStore({ "secrets/commerce-missing.cookie": "placeholder-commerce-missing-session" }),
+    now: () => NOW,
+    protocolClientFactory() {
+      return {
+        async verifySession() {
+          events.push(["verifySession"]);
+          return { ok: true, userId: "should_not_be_used" };
+        },
+      };
+    },
+  });
+
+  const result = await runner.probeAccount({ accountId: "acct_commerce_missing", operation: "listBenefitCoupons" });
+
+  assert.equal(result.status, "skipped");
+  assert.equal(result.fixture.error.category, "protocol_missing");
+  assert.deepEqual(events, []);
+});
+
+test("ProtocolProbeRunner keeps target operation classification when userId hydration fails", async () => {
+  const events = [];
+  const runner = new ProtocolProbeRunner({
+    accountStore: memoryAccountStore([{ id: "acct_commerce_verify_failed", status: "active", cookieJarRef: "secrets/commerce-verify-failed.cookie" }]),
+    secretStore: memorySecretStore({ "secrets/commerce-verify-failed.cookie": "placeholder-commerce-verify-failed-session" }),
+    now: () => NOW,
+    protocolClientFactory() {
+      return {
+        async verifySession() {
+          events.push(["verifySession"]);
+          throw Object.assign(new Error("session verifier failed"), { category: "login_required", code: "LOGIN_REQUIRED" });
+        },
+        async listBenefitCoupons({ userId }) {
+          events.push(["listBenefitCoupons", userId]);
+          return {
+            ok: false,
+            category: "invalid_request",
+            code: "MISSING_USER_ID",
+            message: "user id is required",
+          };
+        },
+      };
+    },
+  });
+
+  const result = await runner.probeAccount({ accountId: "acct_commerce_verify_failed", operation: "listBenefitCoupons" });
+
+  assert.equal(result.status, "failed");
+  assert.equal(result.fixture.error.category, "invalid_request");
+  assert.equal(result.fixture.error.code, "MISSING_USER_ID");
+  assert.deepEqual(events, [
+    ["verifySession"],
+    ["listBenefitCoupons", undefined],
+  ]);
+});
+
+test("ProtocolProbeRunner dispatches auth probes only with explicit confirmation", async () => {
+  const events = [];
+  const runner = new ProtocolProbeRunner({
+    accountStore: memoryAccountStore([{ id: "acct_auth_probe", status: "active", email: "auth-user@example.test", cookieJarRef: "secrets/acct_auth_probe.cookie" }]),
+    secretStore: memorySecretStore({ "secrets/acct_auth_probe.cookie": "tabbit_session=ap" }),
+    fixtureStore: memoryFixtureStore(events),
+    now: () => NOW,
+    protocolClientFactory(account) {
+      return {
+        async sendVerificationCode({ account: runtimeAccount, email, body, confirmSideEffect }) {
+          events.push(["sendVerificationCode", account.id, runtimeAccount.cookieHeader, email, body, confirmSideEffect]);
+          return { ok: true, raw: { email, token: "secret-token" } };
+        },
+        async submitRegistrationOrLogin({ account: runtimeAccount, email, code, body, confirmSideEffect }) {
+          events.push(["submitRegistrationOrLogin", account.id, runtimeAccount.cookieHeader, email, code, body, confirmSideEffect]);
+          return { ok: true, cookieHeader: "tabbit_session=na", userId: "user_auth", raw: { code, token: "secret-token" } };
+        },
+      };
+    },
+  });
+
+  const sendInput = {
+    email: "auth-user@example.test",
+    body: { email_address: "auth-user@example.test", scene: "login" },
+    confirmSideEffect: true,
+  };
+  const send = await runner.probeAccount({
+    accountId: "acct_auth_probe",
+    operation: "sendVerificationCode",
+    input: sendInput,
+    writeFixture: true,
+  });
+  const submitInput = {
+    email: "auth-user@example.test",
+    code: "123456",
+    body: { email_address: "auth-user@example.test", verify_code: "123456" },
+    confirmSideEffect: true,
+  };
+  const submit = await runner.probeAccount({
+    accountId: "acct_auth_probe",
+    operation: "submitRegistrationOrLogin",
+    input: submitInput,
+    writeFixture: true,
+  });
+
+  assert.equal(send.status, "success");
+  assert.equal(send.fixture.operation, "sendVerificationCode");
+  assert.equal(submit.status, "success");
+  assert.equal(submit.fixture.operation, "submitRegistrationOrLogin");
+  assert.deepEqual(events[0], ["sendVerificationCode", "acct_auth_probe", "tabbit_session=ap", "auth-user@example.test", sendInput.body, true]);
+  assert.deepEqual(events[2], ["submitRegistrationOrLogin", "acct_auth_probe", "tabbit_session=ap", "auth-user@example.test", "123456", submitInput.body, true]);
+  const serialized = JSON.stringify([send, submit, events[1][1], events[3][1]]);
+  assert.equal(serialized.includes("auth-user@example.test"), false);
+  assert.equal(serialized.includes("123456"), false);
+  assert.equal(serialized.includes("tabbit_session=ap"), false);
+  assert.equal(serialized.includes("tabbit_session=na"), false);
+  assert.equal(serialized.includes("secret-token"), false);
+});
+
+test("ProtocolProbeRunner rejects auth probes without confirmation before client dispatch", async () => {
+  const events = [];
+  const runner = new ProtocolProbeRunner({
+    accountStore: memoryAccountStore([{ id: "acct_auth_guard", status: "active", email: "guard-user@example.test", cookieJarRef: "secrets/acct_auth_guard.cookie" }]),
+    secretStore: memorySecretStore({ "secrets/acct_auth_guard.cookie": "tabbit_session=ag" }),
+    now: () => NOW,
+    protocolClientFactory() {
+      return {
+        async sendVerificationCode() {
+          events.push(["sendVerificationCode"]);
+          return { ok: true };
+        },
+        async submitRegistrationOrLogin() {
+          events.push(["submitRegistrationOrLogin"]);
+          return { ok: true };
+        },
+      };
+    },
+  });
+
+  const send = await runner.probeAccount({
+    accountId: "acct_auth_guard",
+    operation: "sendVerificationCode",
+    input: { email: "guard-user@example.test", confirmSideEffect: false },
+  });
+  const submit = await runner.probeAccount({
+    accountId: "acct_auth_guard",
+    operation: "submitRegistrationOrLogin",
+    input: { email: "guard-user@example.test", code: "654321" },
+  });
+
+  assert.equal(send.status, "failed");
+  assert.equal(send.fixture.error.category, "invalid_request");
+  assert.equal(submit.status, "failed");
+  assert.equal(submit.fixture.error.category, "invalid_request");
+  assert.deepEqual(events, []);
+  const serialized = JSON.stringify([send, submit]);
+  assert.equal(serialized.includes("guard-user@example.test"), false);
+  assert.equal(serialized.includes("654321"), false);
+  assert.equal(serialized.includes("tabbit_session=ag"), false);
+});
+
+test("ProtocolProbeRunner dispatches confirmed auth probes without stored session material", async () => {
+  const events = [];
+  const runner = new ProtocolProbeRunner({
+    accountStore: memoryAccountStore([{ id: "acct_auth_no_session", status: "provisioning", email: "new-user@example.test" }]),
+    secretStore: {
+      async readSecret(ref) {
+        events.push(["readSecret", ref]);
+        return null;
+      },
+    },
+    now: () => NOW,
+    protocolClientFactory(account) {
+      return {
+        async sendVerificationCode({ account: runtimeAccount, email, confirmSideEffect }) {
+          events.push(["sendVerificationCode", account.id, runtimeAccount.cookieHeader, email, confirmSideEffect]);
+          return { ok: true, raw: { email, token: "secret-token" } };
+        },
+      };
+    },
+  });
+
+  const result = await runner.probeAccount({
+    accountId: "acct_auth_no_session",
+    operation: "sendVerificationCode",
+    input: { email: "new-user@example.test", confirmSideEffect: true },
+  });
+
+  assert.equal(result.status, "success");
+  assert.equal(result.fixture.operation, "sendVerificationCode");
+  assert.deepEqual(events, [
+    ["sendVerificationCode", "acct_auth_no_session", undefined, "new-user@example.test", true],
+  ]);
+  const serialized = JSON.stringify(result);
+  assert.equal(serialized.includes("new-user@example.test"), false);
+  assert.equal(serialized.includes("secret-token"), false);
 });
 
 test("FileProtocolFixtureStore writes fixture JSON below stateDir", async () => {
@@ -297,6 +740,38 @@ test("FileProtocolFixtureStore writes fixture JSON below stateDir", async () => 
   const saved = JSON.parse(await readFile(path.join(stateDir, ref), "utf8"));
   assert.equal(saved.kind, "protocol_probe");
   assert.equal(saved.operation, "verifySession");
+});
+
+test("FileProtocolFixtureStore can write sanitized fixtures below an explicit fixtureDir", async () => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), "tabbit-probe-state-readonly-"));
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "tabbit-probe-fixture-dir-"));
+  const store = new FileProtocolFixtureStore({
+    stateDir,
+    fixtureDir,
+    now: () => NOW,
+    idFactory: () => "probe_1",
+  });
+
+  const ref = await store.writeFixture({
+    version: 1,
+    kind: "protocol_probe",
+    observedAt: NOW,
+    accountId: "acct_a",
+    operation: "dailySignIn",
+    status: "success",
+    result: { token: "secret-token", signInResult: "success" },
+  });
+
+  assert.equal(ref, "fixtures/protocol-probes/probe_1.json");
+  await assert.rejects(() => readFile(path.join(stateDir, ref), "utf8"), { code: "ENOENT" });
+  const saved = JSON.parse(await readFile(path.join(fixtureDir, "probe_1.json"), "utf8"));
+  assert.equal(saved.kind, "protocol_probe");
+  assert.equal(saved.operation, "dailySignIn");
+  assert.equal(JSON.stringify(saved).includes("secret-token"), false);
+  assert.deepEqual((await store.listFixtures()).map((item) => item.ref), ["fixtures/protocol-probes/probe_1.json"]);
+  const readBack = await store.readFixture(ref);
+  assert.equal(readBack.operation, "dailySignIn");
+  await assert.rejects(() => store.readFixture("fixtures/other/probe_1.json"), /protocol probe fixtures/);
 });
 
 
@@ -343,6 +818,84 @@ test("FileProtocolFixtureStore lists only protocol probe fixtures as redacted su
     adviceCategory: "unknown",
   });
   assert.equal(JSON.stringify(fixtures).includes("secret-token"), false);
+});
+
+test("FileProtocolFixtureStore lists sanitized session recovery strategy fixtures", async () => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), "tabbit-probe-session-recovery-list-"));
+  await mkdir(path.join(stateDir, "fixtures", "protocol-probes"), { recursive: true });
+  await writeFile(path.join(stateDir, "fixtures", "protocol-probes", "session-recovery.json"), JSON.stringify({
+    kind: "session_recovery_strategy",
+    operation: "recoverSession",
+    status: "success",
+    observedAt: "2026-07-04T03:00:00.000Z",
+    evidence: {
+      strategy: "automated_reauth",
+      automatedRefresh: "calibrated_reauth_probe",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+    result: { raw: { cookie: "tabbit_session=secret" } },
+  }), "utf8");
+  await writeFile(path.join(stateDir, "fixtures", "protocol-probes", "unknown.json"), JSON.stringify({
+    kind: "unknown_fixture",
+    operation: "recoverSession",
+    status: "success",
+  }), "utf8");
+
+  const store = new FileProtocolFixtureStore({ stateDir });
+  const fixtures = await store.listFixtures();
+
+  assert.deepEqual(fixtures, [{
+    ref: "fixtures/protocol-probes/session-recovery.json",
+    observedAt: "2026-07-04T03:00:00.000Z",
+    operation: "recoverSession",
+    status: "success",
+  }]);
+  assert.doesNotMatch(JSON.stringify(fixtures), /tabbit_session|secret/);
+});
+
+test("FileProtocolFixtureStore lists sanitized reset coupon consumption evidence fixtures", async () => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), "tabbit-probe-reset-coupon-list-"));
+  await mkdir(path.join(stateDir, "fixtures", "protocol-probes"), { recursive: true });
+  await writeFile(path.join(stateDir, "fixtures", "protocol-probes", "reset-coupon-consumption.json"), JSON.stringify({
+    kind: "reset_coupon_consumption_evidence",
+    operation: "consumeResetCoupon",
+    status: "success",
+    observedAt: "2026-07-04T03:10:00.000Z",
+    evidence: {
+      endpointHash: "sha256:endpoint-private-shape",
+      bodyHash: "sha256:body-private-shape",
+      resultHash: "sha256:result-private-shape",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+    result: {
+      resetCouponConsumed: true,
+      consumeResult: "success",
+    },
+    ignoredRaw: {
+      cookie: "tabbit_session=secret",
+      prompt: "placeholder prompt",
+    },
+  }), "utf8");
+  await writeFile(path.join(stateDir, "fixtures", "protocol-probes", "unknown.json"), JSON.stringify({
+    kind: "unknown_fixture",
+    operation: "consumeResetCoupon",
+    status: "success",
+  }), "utf8");
+
+  const store = new FileProtocolFixtureStore({ stateDir });
+  const fixtures = await store.listFixtures();
+
+  assert.deepEqual(fixtures, [{
+    ref: "fixtures/protocol-probes/reset-coupon-consumption.json",
+    observedAt: "2026-07-04T03:10:00.000Z",
+    operation: "consumeResetCoupon",
+    status: "success",
+  }]);
+  assert.doesNotMatch(JSON.stringify(fixtures), /tabbit_session|placeholder prompt|endpoint-private-shape|body-private-shape|result-private-shape/);
 });
 
 test("FileProtocolFixtureStore reads sanitized fixtures and rejects traversal refs", async () => {

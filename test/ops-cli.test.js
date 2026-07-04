@@ -1,10 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import { AccountProvisioner } from "../src/account-provisioner.js";
 import { createProtocolPoolCliDependencies, runProtocolPoolCli } from "../src/ops-cli.js";
+import { FileProtocolFixtureStore } from "../src/protocol-probe.js";
+
+const NOW = "2026-07-02T03:00:00.000Z";
 
 function memoryStore(initialAccounts = [], events = []) {
   let accounts = JSON.parse(JSON.stringify(initialAccounts));
@@ -316,6 +320,360 @@ test("readiness --json reads fixture bodies for sanitized forbidden coverage", a
   const body = JSON.parse(stream.stdout.join(""));
   assert.equal(body.checks.protocolCalibration.status, "ready");
   assert.equal(body.checks.forbidden403.status, "ready");
+});
+
+test("readiness doctor --json explains state, protocol env, and remaining work without touching network", async () => {
+  const stream = io();
+  const calls = [];
+  const stateDir = path.join(tmpdir(), "tabbit-readiness-doctor-test");
+  const result = await runProtocolPoolCli(["readiness", "doctor", "--json"], {
+    config: {
+      stateDir,
+      apiKey: "secret-local-key",
+      compat: {
+        stripClientTools: true,
+        toolLoopMode: "client_executes_tools_first",
+      },
+      protocol: {
+        enabled: true,
+        baseUrl: "https://web.tabbit.ai",
+        sendPath: "/api/v1/chat/completion",
+        sessionVerifyPath: "/api/v0/user/base-info",
+        authSendCodePath: "/api/auth/send-code",
+        authSubmitCodePath: "/api/auth/submit-code",
+        signInPath: "/api/commerce/activity/v1/sign-in",
+        benefitCouponUsePath: "/api/commerce/benefit/v1/coupon/use",
+        activityParticipatePath: "/api/commerce/activity/v1/participate",
+        lotteryDrawPath: "/api/commerce/lottery/v1/draw",
+        reqCtx: "browser-context-secret",
+      },
+    },
+    accountStore: memoryStore(baseAccounts(), calls),
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push(["listFixtures"]);
+        return [
+          { operation: "verifySession", status: "success", result: { ok: true, userId: "user_123" } },
+          { operation: "sendMessage", status: "success", result: { raw: { kind: "stream" }, streamDeltas: ["ok"] } },
+        ];
+      },
+    },
+    readinessStateStore: memoryReadinessStore({}, calls),
+    accountVerifier: {
+      async verifyAccount() {
+        calls.push(["verifyAccount"]);
+        throw new Error("readiness doctor must not verify accounts");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push(["probeAccount"]);
+        throw new Error("readiness doctor must not run protocol probes");
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stream.stderr.length, 0);
+  assert.deepEqual(calls, [["loadAccounts"], ["listFixtures"], ["readReadinessState"]]);
+  const text = stream.stdout.join("");
+  const body = JSON.parse(text);
+  assert.equal(body.stateDir, stateDir);
+  assert.equal(body.protocol.enabled, true);
+  assert.equal(body.protocol.baseUrlConfigured, true);
+  assert.equal(body.protocol.sendPathConfigured, true);
+  assert.equal(body.protocol.sessionVerifyPathConfigured, true);
+  assert.equal(body.protocol.compatStripClientTools, true);
+  assert.equal(body.readiness.status, "blocked");
+  assert.equal(body.fixtureAudit.status, "blocked");
+  assert.ok(Array.isArray(body.remainingWork));
+  assert.ok(body.remainingWork.some((action) => action.includes("403")));
+  assert.match(body.commands.setStateDir, /\$env:TABBIT_POOL_STATE_DIR/);
+  assert.match(body.commands.fixturesAudit, /fixtures audit --json/);
+  assert.doesNotMatch(text, /alpha-user@example\.test|beta-user@example\.test/);
+  assert.doesNotMatch(text, /tabbit_session|secret-token|secret-local-key|browser-context-secret|cookieJarRef/);
+});
+
+test("readiness doctor --json includes auth and benefits backlog without running probes", async () => {
+  const stream = io();
+  const calls = [];
+  const stateDir = path.join(tmpdir(), "tabbit-readiness-doctor-backlog-test");
+  const result = await runProtocolPoolCli(["readiness", "doctor", "--json"], {
+    config: {
+      stateDir,
+      apiKey: "secret-local-key",
+      compat: {
+        stripClientTools: true,
+        toolLoopMode: "client_executes_tools_first",
+      },
+      protocol: {
+        enabled: true,
+        baseUrl: "https://web.tabbit.ai",
+        sendPath: "/api/v1/chat/completion",
+        sessionVerifyPath: "/api/v0/user/base-info",
+        authSendCodePath: "/api/auth/send-code",
+        authSubmitCodePath: "/api/auth/submit-code",
+        signInPath: "/api/commerce/activity/v1/sign-in",
+        benefitCouponUsePath: "/api/commerce/benefit/v1/coupon/use",
+        activityParticipatePath: "/api/commerce/activity/v1/participate",
+        lotteryDrawPath: "/api/commerce/lottery/v1/draw",
+        reqCtx: "browser-context-secret",
+      },
+    },
+    accountStore: memoryStore(baseAccounts(), calls),
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push(["listFixtures"]);
+        return [
+          { operation: "verifySession", status: "success", result: { ok: true, userId: "user_123" } },
+          { operation: "sendMessage", status: "success", result: { raw: { kind: "stream" }, streamDeltas: ["ok"] } },
+          {
+            operation: "sendMessage",
+            status: "failed",
+            input: { tools: [{ type: "function", function: { name: "lookup_private_data" } }] },
+            result: { ok: false, error: { category: "unsupported_feature", code: "***" } },
+          },
+          { operation: "sendMessage", status: "failed", result: { ok: false, error: { category: "forbidden", status: 403 } } },
+        ];
+      },
+    },
+    readinessStateStore: memoryReadinessStore({
+      codex: { verified: true },
+      claude: { verified: true },
+    }, calls),
+    accountVerifier: {
+      async verifyAccount() {
+        calls.push(["verifyAccount"]);
+        throw new Error("readiness doctor must not verify accounts");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push(["probeAccount"]);
+        throw new Error("readiness doctor must not run protocol probes");
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stream.stderr.length, 0);
+  assert.deepEqual(calls, [["loadAccounts"], ["listFixtures"], ["readReadinessState"]]);
+  const text = stream.stdout.join("");
+  const body = JSON.parse(text);
+  assert.equal(body.status, "ready");
+  assert.equal(body.protocol.authSendCodePathConfigured, true);
+  assert.equal(body.protocol.authSubmitCodePathConfigured, true);
+  assert.deepEqual(body.remainingWork, []);
+  assert.equal(body.calibrationBacklog?.status, "blocked");
+  assert.equal(body.calibrationBacklog.scopes.auth.status, "blocked");
+  assert.equal(body.calibrationBacklog.scopes.benefits.status, "blocked");
+  assert.equal(body.calibrationBacklog.scopes.session.status, "blocked");
+  assert.equal(body.calibrationBacklog.scopes.upstream.status, "blocked");
+  assert.ok(body.calibrationBacklog.missing.includes("successful_sendVerificationCode_fixture"));
+  assert.ok(body.calibrationBacklog.missing.includes("successful_lottery_draw_fixture"));
+  assert.ok(body.calibrationBacklog.missing.includes("expired_verifySession_fixture"));
+  assert.ok(body.calibrationBacklog.missing.includes("automated_session_refresh_strategy"));
+  assert.ok(body.calibrationBacklog.missing.includes("real_upstream_error_frame_fixture"));
+  assert.ok(body.calibrationBacklog.missing.includes("real_upstream_cancellation_fixture"));
+  assert.ok(body.calibrationBacklog.missing.includes("real_upstream_backpressure_fixture"));
+  assert.ok(Array.isArray(body.calibrationBacklog.captureCommands));
+  const sendCapture = body.calibrationBacklog.captureCommands.find((item) => item.missing === "successful_sendVerificationCode_fixture");
+  assert.ok(sendCapture);
+  assert.ok(sendCapture.templateCommand.includes("probe template --operation sendVerificationCode --json"));
+  assert.ok(sendCapture.probeCommand.includes("probe protocol --account <account-id> --operation sendVerificationCode --input-file <redacted-input.json> --write-fixture --json"));
+  assert.equal(sendCapture.writeFixtureCommand, null);
+  assert.equal(sendCapture.prerequisitesStatus, "ready");
+  assert.deepEqual(sendCapture.prerequisites, [{
+    name: "auth_send_code_endpoint",
+    env: "TABBIT_POOL_PROTOCOL_AUTH_SEND_CODE_PATH",
+    status: "configured",
+  }]);
+  const dailyCapture = body.calibrationBacklog.captureCommands.find((item) => item.missing === "successful_daily_sign_in_fixture");
+  assert.equal(dailyCapture.prerequisitesStatus, "ready");
+  assert.deepEqual(dailyCapture.prerequisites, [{
+    name: "daily_sign_in_endpoint",
+    env: "TABBIT_POOL_PROTOCOL_SIGN_IN_PATH",
+    status: "configured",
+  }]);
+  const proCapture = body.calibrationBacklog.captureCommands.find((item) => item.missing === "successful_pro_activity_fixture");
+  assert.equal(proCapture.prerequisitesStatus, "ready");
+  assert.deepEqual(proCapture.prerequisites, [{
+    name: "activity_participate_endpoint",
+    env: "TABBIT_POOL_PROTOCOL_ACTIVITY_PARTICIPATE_PATH",
+    status: "configured",
+  }]);
+  const resetCouponCapture = body.calibrationBacklog.captureCommands.find((item) => item.missing === "successful_reset_coupon_consumption_fixture");
+  assert.equal(resetCouponCapture.scope, "benefits");
+  assert.equal(resetCouponCapture.operation, "useResetCoupon");
+  assert.equal(resetCouponCapture.sideEffect, true);
+  assert.ok(resetCouponCapture.templateCommand.includes("probe template --operation useResetCoupon --json"));
+  assert.ok(resetCouponCapture.validateCommand.includes("probe validate --operation useResetCoupon --input-file <redacted-input.json> --json"));
+  assert.ok(resetCouponCapture.confirmedValidateCommand.includes("probe validate --operation useResetCoupon --input-file <redacted-input.json> --require-confirmed-side-effect --json"));
+  assert.ok(resetCouponCapture.probeCommand.includes("probe protocol --account <account-id> --operation useResetCoupon --input-file <redacted-input.json> --write-fixture --json"));
+  assert.equal(resetCouponCapture.writeFixtureCommand, null);
+  assert.equal(resetCouponCapture.prerequisitesStatus, "ready");
+  assert.deepEqual(resetCouponCapture.prerequisites, [{
+    name: "benefit_coupon_use_endpoint",
+    env: "TABBIT_POOL_PROTOCOL_BENEFIT_COUPON_USE_PATH",
+    status: "configured",
+  }]);
+  assert.match(resetCouponCapture.reason, /coupon use/i);
+  const lotteryCapture = body.calibrationBacklog.captureCommands.find((item) => item.missing === "successful_lottery_draw_fixture");
+  assert.equal(lotteryCapture.prerequisitesStatus, "ready");
+  assert.deepEqual(lotteryCapture.prerequisites, [{
+    name: "lottery_draw_endpoint",
+    env: "TABBIT_POOL_PROTOCOL_LOTTERY_DRAW_PATH",
+    status: "configured",
+  }]);
+  const expiredSessionCapture = body.calibrationBacklog.captureCommands.find((item) => item.missing === "expired_verifySession_fixture");
+  assert.equal(expiredSessionCapture.prerequisitesStatus, "ready");
+  assert.deepEqual(expiredSessionCapture.prerequisites, [{
+    name: "session_verify_endpoint",
+    env: "TABBIT_POOL_PROTOCOL_SESSION_VERIFY_PATH",
+    status: "configured",
+  }]);
+  const upstreamErrorCapture = body.calibrationBacklog.captureCommands.find((item) => item.missing === "real_upstream_error_frame_fixture");
+  assert.equal(upstreamErrorCapture.scope, "upstream");
+  assert.equal(upstreamErrorCapture.operation, "sendMessage");
+  assert.equal(upstreamErrorCapture.sideEffect, false);
+  assert.equal(upstreamErrorCapture.prerequisitesStatus, "ready");
+  assert.deepEqual(upstreamErrorCapture.prerequisites, [{
+    name: "protocol_send_endpoint",
+    env: "TABBIT_POOL_PROTOCOL_SEND_PATH",
+    status: "configured",
+  }]);
+  assert.match(upstreamErrorCapture.probeCommand, /probe protocol --account <account-id> --operation sendMessage --input-file <redacted-input\.json> --write-fixture --json/);
+  const upstreamCancelCapture = body.calibrationBacklog.captureCommands.find((item) => item.missing === "real_upstream_cancellation_fixture");
+  assert.equal(upstreamCancelCapture.scope, "upstream");
+  assert.equal(upstreamCancelCapture.operation, "sendMessage");
+  assert.equal(upstreamCancelCapture.prerequisitesStatus, "ready");
+  assert.deepEqual(upstreamCancelCapture.prerequisites, [{
+    name: "protocol_send_endpoint",
+    env: "TABBIT_POOL_PROTOCOL_SEND_PATH",
+    status: "configured",
+  }]);
+  const upstreamBackpressureCapture = body.calibrationBacklog.captureCommands.find((item) => item.missing === "real_upstream_backpressure_fixture");
+  assert.equal(upstreamBackpressureCapture.scope, "upstream");
+  assert.equal(upstreamBackpressureCapture.operation, "sendMessage");
+  assert.equal(upstreamBackpressureCapture.prerequisitesStatus, "ready");
+  assert.deepEqual(upstreamBackpressureCapture.prerequisites, [{
+    name: "protocol_send_endpoint",
+    env: "TABBIT_POOL_PROTOCOL_SEND_PATH",
+    status: "configured",
+  }]);
+  const recoveryCapture = body.calibrationBacklog.captureCommands.find((item) => item.missing === "automated_session_refresh_strategy");
+  assert.equal(recoveryCapture.operation, "recoverSession");
+  assert.ok(recoveryCapture.templateCommand.includes("probe template --operation recoverSession --json"));
+  assert.ok(recoveryCapture.validateCommand.includes("probe validate --operation recoverSession --input-file <redacted-input.json> --json"));
+  assert.equal(recoveryCapture.confirmedValidateCommand, null);
+  assert.equal(recoveryCapture.probeCommand, null);
+  assert.ok(recoveryCapture.writeFixtureCommand.includes("probe validate --operation recoverSession --input-file <redacted-input.json> --write-fixture --json"));
+  assert.match(body.commands.authFixturesAudit, /fixtures audit --scope auth --json/);
+  assert.match(body.commands.benefitsFixturesAudit, /fixtures audit --scope benefits --json/);
+  assert.match(body.commands.sessionFixturesAudit, /fixtures audit --scope session --json/);
+  assert.match(body.commands.upstreamFixturesAudit, /fixtures audit --scope upstream --json/);
+  assert.doesNotMatch(text, /alpha-user@example\.test|beta-user@example\.test/);
+  assert.doesNotMatch(text, /tabbit_session|secret-token|secret-local-key|browser-context-secret|cookieJarRef/);
+  assert.doesNotMatch(text, /lookup_private_data/);
+});
+
+test("readiness doctor prints calibration backlog in plain output", async () => {
+  const stream = io();
+  const calls = [];
+  const stateDir = path.join(tmpdir(), "tabbit-readiness-doctor-plain-backlog-test");
+  const result = await runProtocolPoolCli(["readiness", "doctor"], {
+    config: {
+      stateDir,
+      apiKey: "secret-local-key",
+      compat: {
+        stripClientTools: true,
+        toolLoopMode: "client_executes_tools_first",
+      },
+      protocol: {
+        enabled: true,
+        baseUrl: "https://web.tabbit.ai",
+        sendPath: "/api/v1/chat/completion",
+        sessionVerifyPath: "/api/v0/user/base-info",
+        authSendCodePath: "/api/auth/send-code",
+        authSubmitCodePath: "/api/auth/submit-code",
+        signInPath: "/api/commerce/activity/v1/sign-in",
+        benefitCouponUsePath: "/api/commerce/benefit/v1/coupon/use",
+        activityParticipatePath: "/api/commerce/activity/v1/participate",
+        lotteryDrawPath: "/api/commerce/lottery/v1/draw",
+        reqCtx: "browser-context-secret",
+      },
+    },
+    accountStore: memoryStore(baseAccounts(), calls),
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push(["listFixtures"]);
+        return [
+          { operation: "verifySession", status: "success", result: { ok: true, userId: "user_123" } },
+          { operation: "sendMessage", status: "success", result: { raw: { kind: "stream" }, streamDeltas: ["ok"] } },
+          {
+            operation: "sendMessage",
+            status: "failed",
+            input: { tools: [{ type: "function", function: { name: "lookup_private_data" } }] },
+            result: { ok: false, error: { category: "unsupported_feature", code: "***" } },
+          },
+          { operation: "sendMessage", status: "failed", result: { ok: false, error: { category: "forbidden", status: 403 } } },
+        ];
+      },
+    },
+    readinessStateStore: memoryReadinessStore({
+      codex: { verified: true },
+      claude: { verified: true },
+    }, calls),
+    accountVerifier: {
+      async verifyAccount() {
+        calls.push(["verifyAccount"]);
+        throw new Error("readiness doctor must not verify accounts");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push(["probeAccount"]);
+        throw new Error("readiness doctor must not run protocol probes");
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stream.stderr.length, 0);
+  assert.deepEqual(calls, [["loadAccounts"], ["listFixtures"], ["readReadinessState"]]);
+  const text = stream.stdout.join("");
+  assert.match(text, /^status\tready/m);
+  assert.match(text, /^auth_send_endpoint\tconfigured/m);
+  assert.match(text, /^auth_submit_endpoint\tconfigured/m);
+  assert.match(text, /^remaining_work\t0/m);
+  assert.match(text, /^calibration_backlog\tblocked\tmissing=11/m);
+  assert.match(text, /^auth_backlog\tblocked\tmissing=2/m);
+  assert.match(text, /^benefits_backlog\tblocked\tmissing=4/m);
+  assert.match(text, /^session_backlog\tblocked\tmissing=2/m);
+  assert.match(text, /^upstream_backlog\tblocked\tmissing=3/m);
+  assert.match(text, /^capture_command\tsuccessful_sendVerificationCode_fixture.*\tprereq=TABBIT_POOL_PROTOCOL_AUTH_SEND_CODE_PATH:configured/m);
+  assert.match(text, /^capture_command\tsuccessful_daily_sign_in_fixture.*\tprereq=TABBIT_POOL_PROTOCOL_SIGN_IN_PATH:configured/m);
+  assert.match(text, /^capture_command\tsuccessful_pro_activity_fixture.*\tprereq=TABBIT_POOL_PROTOCOL_ACTIVITY_PARTICIPATE_PATH:configured/m);
+  assert.match(text, /^capture_command\tsuccessful_lottery_draw_fixture.*\tprereq=TABBIT_POOL_PROTOCOL_LOTTERY_DRAW_PATH:configured/m);
+  assert.match(text, /^capture_command\texpired_verifySession_fixture.*\tprereq=TABBIT_POOL_PROTOCOL_SESSION_VERIFY_PATH:configured/m);
+  assert.match(text, /^capture_command\treal_upstream_error_frame_fixture\tupstream\tside_effect=false.*\tprereq=TABBIT_POOL_PROTOCOL_SEND_PATH:configured/m);
+  assert.match(text, /^capture_command\treal_upstream_cancellation_fixture\tupstream\tside_effect=false.*\tprereq=TABBIT_POOL_PROTOCOL_SEND_PATH:configured/m);
+  assert.match(text, /^capture_command\treal_upstream_backpressure_fixture\tupstream\tside_effect=false.*\tprereq=TABBIT_POOL_PROTOCOL_SEND_PATH:configured/m);
+  assert.match(text, /^capture_command\tsuccessful_sendVerificationCode_fixture\tauth\tside_effect=true\ttemplate=node bin\\tabbit-pool\.js probe template --operation sendVerificationCode --json\tvalidate=node bin\\tabbit-pool\.js probe validate --operation sendVerificationCode --input-file <redacted-input\.json> --json\tconfirm_validate=node bin\\tabbit-pool\.js probe validate --operation sendVerificationCode --input-file <redacted-input\.json> --require-confirmed-side-effect --json\tprobe=node bin\\tabbit-pool\.js probe protocol --account <account-id> --operation sendVerificationCode --input-file <redacted-input\.json> --write-fixture --json/m);
+  assert.match(text, /^capture_command\tsuccessful_reset_coupon_consumption_fixture\tbenefits\tside_effect=true\ttemplate=node bin\\tabbit-pool\.js probe template --operation useResetCoupon --json\tvalidate=node bin\\tabbit-pool\.js probe validate --operation useResetCoupon --input-file <redacted-input\.json> --json\tconfirm_validate=node bin\\tabbit-pool\.js probe validate --operation useResetCoupon --input-file <redacted-input\.json> --require-confirmed-side-effect --json\tprobe=node bin\\tabbit-pool\.js probe protocol --account <account-id> --operation useResetCoupon --input-file <redacted-input\.json> --write-fixture --json\twrite_fixture=\tprereq=TABBIT_POOL_PROTOCOL_BENEFIT_COUPON_USE_PATH:configured\treason=/m);
+  assert.match(text, /^capture_command\tautomated_session_refresh_strategy\tsession\tside_effect=false\ttemplate=node bin\\tabbit-pool\.js probe template --operation recoverSession --json\tvalidate=node bin\\tabbit-pool\.js probe validate --operation recoverSession --input-file <redacted-input\.json> --json\tconfirm_validate=\tprobe=\twrite_fixture=node bin\\tabbit-pool\.js probe validate --operation recoverSession --input-file <redacted-input\.json> --write-fixture --json\tprereq=\treason=/m);
+  assert.doesNotMatch(text, /alpha-user@example\.test|beta-user@example\.test/);
+  assert.doesNotMatch(text, /tabbit_session|secret-token|secret-local-key|browser-context-secret|cookieJarRef/);
+  assert.doesNotMatch(text, /lookup_private_data/);
 });
 
 
@@ -733,6 +1091,7 @@ test("probe template --operation sendMessage prints a safe starter input object"
   assert.deepEqual(body, {
     model: "tabbit/priority",
     messages: [{ role: "user", content: "ping" }],
+    stream: true,
   });
   assert.equal(JSON.stringify(body).includes("token"), false);
   assert.equal(JSON.stringify(body).includes("cookie"), false);
@@ -841,6 +1200,209 @@ test("probe template prints side-effect inputs with confirmation disabled", asyn
     confirmSideEffect: false,
     body: {},
   });
+
+  const useResetCouponStream = io();
+  const useResetCoupon = await runProtocolPoolCli(["probe", "template", "--operation", "useResetCoupon", "--json"], {
+    stdout: (line) => useResetCouponStream.stdout.push(line),
+    stderr: (line) => useResetCouponStream.stderr.push(line),
+  });
+
+  assert.equal(useResetCoupon.exitCode, 0);
+  assert.deepEqual(JSON.parse(useResetCouponStream.stdout.join("")), {
+    confirmSideEffect: false,
+    couponCode: "coupon-code",
+    couponType: "weekly_reset_coupon",
+    requestNo: "reset-coupon-use-probe",
+  });
+});
+
+test("probe template for sendMessage defaults to stream capture input", async () => {
+  const templateStream = io();
+  const templateResult = await runProtocolPoolCli(["probe", "template", "--operation", "sendMessage", "--json"], {
+    stdout: (line) => templateStream.stdout.push(line),
+    stderr: (line) => templateStream.stderr.push(line),
+  });
+
+  assert.equal(templateResult.exitCode, 0);
+  assert.equal(templateStream.stderr.length, 0);
+  const template = JSON.parse(templateStream.stdout.join(""));
+  assert.deepEqual(template, {
+    model: "tabbit/priority",
+    messages: [{ role: "user", content: "ping" }],
+    stream: true,
+  });
+
+  const validateStream = io();
+  const validateResult = await runProtocolPoolCli([
+    "probe", "validate",
+    "--operation", "sendMessage",
+    "--input-json", JSON.stringify(template),
+    "--json",
+  ], {
+    stdout: (line) => validateStream.stdout.push(line),
+    stderr: (line) => validateStream.stderr.push(line),
+  });
+
+  assert.equal(validateResult.exitCode, 0);
+  assert.equal(validateStream.stderr.length, 0);
+  const preview = JSON.parse(validateStream.stdout.join(""));
+  assert.equal(preview.status, "valid");
+  assert.equal(preview.operation, "sendMessage");
+  assert.equal(preview.sideEffect, false);
+  assert.equal(preview.fields.messages, "array");
+  assert.equal(preview.fields.stream, true);
+
+  const serialized = templateStream.stdout.join("") + validateStream.stdout.join("");
+  assert.doesNotMatch(serialized, /cookie|session|token|api[_-]?key|Bearer\s+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.|rawPayload|prompt|user@example/i);
+});
+
+test("probe template prints auth inputs with confirmation disabled", async () => {
+  const sendStream = io();
+  const send = await runProtocolPoolCli(["probe", "template", "--operation", "sendVerificationCode", "--json"], {
+    stdout: (line) => sendStream.stdout.push(line),
+    stderr: (line) => sendStream.stderr.push(line),
+  });
+  const submitStream = io();
+  const submit = await runProtocolPoolCli(["probe", "template", "--operation", "submitRegistrationOrLogin", "--json"], {
+    stdout: (line) => submitStream.stdout.push(line),
+    stderr: (line) => submitStream.stderr.push(line),
+  });
+
+  assert.equal(send.exitCode, 0);
+  assert.equal(submit.exitCode, 0);
+  const authUuid = "0000000000000000000000000000000000000000000000000000000000000000";
+  assert.deepEqual(JSON.parse(sendStream.stdout.join("")), {
+    confirmSideEffect: false,
+    mobile: "10000000000",
+    uuid: authUuid,
+    body: { uuid: authUuid, platform: "1", version: "", app: "1000", mobile: "10000000000" },
+  });
+  assert.deepEqual(JSON.parse(submitStream.stdout.join("")), {
+    confirmSideEffect: false,
+    mobile: "10000000000",
+    code: "000000",
+    uuid: authUuid,
+    body: { uuid: authUuid, platform: "1", version: "", app: "1000", mobile: "10000000000", smsCode: "000000" },
+  });
+  const serialized = sendStream.stdout.join("") + submitStream.stdout.join("");
+  assert.equal(serialized.includes("token"), false);
+  assert.equal(serialized.includes("cookie"), false);
+  assert.equal(serialized.includes("session"), false);
+});
+
+test("probe validate accepts calibrated auth mobile input without email", async () => {
+  const stream = io();
+  const calls = [];
+  const authUuid = "0000000000000000000000000000000000000000000000000000000000000000";
+  const inputFile = path.join(await mkdtemp(path.join(tmpdir(), "tabbit-probe-validate-auth-mobile-")), "auth-submit.json");
+  await writeFile(inputFile, JSON.stringify({
+    confirmSideEffect: true,
+    mobile: "10000000000",
+    code: "000000",
+    uuid: authUuid,
+    body: { uuid: authUuid, platform: "1", version: "", app: "1000", mobile: "10000000000", smsCode: "000000" },
+  }), "utf8");
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "submitRegistrationOrLogin",
+    "--input-file",
+    inputFile,
+    "--json",
+  ], {
+    accountStore: {
+      async loadAccounts() {
+        calls.push("loadAccounts");
+        throw new Error("probe validate must not read accounts");
+      },
+    },
+    secretStore: {
+      async readSecret() {
+        calls.push("readSecret");
+        throw new Error("probe validate must not read secrets");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("probe validate must not run protocol probes");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stream.stderr.length, 0);
+  assert.deepEqual(calls, []);
+  const text = stream.stdout.join("");
+  const body = JSON.parse(text);
+  assert.equal(body.status, "valid");
+  assert.equal(body.fields.mobile, "present");
+  assert.equal(body.fields.email, "missing");
+  assert.equal(body.fields.code, "present");
+  assert.equal(body.fields.uuid, "present");
+  assert.deepEqual(body.bodyKeys, ["app", "mobile", "platform", "smsCode", "uuid", "version"]);
+  assert.doesNotMatch(text, /10000000000|0000000000000000000000000000000000000000000000000000000000000000|000000/);
+});
+
+test("probe template --operation recoverSession prints safe session recovery evidence input", async () => {
+  const stream = io();
+  const result = await runProtocolPoolCli(["probe", "template", "--operation", "recoverSession", "--json"], {
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stream.stderr.length, 0);
+  const body = JSON.parse(stream.stdout.join(""));
+  assert.deepEqual(body, {
+    kind: "session_recovery_strategy",
+    operation: "recoverSession",
+    status: "success",
+    evidence: {
+      strategy: "automated_reauth",
+      automatedRefresh: "calibrated_reauth_probe",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+  });
+  const serialized = stream.stdout.join("");
+  assert.doesNotMatch(serialized, /cookie|Bearer\s+|api[_-]?key|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.|prompt|user@example/i);
+});
+
+test("probe template --operation consumeResetCoupon prints safe reset coupon consumption evidence input", async () => {
+  const stream = io();
+  const result = await runProtocolPoolCli(["probe", "template", "--operation", "consumeResetCoupon", "--json"], {
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stream.stderr.length, 0);
+  const body = JSON.parse(stream.stdout.join(""));
+  assert.deepEqual(body, {
+    kind: "reset_coupon_consumption_evidence",
+    operation: "consumeResetCoupon",
+    status: "success",
+    evidence: {
+      endpointHash: "sha256:<redacted-endpoint>",
+      bodyHash: "sha256:<redacted-body>",
+      resultHash: "sha256:<redacted-result>",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+    result: {
+      resetCouponConsumed: true,
+      consumeResult: "success",
+    },
+  });
+  const serialized = stream.stdout.join("");
+  assert.doesNotMatch(serialized, /cookie|Bearer\s+|api[_-]?key|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.|prompt|user@example/i);
 });
 
 test("probe template rejects unsupported operations", async () => {
@@ -951,6 +1513,102 @@ test("default CLI dependencies expose a batch benefits maintainer", async () => 
   assert.equal(result.changed, false);
   assert.deepEqual(result.accounts, []);
   assert.deepEqual(result.results, []);
+});
+
+test("default CLI dependencies can keep protocol fixtures in a separate writable directory", async () => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), "tabbit-pool-readonly-state-"));
+  const fixtureDir = await mkdtemp(path.join(tmpdir(), "tabbit-pool-writable-fixtures-"));
+  const deps = createProtocolPoolCliDependencies({
+    env: {
+      TABBIT_POOL_STATE_DIR: stateDir,
+      TABBIT_POOL_PROTOCOL_FIXTURE_DIR: fixtureDir,
+    },
+    now: () => Date.parse(NOW),
+  });
+
+  const ref = await deps.protocolFixtureStore.writeFixture({
+    version: 1,
+    kind: "protocol_probe",
+    observedAt: NOW,
+    operation: "dailySignIn",
+    status: "success",
+    result: { token: "secret-token", signInResult: "success" },
+  });
+
+  assert.equal(ref, "fixtures/protocol-probes/2026-07-02T030000000Z-account-dailySignIn.json");
+  await assert.rejects(() => readFile(path.join(stateDir, ref), "utf8"), { code: "ENOENT" });
+  const saved = await readFile(path.join(fixtureDir, "2026-07-02T030000000Z-account-dailySignIn.json"), "utf8");
+  assert.equal(saved.includes("secret-token"), false);
+  assert.deepEqual((await deps.protocolFixtureStore.listFixtures()).map((item) => item.ref), [ref]);
+});
+
+test("createProtocolPoolCliDependencies wires configured auth operations for AccountProvisioner", async () => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), "tabbit-pool-auth-wiring-"));
+  const calls = [];
+  const deps = createProtocolPoolCliDependencies({
+    env: {
+      TABBIT_POOL_STATE_DIR: stateDir,
+      TABBIT_POOL_PROTOCOL_AUTH_SEND_CODE_PATH: "/api/auth/send-code",
+      TABBIT_POOL_PROTOCOL_AUTH_SUBMIT_CODE_PATH: "/api/auth/submit-code",
+    },
+    now: () => Date.parse("2026-07-04T02:00:00.000Z"),
+    fetch: async (url, options = {}) => {
+      calls.push({ url, method: options.method || "GET", body: options.body || "" });
+      if (url.endsWith("/chat/sign-key")) return jsonResponse("sign-key-auth");
+      if (url.endsWith("/api/auth/send-code")) {
+        return jsonResponse({ codeSent: true, deliveryResult: "sent" });
+      }
+      if (url.endsWith("/api/auth/submit-code")) {
+        return jsonResponse({
+          data: {
+            cookie: "fixture-cookie",
+            user_id: "user_auth_wired",
+            access_tier: "free",
+          },
+        });
+      }
+      throw new Error("unexpected auth wiring request: " + url);
+    },
+  });
+  const provisioner = new AccountProvisioner({
+    accountStore: deps.accountStore,
+    secretStore: deps.secretStore,
+    protocolClient: deps.accountProtocolClient,
+    idGenerator: () => "acct_auth_wired",
+    now: () => new Date("2026-07-04T02:00:00.000Z"),
+    mailProvider: {
+      async createInbox() {
+        return { id: "inbox_auth_wired", address: "auth-wired@example.test" };
+      },
+      async waitForVerificationCode() {
+        return { code: "654321" };
+      },
+    },
+  });
+
+  const result = await provisioner.createAccount({
+    authSendCodeBody: { email_address: "auth-wired@example.test", scene: "login" },
+    authSubmitCodeBody: { email_address: "auth-wired@example.test", verify_code: "654321" },
+  });
+
+  assert.equal(result.account.status, "active");
+  assert.equal(result.account.userId, "user_auth_wired");
+  assert.equal(result.account.accessTier, "free");
+  assert.deepEqual(result.actions.map((item) => [item.name, item.status]), [
+    ["createInbox", "success"],
+    ["sendVerificationCode", "success"],
+    ["waitForVerificationCode", "success"],
+    ["submitRegistrationOrLogin", "success"],
+    ["saveSession", "success"],
+  ]);
+  assert.equal(await deps.secretStore.readSecret("secrets/acct_auth_wired.cookie"), "fixture-cookie");
+  assert.deepEqual(calls.map((call) => call.url).filter((url) => url.includes("/api/auth/")), [
+    "https://web.tabbit.ai/api/auth/send-code",
+    "https://web.tabbit.ai/api/auth/submit-code",
+  ]);
+  const serializedResult = JSON.stringify(result);
+  assert.equal(serializedResult.includes("tabbit_session=auth-wired-secret"), false);
+  assert.equal(serializedResult.includes("654321"), false);
 });
 
 test("configured quota usage env wires maintain refreshQuota with hydrated local session", async () => {
@@ -1099,7 +1757,7 @@ test("configured sign-in maintain checks signedToday before posting", async () =
     cookieJarRef: "secrets/acct_sign_in_status_env.cookie",
     lastCheckinAt: "2026-07-02T09:45:00.000Z",
   }]);
-  await deps.secretStore.writeSecret("secrets/acct_sign_in_status_env.cookie", "tabbit_session=sign-in-status-env");
+  await deps.secretStore.writeSecret("secrets/acct_sign_in_status_env.cookie", "tabbit_session=sin");
 
   const result = await deps.benefitsMaintainer.maintainAllAccounts();
 
@@ -1108,8 +1766,8 @@ test("configured sign-in maintain checks signedToday before posting", async () =
   assert.equal(result.results[0].actions.find((item) => item.name === "dailyCheckin")?.status, "success");
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "https://web.tabbit.ai/api/commerce/activity/v1/sign-in/status?scene_codes=desktop_pet");
-  assert.equal(calls[0].options.headers.Cookie, "tabbit_session=sign-in-status-env");
-  assert.equal(JSON.stringify(result).includes("tabbit_session=sign-in-status-env"), false);
+  assert.equal(calls[0].options.headers.Cookie, "tabbit_session=sin");
+  assert.equal(JSON.stringify(result).includes("tabbit_session=sin"), false);
 });
 
 test("default CLI dependencies expose a safe account verifier", async () => {
@@ -1186,10 +1844,11 @@ test("configured protocol env wires protocol probe runner without leaking the se
 
   assert.equal(result.status, "success");
   assert.equal(result.fixture.operation, "verifySession");
-  assert.equal(result.fixture.result.userId, "user_probe");
+  assert.equal(result.fixture.result.userId, "***");
   assert.equal(calls.length, 2);
   assert.equal(calls[1].options.headers.Cookie, "tabbit_session=probe-env");
   assert.equal(JSON.stringify(result).includes("tabbit_session=probe-env"), false);
+  assert.equal(JSON.stringify(result).includes("user_probe"), false);
 });
 
 test("configured protocol env wires protocol probe runner for uploadAttachment", async () => {
@@ -1391,6 +2050,1231 @@ test("configured read-only benefits env wires protocol probe runner", async () =
   assert.equal(JSON.stringify([newbie, reward, placement]).includes("tabbit_session=benefits-probe"), false);
 });
 
+test("configured reset coupon use env wires protocol probe runner with explicit confirmation", async () => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), "tabbit-pool-reset-coupon-use-env-"));
+  const calls = [];
+  const deps = createProtocolPoolCliDependencies({
+    env: {
+      TABBIT_POOL_STATE_DIR: stateDir,
+      TABBIT_POOL_PROTOCOL_BENEFIT_COUPON_USE_PATH: "/api/commerce/benefit/v1/coupon/use",
+    },
+    now: () => 1700000000000,
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        coupon_result: "success",
+        used: true,
+      });
+    },
+  });
+  await deps.accountStore.saveAccounts([{
+    id: "acct_reset_coupon_use_probe",
+    status: "active",
+    userId: "user_reset_coupon_use",
+    cookieJarRef: "secrets/acct_reset_coupon_use_probe.cookie",
+  }]);
+  await deps.secretStore.writeSecret("secrets/acct_reset_coupon_use_probe.cookie", "tabbit_session=reset-coupon-use");
+
+  const result = await deps.protocolProbeRunner.probeAccount({
+    accountId: "acct_reset_coupon_use_probe",
+    operation: "useResetCoupon",
+    input: {
+      confirmSideEffect: true,
+      couponCode: "coupon-code",
+      couponType: "weekly_reset_coupon",
+      requestNo: "reset-coupon-use-probe",
+    },
+  });
+
+  assert.equal(result.status, "success");
+  assert.equal(result.fixture.operation, "useResetCoupon");
+  assert.equal(result.fixture.result.source, "tabbit-reset-coupon-use");
+  assert.equal(result.fixture.result.evidence.safe, true);
+  assert.equal(result.fixture.result.evidence.sanitized, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://web.tabbit.ai/api/commerce/benefit/v1/coupon/use");
+  assert.equal(calls[0].options.headers.Cookie, "tabbit_session=reset-coupon-use");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    user_id: "user_reset_coupon_use",
+    coupon_code: "coupon-code",
+    coupon_type: "weekly_reset_coupon",
+    request_no: "reset-coupon-use-probe",
+  });
+  assert.equal(JSON.stringify(result).includes("tabbit_session=reset-coupon-use"), false);
+});
+
+
+test("probe validate --json validates auth input without leaking values", async () => {
+  const stream = io();
+  const calls = [];
+  const inputFile = path.join(await mkdtemp(path.join(tmpdir(), "tabbit-probe-validate-")), "auth-submit.json");
+  await writeFile(inputFile, JSON.stringify({
+    confirmSideEffect: true,
+    email: "real-user@example.test",
+    code: "654321",
+    body: {
+      email: "real-user@example.test",
+      code: "654321",
+      scene: "registration",
+      captchaToken: "captcha-secret-value",
+    },
+  }), "utf8");
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "submitRegistrationOrLogin",
+    "--input-file",
+    inputFile,
+    "--json",
+  ], {
+    accountStore: {
+      async loadAccounts() {
+        calls.push("loadAccounts");
+        throw new Error("probe validate must not read accounts");
+      },
+    },
+    secretStore: {
+      async readSecret() {
+        calls.push("readSecret");
+        throw new Error("probe validate must not read secrets");
+      },
+    },
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        throw new Error("probe validate must not read fixtures");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("probe validate must not run protocol probes");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stream.stderr.length, 0);
+  assert.deepEqual(calls, []);
+  const text = stream.stdout.join("");
+  const body = JSON.parse(text);
+  assert.equal(body.status, "valid");
+  assert.equal(body.operation, "submitRegistrationOrLogin");
+  assert.equal(body.source, "input");
+  assert.equal(body.sideEffect, true);
+  assert.equal(body.confirmSideEffect, true);
+  assert.equal(body.fields.email, "present");
+  assert.equal(body.fields.code, "present");
+  assert.equal(body.fields.body, "object");
+  assert.deepEqual(body.bodyKeys, ["captchaToken", "code", "email", "scene"]);
+  assert.doesNotMatch(text, /real-user@example\.test|654321|captcha-secret-value/);
+  assert.doesNotMatch(text, /cookie|session|secret-value/);
+});
+
+test("probe validate rejects invalid auth input before touching dependencies", async () => {
+  const stream = io();
+  const calls = [];
+  const inputFile = path.join(await mkdtemp(path.join(tmpdir(), "tabbit-probe-validate-invalid-")), "auth-submit.json");
+  await writeFile(inputFile, JSON.stringify({
+    confirmSideEffect: "yes",
+    email: "invalid-user@example.test",
+    code: "987654",
+    body: {
+      email: "invalid-user@example.test",
+      code: "987654",
+      scene: "registration",
+    },
+  }), "utf8");
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "submitRegistrationOrLogin",
+    "--input-file",
+    inputFile,
+    "--json",
+  ], {
+    accountStore: {
+      async loadAccounts() {
+        calls.push("loadAccounts");
+        throw new Error("probe validate must not read accounts");
+      },
+    },
+    secretStore: {
+      async readSecret() {
+        calls.push("readSecret");
+        throw new Error("probe validate must not read secrets");
+      },
+    },
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        throw new Error("probe validate must not read fixtures");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("probe validate must not run protocol probes");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 2);
+  assert.deepEqual(calls, []);
+  assert.equal(stream.stdout.length, 0);
+  const errorText = stream.stderr.join("");
+  assert.match(errorText, /confirmSideEffect.*boolean/);
+  assert.doesNotMatch(errorText, /invalid-user@example\.test|987654|registration/);
+});
+
+test("probe validate --require-confirmed-side-effect rejects unconfirmed side-effect input", async () => {
+  const stream = io();
+  const calls = [];
+  const inputFile = path.join(await mkdtemp(path.join(tmpdir(), "tabbit-probe-validate-confirm-")), "auth-send.json");
+  await writeFile(inputFile, JSON.stringify({
+    confirmSideEffect: false,
+    email: "unconfirmed-user@example.test",
+    body: {
+      email: "unconfirmed-user@example.test",
+      scene: "registration",
+      captchaToken: "synthetic-captcha-value",
+    },
+  }), "utf8");
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "sendVerificationCode",
+    "--input-file",
+    inputFile,
+    "--require-confirmed-side-effect",
+    "--json",
+  ], {
+    accountStore: {
+      async loadAccounts() {
+        calls.push("loadAccounts");
+        throw new Error("probe validate must not read accounts");
+      },
+    },
+    secretStore: {
+      async readSecret() {
+        calls.push("readSecret");
+        throw new Error("probe validate must not read secrets");
+      },
+    },
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        throw new Error("probe validate must not read fixtures");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("probe validate must not run protocol probes");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 2);
+  assert.deepEqual(calls, []);
+  assert.equal(stream.stdout.length, 0);
+  const errorText = stream.stderr.join("");
+  assert.match(errorText, /confirmSideEffect:true/);
+  assert.doesNotMatch(errorText, /unconfirmed-user@example\.test|registration|synthetic-captcha-value/);
+});
+
+test("probe validate --operation useResetCoupon enforces confirmation and calibrated fields", async () => {
+  const stream = io();
+  const calls = [];
+  const inputFile = path.join(await mkdtemp(path.join(tmpdir(), "tabbit-probe-use-reset-coupon-")), "use-reset-coupon.json");
+  await writeFile(inputFile, JSON.stringify({
+    confirmSideEffect: false,
+    couponCode: "coupon-code",
+    couponType: "weekly_reset_coupon",
+    requestNo: "reset-coupon-use-probe",
+  }), "utf8");
+
+  const rejected = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "useResetCoupon",
+    "--input-file",
+    inputFile,
+    "--require-confirmed-side-effect",
+    "--json",
+  ], {
+    accountStore: {
+      async loadAccounts() {
+        calls.push("loadAccounts");
+        throw new Error("probe validate must not read accounts");
+      },
+    },
+    secretStore: {
+      async readSecret() {
+        calls.push("readSecret");
+        throw new Error("probe validate must not read secrets");
+      },
+    },
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        throw new Error("probe validate must not read fixtures");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("probe validate must not run protocol probes");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(rejected.exitCode, 2);
+  assert.deepEqual(calls, []);
+  assert.equal(stream.stdout.length, 0);
+  assert.match(stream.stderr.join(""), /confirmSideEffect:true/);
+
+  await writeFile(inputFile, JSON.stringify({
+    confirmSideEffect: true,
+    couponCode: "coupon-code",
+    couponType: "weekly_reset_coupon",
+    requestNo: "reset-coupon-use-probe",
+  }), "utf8");
+  const acceptedStream = io();
+  const accepted = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "useResetCoupon",
+    "--input-file",
+    inputFile,
+    "--require-confirmed-side-effect",
+    "--json",
+  ], {
+    accountStore: {
+      async loadAccounts() {
+        calls.push("loadAccounts");
+        throw new Error("probe validate must not read accounts");
+      },
+    },
+    secretStore: {
+      async readSecret() {
+        calls.push("readSecret");
+        throw new Error("probe validate must not read secrets");
+      },
+    },
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        throw new Error("probe validate must not read fixtures");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("probe validate must not run protocol probes");
+      },
+    },
+    stdout: (line) => acceptedStream.stdout.push(line),
+    stderr: (line) => acceptedStream.stderr.push(line),
+  });
+
+  assert.equal(accepted.exitCode, 0);
+  assert.deepEqual(calls, []);
+  assert.equal(acceptedStream.stderr.length, 0);
+  const body = JSON.parse(acceptedStream.stdout.join(""));
+  assert.equal(body.status, "valid");
+  assert.equal(body.sideEffect, true);
+  assert.equal(body.fields.couponCode, "present");
+  assert.equal(body.fields.couponType, "present");
+  assert.equal(body.fields.requestNo, "present");
+});
+
+test("probe validate --require-confirmed-side-effect allows read-only operations", async () => {
+  const stream = io();
+  const calls = [];
+  const result = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "verifySession",
+    "--require-confirmed-side-effect",
+    "--json",
+  ], {
+    accountStore: {
+      async loadAccounts() {
+        calls.push("loadAccounts");
+        throw new Error("probe validate must not read accounts");
+      },
+    },
+    secretStore: {
+      async readSecret() {
+        calls.push("readSecret");
+        throw new Error("probe validate must not read secrets");
+      },
+    },
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        throw new Error("probe validate must not read fixtures");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("probe validate must not run protocol probes");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, []);
+  assert.equal(stream.stderr.length, 0);
+  const body = JSON.parse(stream.stdout.join(""));
+  assert.equal(body.status, "valid");
+  assert.equal(body.operation, "verifySession");
+  assert.equal(body.sideEffect, false);
+});
+
+test("probe validate --operation recoverSession validates offline evidence without leaking values", async () => {
+  const stream = io();
+  const calls = [];
+  const inputFile = path.join(await mkdtemp(path.join(tmpdir(), "tabbit-probe-recover-session-")), "recover-session.json");
+  await writeFile(inputFile, JSON.stringify({
+    kind: "session_recovery_strategy",
+    operation: "recoverSession",
+    status: "success",
+    evidence: {
+      strategy: "automated_reauth",
+      automatedRefresh: "calibrated_reauth_probe",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+    ignoredRaw: {
+      cookie: "tabbit_session=secret",
+      prompt: "placeholder prompt should stay hidden",
+      recoveredValue: "placeholder-recovered-value",
+    },
+  }), "utf8");
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "recoverSession",
+    "--input-file",
+    inputFile,
+    "--json",
+  ], {
+    accountStore: {
+      async loadAccounts() {
+        calls.push("loadAccounts");
+        throw new Error("probe validate must not read accounts");
+      },
+    },
+    secretStore: {
+      async readSecret() {
+        calls.push("readSecret");
+        throw new Error("probe validate must not read secrets");
+      },
+    },
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        throw new Error("probe validate must not read fixtures");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("probe validate must not run protocol probes");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stream.stderr.length, 0);
+  assert.deepEqual(calls, []);
+  const text = stream.stdout.join("");
+  const body = JSON.parse(text);
+  assert.equal(body.status, "valid");
+  assert.equal(body.operation, "recoverSession");
+  assert.equal(body.sideEffect, false);
+  assert.equal(body.fields.kind, "present");
+  assert.equal(body.fields.status, "present");
+  assert.equal(body.fields.evidence, "object");
+  assert.deepEqual(body.evidenceKeys, ["automatedRefresh", "rawPayload", "safe", "sanitized", "strategy"]);
+  assert.deepEqual(body.sessionRecovery, {
+    strategy: "automated_reauth",
+    automatedRefresh: "calibrated_reauth_probe",
+    safe: true,
+    sanitized: true,
+    rawPayload: false,
+  });
+  assert.doesNotMatch(text, /tabbit_session=secret|placeholder prompt|placeholder-recovered-value/);
+});
+
+test("probe validate --operation recoverSession rejects unsafe evidence before touching dependencies", async () => {
+  const stream = io();
+  const calls = [];
+  const inputFile = path.join(await mkdtemp(path.join(tmpdir(), "tabbit-probe-recover-session-invalid-")), "recover-session.json");
+  await writeFile(inputFile, JSON.stringify({
+    kind: "session_recovery_strategy",
+    operation: "recoverSession",
+    status: "success",
+    evidence: {
+      strategy: "automated_reauth",
+      automatedRefresh: "calibrated_reauth_probe",
+      safe: true,
+      sanitized: true,
+      rawPayload: true,
+    },
+    ignoredRaw: {
+      prompt: "unsafe placeholder prompt",
+    },
+  }), "utf8");
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "recoverSession",
+    "--input-file",
+    inputFile,
+    "--json",
+  ], {
+    accountStore: {
+      async loadAccounts() {
+        calls.push("loadAccounts");
+        throw new Error("probe validate must not read accounts");
+      },
+    },
+    secretStore: {
+      async readSecret() {
+        calls.push("readSecret");
+        throw new Error("probe validate must not read secrets");
+      },
+    },
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        throw new Error("probe validate must not read fixtures");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("probe validate must not run protocol probes");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 2);
+  assert.deepEqual(calls, []);
+  assert.equal(stream.stdout.length, 0);
+  const errorText = stream.stderr.join("");
+  assert.match(errorText, /rawPayload:false/);
+  assert.doesNotMatch(errorText, /unsafe placeholder prompt/);
+});
+
+test("probe validate --operation recoverSession requires explicit evidence input", async () => {
+  const stream = io();
+  const calls = [];
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "recoverSession",
+    "--json",
+  ], {
+    accountStore: {
+      async loadAccounts() {
+        calls.push("loadAccounts");
+        throw new Error("probe validate must not read accounts");
+      },
+    },
+    secretStore: {
+      async readSecret() {
+        calls.push("readSecret");
+        throw new Error("probe validate must not read secrets");
+      },
+    },
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        throw new Error("probe validate must not read fixtures");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("probe validate must not run protocol probes");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 2);
+  assert.deepEqual(calls, []);
+  assert.equal(stream.stdout.length, 0);
+  assert.match(stream.stderr.join(""), /requires explicit sanitized evidence input/);
+});
+
+test("probe validate --operation consumeResetCoupon validates offline evidence without leaking values", async () => {
+  const stream = io();
+  const calls = [];
+  const inputFile = path.join(await mkdtemp(path.join(tmpdir(), "tabbit-probe-consume-reset-coupon-")), "consume-reset-coupon.json");
+  await writeFile(inputFile, JSON.stringify({
+    kind: "reset_coupon_consumption_evidence",
+    operation: "consumeResetCoupon",
+    status: "success",
+    evidence: {
+      endpointHash: "sha256:endpoint-private-shape",
+      bodyHash: "sha256:body-private-shape",
+      resultHash: "sha256:result-private-shape",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+    result: {
+      resetCouponConsumed: true,
+      consumeResult: "success",
+    },
+    ignoredRaw: {
+      cookie: "tabbit_session=secret",
+      prompt: "placeholder prompt should stay hidden",
+      payload: "raw endpoint/body/result payload should stay hidden",
+    },
+  }), "utf8");
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "consumeResetCoupon",
+    "--input-file",
+    inputFile,
+    "--json",
+  ], {
+    accountStore: {
+      async loadAccounts() {
+        calls.push("loadAccounts");
+        throw new Error("probe validate must not read accounts");
+      },
+    },
+    secretStore: {
+      async readSecret() {
+        calls.push("readSecret");
+        throw new Error("probe validate must not read secrets");
+      },
+    },
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        throw new Error("probe validate must not read fixtures");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("probe validate must not run protocol probes");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stream.stderr.length, 0);
+  assert.deepEqual(calls, []);
+  const text = stream.stdout.join("");
+  const body = JSON.parse(text);
+  assert.equal(body.status, "valid");
+  assert.equal(body.operation, "consumeResetCoupon");
+  assert.equal(body.sideEffect, false);
+  assert.equal(body.fields.kind, "present");
+  assert.equal(body.fields.status, "present");
+  assert.equal(body.fields.evidence, "object");
+  assert.deepEqual(body.evidenceKeys, ["bodyHash", "endpointHash", "rawPayload", "resultHash", "safe", "sanitized"]);
+  assert.deepEqual(body.resetCouponConsumption, {
+    endpointHash: true,
+    bodyHash: true,
+    resultHash: true,
+    safe: true,
+    sanitized: true,
+    rawPayload: false,
+    consumptionSignal: true,
+    nonConsumptionSignal: false,
+  });
+  assert.doesNotMatch(text, /endpoint-private-shape|body-private-shape|result-private-shape|tabbit_session=secret|placeholder prompt|raw endpoint\/body\/result payload/);
+});
+
+test("probe validate --operation consumeResetCoupon rejects unsafe or non-consumption evidence before touching dependencies", async () => {
+  const cases = [
+    {
+      name: "missing-hash",
+      input: {
+        kind: "reset_coupon_consumption_evidence",
+        operation: "consumeResetCoupon",
+        status: "success",
+        evidence: {
+          endpointHash: "sha256:endpoint-private-shape",
+          bodyHash: "sha256:body-private-shape",
+          safe: true,
+          sanitized: true,
+          rawPayload: false,
+        },
+        result: { resetCouponConsumed: true },
+      },
+      expected: /endpointHash, bodyHash, and resultHash/,
+    },
+    {
+      name: "raw-payload",
+      input: {
+        kind: "reset_coupon_consumption_evidence",
+        operation: "consumeResetCoupon",
+        status: "success",
+        evidence: {
+          endpointHash: "sha256:endpoint-private-shape",
+          bodyHash: "sha256:body-private-shape",
+          resultHash: "sha256:result-private-shape",
+          safe: true,
+          sanitized: true,
+          rawPayload: true,
+        },
+        result: { resetCouponConsumed: true },
+      },
+      expected: /rawPayload:false/,
+    },
+    {
+      name: "already-participated",
+      input: {
+        kind: "reset_coupon_consumption_evidence",
+        operation: "consumeResetCoupon",
+        status: "success",
+        evidence: {
+          endpointHash: "sha256:endpoint-private-shape",
+          bodyHash: "sha256:body-private-shape",
+          resultHash: "sha256:result-private-shape",
+          safe: true,
+          sanitized: true,
+          rawPayload: false,
+        },
+        result: {
+          resetCouponConsumed: true,
+          consumeResult: "already_participated",
+        },
+      },
+      expected: /non-consumption/,
+    },
+  ];
+
+  for (const item of cases) {
+    const stream = io();
+    const calls = [];
+    const inputFile = path.join(await mkdtemp(path.join(tmpdir(), "tabbit-probe-consume-reset-coupon-invalid-")), item.name + ".json");
+    await writeFile(inputFile, JSON.stringify({
+      ...item.input,
+      ignoredRaw: {
+        cookie: "tabbit_session=secret",
+        prompt: "unsafe placeholder prompt",
+      },
+    }), "utf8");
+
+    const result = await runProtocolPoolCli([
+      "probe",
+      "validate",
+      "--operation",
+      "consumeResetCoupon",
+      "--input-file",
+      inputFile,
+      "--json",
+    ], {
+      accountStore: {
+        async loadAccounts() {
+          calls.push("loadAccounts");
+          throw new Error("probe validate must not read accounts");
+        },
+      },
+      secretStore: {
+        async readSecret() {
+          calls.push("readSecret");
+          throw new Error("probe validate must not read secrets");
+        },
+      },
+      protocolFixtureStore: {
+        async listFixtures() {
+          calls.push("listFixtures");
+          throw new Error("probe validate must not read fixtures");
+        },
+      },
+      protocolProbeRunner: {
+        async probeAccount() {
+          calls.push("probeAccount");
+          throw new Error("probe validate must not run protocol probes");
+        },
+      },
+      stdout: (line) => stream.stdout.push(line),
+      stderr: (line) => stream.stderr.push(line),
+    });
+
+    assert.equal(result.exitCode, 2, item.name);
+    assert.deepEqual(calls, [], item.name);
+    assert.equal(stream.stdout.length, 0, item.name);
+    const errorText = stream.stderr.join("");
+    assert.match(errorText, item.expected, item.name);
+    assert.doesNotMatch(errorText, /tabbit_session=secret|unsafe placeholder prompt|endpoint-private-shape|body-private-shape|result-private-shape/, item.name);
+  }
+});
+
+test("probe validate --operation consumeResetCoupon requires explicit evidence input", async () => {
+  const stream = io();
+  const calls = [];
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "consumeResetCoupon",
+    "--json",
+  ], {
+    accountStore: {
+      async loadAccounts() {
+        calls.push("loadAccounts");
+        throw new Error("probe validate must not read accounts");
+      },
+    },
+    secretStore: {
+      async readSecret() {
+        calls.push("readSecret");
+        throw new Error("probe validate must not read secrets");
+      },
+    },
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        throw new Error("probe validate must not read fixtures");
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("probe validate must not run protocol probes");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 2);
+  assert.deepEqual(calls, []);
+  assert.equal(stream.stdout.length, 0);
+  assert.match(stream.stderr.join(""), /requires explicit sanitized reset coupon consumption evidence input/);
+});
+
+test("probe validate --write-fixture persists recoverSession offline evidence without reading runtime state", async () => {
+  const stream = io();
+  const calls = [];
+  const written = [];
+  const inputFile = path.join(await mkdtemp(path.join(tmpdir(), "tabbit-probe-recover-session-write-")), "recover-session.json");
+  await writeFile(inputFile, JSON.stringify({
+    kind: "session_recovery_strategy",
+    operation: "recoverSession",
+    status: "success",
+    evidence: {
+      strategy: "automated_reauth",
+      automatedRefresh: "calibrated_reauth_probe",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+    ignoredRaw: {
+      cookie: "tabbit_session=secret",
+      token: "secret-token",
+      prompt: "placeholder prompt should not be stored",
+    },
+  }), "utf8");
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "recoverSession",
+    "--input-file",
+    inputFile,
+    "--write-fixture",
+    "--json",
+  ], {
+    now: () => Date.parse("2026-07-04T04:00:00.000Z"),
+    accountStore: {
+      async loadAccounts() {
+        calls.push("loadAccounts");
+        throw new Error("probe validate --write-fixture must not read accounts");
+      },
+    },
+    secretStore: {
+      async readSecret() {
+        calls.push("readSecret");
+        throw new Error("probe validate --write-fixture must not read secrets");
+      },
+    },
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        throw new Error("probe validate --write-fixture must not read fixtures");
+      },
+      async readFixture() {
+        calls.push("readFixture");
+        throw new Error("probe validate --write-fixture must not read fixture bodies");
+      },
+      async writeFixture(fixture) {
+        calls.push("writeFixture");
+        written.push(fixture);
+        return "fixtures/protocol-probes/recover-session.json";
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("probe validate --write-fixture must not run protocol probes");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, ["writeFixture"]);
+  assert.equal(stream.stderr.length, 0);
+  assert.deepEqual(written, [{
+    kind: "session_recovery_strategy",
+    observedAt: "2026-07-04T04:00:00.000Z",
+    operation: "recoverSession",
+    status: "success",
+    evidence: {
+      strategy: "automated_reauth",
+      automatedRefresh: "calibrated_reauth_probe",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+  }]);
+  const text = stream.stdout.join("");
+  const body = JSON.parse(text);
+  assert.equal(body.status, "valid");
+  assert.equal(body.operation, "recoverSession");
+  assert.equal(body.fixtureRef, "fixtures/protocol-probes/recover-session.json");
+  assert.equal(body.fixture.operation, "recoverSession");
+  assert.equal(body.fixture.kind, "session_recovery_strategy");
+  assert.doesNotMatch(text, /tabbit_session=secret|secret-token|placeholder prompt/);
+});
+
+test("probe validate --write-fixture persists consumeResetCoupon evidence without leaking hash values", async () => {
+  const stream = io();
+  const calls = [];
+  const written = [];
+  const inputFile = path.join(await mkdtemp(path.join(tmpdir(), "tabbit-probe-consume-reset-coupon-write-")), "consume-reset-coupon.json");
+  await writeFile(inputFile, JSON.stringify({
+    kind: "reset_coupon_consumption_evidence",
+    operation: "consumeResetCoupon",
+    status: "success",
+    evidence: {
+      endpointHash: "sha256:endpoint-private-shape",
+      bodyHash: "sha256:body-private-shape",
+      resultHash: "sha256:result-private-shape",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+    result: {
+      resetCouponConsumed: true,
+      consumeResult: "success",
+    },
+    ignoredRaw: {
+      cookie: "tabbit_session=secret",
+      payload: "raw endpoint/body/result payload should not be stored",
+    },
+  }), "utf8");
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "consumeResetCoupon",
+    "--input-file",
+    inputFile,
+    "--write-fixture",
+    "--json",
+  ], {
+    now: () => Date.parse("2026-07-04T04:05:00.000Z"),
+    accountStore: {
+      async loadAccounts() {
+        calls.push("loadAccounts");
+        throw new Error("probe validate --write-fixture must not read accounts");
+      },
+    },
+    secretStore: {
+      async readSecret() {
+        calls.push("readSecret");
+        throw new Error("probe validate --write-fixture must not read secrets");
+      },
+    },
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        throw new Error("probe validate --write-fixture must not read fixtures");
+      },
+      async readFixture() {
+        calls.push("readFixture");
+        throw new Error("probe validate --write-fixture must not read fixture bodies");
+      },
+      async writeFixture(fixture) {
+        calls.push("writeFixture");
+        written.push(fixture);
+        return "fixtures/protocol-probes/consume-reset-coupon.json";
+      },
+    },
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("probe validate --write-fixture must not run protocol probes");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, ["writeFixture"]);
+  assert.equal(stream.stderr.length, 0);
+  assert.deepEqual(written, [{
+    kind: "reset_coupon_consumption_evidence",
+    observedAt: "2026-07-04T04:05:00.000Z",
+    operation: "consumeResetCoupon",
+    status: "success",
+    evidence: {
+      endpointHash: "sha256:endpoint-private-shape",
+      bodyHash: "sha256:body-private-shape",
+      resultHash: "sha256:result-private-shape",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+    result: {
+      resetCouponConsumed: true,
+      consumeResult: "success",
+    },
+  }]);
+  const text = stream.stdout.join("");
+  const body = JSON.parse(text);
+  assert.equal(body.status, "valid");
+  assert.equal(body.operation, "consumeResetCoupon");
+  assert.equal(body.fixtureRef, "fixtures/protocol-probes/consume-reset-coupon.json");
+  assert.equal(body.fixture.operation, "consumeResetCoupon");
+  assert.equal(body.fixture.kind, "reset_coupon_consumption_evidence");
+  assert.deepEqual(body.fixture.evidence, {
+    endpointHash: true,
+    bodyHash: true,
+    resultHash: true,
+    safe: true,
+    sanitized: true,
+    rawPayload: false,
+  });
+  assert.doesNotMatch(text, /endpoint-private-shape|body-private-shape|result-private-shape|tabbit_session=secret|raw endpoint\/body\/result payload/);
+});
+
+test("probe validate --write-fixture rejects non-offline evidence operations before touching fixture store", async () => {
+  const stream = io();
+  const calls = [];
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "sendMessage",
+    "--input-json",
+    JSON.stringify({ model: "tabbit/priority", messages: [{ role: "user", content: "ping" }] }),
+    "--write-fixture",
+    "--json",
+  ], {
+    protocolFixtureStore: {
+      async writeFixture() {
+        calls.push("writeFixture");
+        throw new Error("probe validate --write-fixture must reject before writing non-offline evidence");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 2);
+  assert.deepEqual(calls, []);
+  assert.equal(stream.stdout.length, 0);
+  assert.match(stream.stderr.join(""), /offline evidence/i);
+  assert.doesNotMatch(stream.stderr.join(""), /ping|tabbit\/priority/);
+});
+
+test("probe validate --write-fixture prints plain offline fixture refs without raw evidence", async () => {
+  const stream = io();
+  const inputFile = path.join(await mkdtemp(path.join(tmpdir(), "tabbit-probe-recover-session-write-plain-")), "recover-session.json");
+  await writeFile(inputFile, JSON.stringify({
+    kind: "session_recovery_strategy",
+    operation: "recoverSession",
+    status: "success",
+    evidence: {
+      strategy: "automated_reauth",
+      automatedRefresh: "calibrated_reauth_probe",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+    ignoredRaw: {
+      cookie: "tabbit_session=secret",
+    },
+  }), "utf8");
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "validate",
+    "--operation",
+    "recoverSession",
+    "--input-file",
+    inputFile,
+    "--write-fixture",
+  ], {
+    now: () => Date.parse("2026-07-04T04:10:00.000Z"),
+    protocolFixtureStore: {
+      async writeFixture() {
+        return "fixtures/protocol-probes/recover-session-plain.json";
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stream.stderr.length, 0);
+  const text = stream.stdout.join("");
+  assert.match(text, /^status\tvalid/m);
+  assert.match(text, /^operation\trecoverSession/m);
+  assert.match(text, /^fixture_ref\tfixtures\/protocol-probes\/recover-session-plain\.json/m);
+  assert.doesNotMatch(text, /tabbit_session=secret|automated_reauth|calibrated_reauth_probe/);
+});
+
+test("probe protocol --operation recoverSession rejects offline evidence dispatch", async () => {
+  const stream = io();
+  const calls = [];
+  const input = {
+    kind: "session_recovery_strategy",
+    operation: "recoverSession",
+    status: "success",
+    evidence: {
+      strategy: "automated_reauth",
+      automatedRefresh: "calibrated_reauth_probe",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+  };
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "protocol",
+    "--account",
+    "acct_recover_session",
+    "--operation",
+    "recoverSession",
+    "--input-json",
+    JSON.stringify(input),
+    "--json",
+  ], {
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("recoverSession must stay offline");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 2);
+  assert.deepEqual(calls, []);
+  assert.equal(stream.stdout.length, 0);
+  assert.match(stream.stderr.join(""), /offline evidence/i);
+});
+
+test("probe protocol --operation consumeResetCoupon rejects offline evidence dispatch", async () => {
+  const stream = io();
+  const calls = [];
+  const input = {
+    kind: "reset_coupon_consumption_evidence",
+    operation: "consumeResetCoupon",
+    status: "success",
+    evidence: {
+      endpointHash: "sha256:endpoint-private-shape",
+      bodyHash: "sha256:body-private-shape",
+      resultHash: "sha256:result-private-shape",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+    result: {
+      resetCouponConsumed: true,
+      consumeResult: "success",
+    },
+  };
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "protocol",
+    "--account",
+    "acct_consume_reset_coupon",
+    "--operation",
+    "consumeResetCoupon",
+    "--input-json",
+    JSON.stringify(input),
+    "--json",
+  ], {
+    protocolProbeRunner: {
+      async probeAccount() {
+        calls.push("probeAccount");
+        throw new Error("consumeResetCoupon must stay offline");
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 2);
+  assert.deepEqual(calls, []);
+  assert.equal(stream.stdout.length, 0);
+  assert.match(stream.stderr.join(""), /offline evidence/i);
+});
 
 test("probe protocol --json runs injected protocol probe runner", async () => {
   const calls = [];
@@ -1476,6 +3360,51 @@ test("probe protocol --input-json passes parsed input to the probe runner", asyn
   assert.deepEqual(calls, [{
     accountId: "acct_a",
     operation: "sendMessage",
+    input: probeInput,
+    writeFixture: false,
+  }]);
+});
+
+test("probe protocol --input-json passes valid auth probe input to the runner", async () => {
+  const calls = [];
+  const stream = io();
+  const probeInput = {
+    email: "new-user@example.test",
+    code: "000000",
+    body: { email: "new-user@example.test", code: "000000" },
+    confirmSideEffect: true,
+  };
+
+  const result = await runProtocolPoolCli([
+    "probe",
+    "protocol",
+    "--account",
+    "acct_a",
+    "--operation",
+    "submitRegistrationOrLogin",
+    "--input-json",
+    JSON.stringify(probeInput),
+    "--json",
+  ], {
+    accountStore: memoryStore(baseAccounts()),
+    protocolProbeRunner: {
+      async probeAccount(input) {
+        calls.push(input);
+        return {
+          status: "success",
+          advice: { category: "unknown", severity: "info", recommendation: "ok" },
+          fixture: { version: 1, kind: "protocol_probe", operation: input.operation, status: "success" },
+        };
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [{
+    accountId: "acct_a",
+    operation: "submitRegistrationOrLogin",
     input: probeInput,
     writeFixture: false,
   }]);
@@ -1587,6 +3516,67 @@ test("probe protocol rejects invalid sendMessage model without leaking raw paylo
   assert.match(stderr, /model/i);
   assert.equal(stderr.includes("secret-code-123456"), false);
   assert.equal(stderr.includes(rawPayload), false);
+});
+
+test("probe protocol rejects invalid auth probe input before calling the runner", async () => {
+  const cases = [
+    {
+      operation: "sendVerificationCode",
+      payload: { email: "", confirmSideEffect: true, token: "secret-token", code: "123456" },
+      pattern: /email/i,
+    },
+    {
+      operation: "sendVerificationCode",
+      payload: { email: "new-user@example.test", confirmSideEffect: "yes" },
+      pattern: /confirmSideEffect/i,
+    },
+    {
+      operation: "sendVerificationCode",
+      payload: { email: "new-user@example.test", body: [], confirmSideEffect: true },
+      pattern: /body/i,
+    },
+    {
+      operation: "submitRegistrationOrLogin",
+      payload: { email: "new-user@example.test", confirmSideEffect: true, code: "" },
+      pattern: /code/i,
+    },
+  ];
+
+  for (const item of cases) {
+    const stream = io();
+    const calls = [];
+    const rawPayload = JSON.stringify(item.payload);
+    const result = await runProtocolPoolCli([
+      "probe",
+      "protocol",
+      "--account",
+      "acct_a",
+      "--operation",
+      item.operation,
+      "--input-json",
+      rawPayload,
+      "--json",
+    ], {
+      protocolProbeRunner: {
+        async probeAccount(input) {
+          calls.push(input);
+          return { status: "success", advice: {}, fixture: {} };
+        },
+      },
+      stdout: (line) => stream.stdout.push(line),
+      stderr: (line) => stream.stderr.push(line),
+    });
+
+    assert.equal(result.exitCode, 2);
+    assert.equal(stream.stdout.length, 0);
+    assert.deepEqual(calls, []);
+    const stderr = stream.stderr.join("\n");
+    assert.match(stderr, item.pattern);
+    assert.equal(stderr.includes("new-user@example.test"), false);
+    assert.equal(stderr.includes("secret-token"), false);
+    assert.equal(stderr.includes("123456"), false);
+    assert.equal(stderr.includes(rawPayload), false);
+  }
 });
 
 test("probe protocol rejects non-boolean listModels force before calling the runner", async () => {
@@ -1905,6 +3895,826 @@ test("fixtures audit --json reads fixture bodies for stream and tool coverage", 
   assert.equal(body.coverage.sessionVerify.count, 1);
   assert.equal(body.coverage.toolCall.count, 1);
   assert.doesNotMatch(text, /beta-user@example.test|token=secret|123456/);
+});
+
+test("fixtures audit --scope auth reports auth evidence coverage", async () => {
+  const stream = io();
+  const calls = [];
+  const fixtures = new Map([
+    ["fixtures/protocol-probes/auth-send.json", {
+      operation: "sendVerificationCode",
+      status: "success",
+      input: { email: "new-user@example.test" },
+      result: { ok: true, raw: { token: "secret-token" } },
+    }],
+    ["fixtures/protocol-probes/auth-submit.json", {
+      operation: "submitRegistrationOrLogin",
+      status: "success",
+      input: { email: "new-user@example.test", code: "123456" },
+      result: { ok: true, userId: "user_without_session" },
+    }],
+    ["fixtures/protocol-probes/send-message.json", {
+      operation: "sendMessage",
+      status: "success",
+      result: { content: "unrelated auth audit fixture" },
+    }],
+  ]);
+
+  const result = await runProtocolPoolCli(["fixtures", "audit", "--scope", "auth", "--json"], {
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        return Array.from(fixtures.entries()).map(([ref, fixture]) => ({
+          ref,
+          operation: fixture.operation,
+          status: fixture.status,
+        }));
+      },
+      async readFixture(ref) {
+        calls.push("readFixture:" + ref);
+        return fixtures.get(ref);
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [
+    "listFixtures",
+    "readFixture:fixtures/protocol-probes/auth-send.json",
+    "readFixture:fixtures/protocol-probes/auth-submit.json",
+  ]);
+  const text = stream.stdout.join("");
+  const body = JSON.parse(text);
+  assert.equal(body.scope, "auth");
+  assert.equal(body.status, "blocked");
+  assert.equal(body.counts.successfulSendVerificationCode, 1);
+  assert.equal(body.counts.successfulSendVerificationCodeWithDeliverySignal, 0);
+  assert.equal(body.coverage.authSendVerificationCode.count, 0);
+  assert.equal(body.counts.successfulSubmitRegistrationOrLogin, 1);
+  assert.equal(body.counts.successfulSubmitRegistrationOrLoginWithSessionMaterial, 0);
+  assert.equal(body.coverage.authSubmitRegistrationOrLogin.count, 0);
+  assert.deepEqual(body.missing, ["successful_sendVerificationCode_fixture", "successful_submitRegistrationOrLogin_fixture"]);
+  assert.doesNotMatch(text, /new-user@example.test|secret-token|123456|user_without_session|unrelated auth audit fixture/);
+});
+
+test("fixtures audit --scope auth prints transport and strict evidence counts in plain output", async () => {
+  const stream = io();
+  const calls = [];
+  const fixtures = new Map([
+    ["fixtures/protocol-probes/auth-send.json", {
+      operation: "sendVerificationCode",
+      status: "success",
+      input: { email: "new-user@example.test" },
+      result: { ok: true, raw: { token: "secret-token" } },
+    }],
+    ["fixtures/protocol-probes/auth-submit.json", {
+      operation: "submitRegistrationOrLogin",
+      status: "success",
+      input: { email: "new-user@example.test", code: "123456" },
+      result: { ok: true, userId: "user_without_session" },
+    }],
+    ["fixtures/protocol-probes/send-message.json", {
+      operation: "sendMessage",
+      status: "success",
+      result: { content: "unrelated auth audit fixture" },
+    }],
+  ]);
+
+  const result = await runProtocolPoolCli(["fixtures", "audit", "--scope", "auth"], {
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        return Array.from(fixtures.entries()).map(([ref, fixture]) => ({
+          ref,
+          operation: fixture.operation,
+          status: fixture.status,
+        }));
+      },
+      async readFixture(ref) {
+        calls.push("readFixture:" + ref);
+        return fixtures.get(ref);
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [
+    "listFixtures",
+    "readFixture:fixtures/protocol-probes/auth-send.json",
+    "readFixture:fixtures/protocol-probes/auth-submit.json",
+  ]);
+  assert.equal(stream.stderr.length, 0);
+  const text = stream.stdout.join("");
+  assert.match(text, /^status\tblocked/m);
+  assert.match(text, /^successful_sendVerificationCode_fixture\tmissing\t0/m);
+  assert.match(text, /^sendVerificationCode_transport_success\t1/m);
+  assert.match(text, /^sendVerificationCode_delivery_success\t0/m);
+  assert.match(text, /^submitRegistrationOrLogin_transport_success\t1/m);
+  assert.match(text, /^submitRegistrationOrLogin_session_material_success\t0/m);
+  assert.match(text, /^missing\tsuccessful_sendVerificationCode_fixture,successful_submitRegistrationOrLogin_fixture/m);
+  assert.doesNotMatch(text, /new-user@example.test|secret-token|123456|user_without_session|unrelated auth audit fixture/);
+});
+
+test("fixtures audit --scope benefits reports side-effect evidence coverage", async () => {
+  const stream = io();
+  const calls = [];
+  const fixtures = new Map([
+    ["fixtures/protocol-probes/daily-sign-in.json", {
+      operation: "dailySignIn",
+      status: "success",
+      input: { email: "benefit-user@example.test", requestNo: "request-123456" },
+      result: { signInResult: "already_signed", raw: { token: "secret-token" } },
+    }],
+    ["fixtures/protocol-probes/reset-activity.json", {
+      operation: "participateResetCouponActivity",
+      status: "success",
+      input: { payload: { request_no: "reset-123456" } },
+      result: { participationResult: "already_participated", activityId: 10001 },
+    }],
+    ["fixtures/protocol-probes/reset-activity-consumed-looking.json", {
+      operation: "participateResetCouponActivity",
+      status: "success",
+      input: { payload: { user_id: "synthetic-user", request_no: "reset-abcdef" } },
+      result: { resetCouponConsumed: true, consumeResult: "success", couponConsumed: true, raw: { token: "secret-token" } },
+    }],
+    ["fixtures/protocol-probes/pro-activity.json", {
+      operation: "participateActivity",
+      status: "failed",
+      input: { body: { prompt: "synthetic private prompt" } },
+      error: { category: "forbidden", message: "benefit-user@example.test token=secret" },
+    }],
+    ["fixtures/protocol-probes/pro-activity-generic-success.json", {
+      operation: "participateActivity",
+      status: "success",
+      input: { body: { userId: "synthetic-user", prompt: "private pro prompt" } },
+      result: { ok: true, status: "success", result: "success", raw: { token: "secret-token" } },
+    }],
+    ["fixtures/protocol-probes/lottery-draw.json", {
+      operation: "drawLottery",
+      status: "failed",
+      input: { body: { activityId: "lottery-123456" } },
+      error: { category: "quota_exhausted", message: "no chance for benefit-user@example.test" },
+    }],
+    ["fixtures/protocol-probes/lottery-draw-generic-success.json", {
+      operation: "drawLottery",
+      status: "success",
+      input: { body: { userId: "synthetic-user", prompt: "private lottery prompt" } },
+      result: { status: "success", result: "success", ok: true, raw: { token: "secret-token" } },
+    }],
+    ["fixtures/protocol-probes/send-message.json", {
+      operation: "sendMessage",
+      status: "success",
+      result: { content: "unrelated benefits audit fixture token=secret" },
+    }],
+  ]);
+
+  const result = await runProtocolPoolCli(["fixtures", "audit", "--scope", "benefits", "--json"], {
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        return Array.from(fixtures.entries()).map(([ref, fixture]) => ({
+          ref,
+          operation: fixture.operation,
+          status: fixture.status,
+        }));
+      },
+      async readFixture(ref) {
+        calls.push("readFixture:" + ref);
+        return fixtures.get(ref);
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [
+    "listFixtures",
+    "readFixture:fixtures/protocol-probes/daily-sign-in.json",
+    "readFixture:fixtures/protocol-probes/reset-activity.json",
+    "readFixture:fixtures/protocol-probes/reset-activity-consumed-looking.json",
+    "readFixture:fixtures/protocol-probes/pro-activity.json",
+    "readFixture:fixtures/protocol-probes/pro-activity-generic-success.json",
+    "readFixture:fixtures/protocol-probes/lottery-draw.json",
+    "readFixture:fixtures/protocol-probes/lottery-draw-generic-success.json",
+  ]);
+  const text = stream.stdout.join("");
+  const body = JSON.parse(text);
+  assert.equal(body.scope, "benefits");
+  assert.equal(body.status, "blocked");
+  assert.equal(body.counts.total, 7);
+  assert.equal(body.counts.success, 5);
+  assert.equal(body.counts.failed, 2);
+  assert.equal(body.counts.participateResetCouponActivity, 2);
+  assert.equal(body.counts.participateActivity, 2);
+  assert.equal(body.counts.drawLottery, 2);
+  assert.equal(body.counts.successfulProActivity, 0);
+  assert.equal(body.counts.successfulResetCouponConsumption, 0);
+  assert.equal(body.counts.successfulLotteryDraw, 0);
+  assert.equal(body.coverage.dailySignIn.count, 1);
+  assert.equal(body.coverage.proActivitySuccess.count, 0);
+  assert.equal(body.coverage.resetCouponConsumption.count, 0);
+  assert.equal(body.coverage.lotteryDrawSuccess.count, 0);
+  assert.deepEqual(body.missing, [
+    "successful_pro_activity_fixture",
+    "successful_reset_coupon_consumption_fixture",
+    "successful_lottery_draw_fixture",
+  ]);
+  assert.doesNotMatch(text, /benefit-user@example.test|secret-token|token=secret|synthetic private prompt|private pro prompt|private lottery prompt|request-123456|synthetic-user|reset-abcdef|unrelated benefits audit fixture/);
+});
+
+test("fixtures audit --scope benefits prints strict side-effect counts in plain output", async () => {
+  const stream = io();
+  const calls = [];
+  const fixtures = new Map([
+    ["fixtures/protocol-probes/daily-sign-in.json", {
+      operation: "dailySignIn",
+      status: "success",
+      input: { email: "benefit-user@example.test", requestNo: "request-123456" },
+      result: { signInResult: "success", signedToday: true, raw: { token: "secret-token" } },
+    }],
+    ["fixtures/protocol-probes/reset-activity-consumed-looking.json", {
+      operation: "participateResetCouponActivity",
+      status: "success",
+      input: { payload: { user_id: "synthetic-user", request_no: "reset-abcdef" } },
+      result: { resetCouponConsumed: true, consumeResult: "success", couponConsumed: true, raw: { token: "secret-token" } },
+    }],
+    ["fixtures/protocol-probes/pro-activity-generic-success.json", {
+      operation: "participateActivity",
+      status: "success",
+      input: { body: { userId: "synthetic-user", prompt: "private pro prompt" } },
+      result: { ok: true, status: "success", result: "success", raw: { token: "secret-token" } },
+    }],
+    ["fixtures/protocol-probes/lottery-draw-generic-success.json", {
+      operation: "drawLottery",
+      status: "success",
+      input: { body: { userId: "synthetic-user", prompt: "private lottery prompt" } },
+      result: { status: "success", result: "success", ok: true, raw: { token: "secret-token" } },
+    }],
+    ["fixtures/protocol-probes/send-message.json", {
+      operation: "sendMessage",
+      status: "success",
+      result: { content: "unrelated benefits audit fixture token=secret" },
+    }],
+  ]);
+
+  const result = await runProtocolPoolCli(["fixtures", "audit", "--scope", "benefits"], {
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        return Array.from(fixtures.entries()).map(([ref, fixture]) => ({
+          ref,
+          operation: fixture.operation,
+          status: fixture.status,
+        }));
+      },
+      async readFixture(ref) {
+        calls.push("readFixture:" + ref);
+        return fixtures.get(ref);
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [
+    "listFixtures",
+    "readFixture:fixtures/protocol-probes/daily-sign-in.json",
+    "readFixture:fixtures/protocol-probes/reset-activity-consumed-looking.json",
+    "readFixture:fixtures/protocol-probes/pro-activity-generic-success.json",
+    "readFixture:fixtures/protocol-probes/lottery-draw-generic-success.json",
+  ]);
+  assert.equal(stream.stderr.length, 0);
+  const text = stream.stdout.join("");
+  assert.match(text, /^status\tblocked/m);
+  assert.match(text, /^dailySignIn\t1/m);
+  assert.match(text, /^participateActivity\t1/m);
+  assert.match(text, /^participateResetCouponActivity\t1/m);
+  assert.match(text, /^drawLottery\t1/m);
+  assert.match(text, /^successful_daily_sign_in\t1/m);
+  assert.match(text, /^successful_pro_activity\t0/m);
+  assert.match(text, /^successful_reset_coupon_consumption\t0/m);
+  assert.match(text, /^successful_lottery_draw\t0/m);
+  assert.match(text, /^missing\tsuccessful_pro_activity_fixture,successful_reset_coupon_consumption_fixture,successful_lottery_draw_fixture/m);
+  assert.doesNotMatch(text, /benefit-user@example.test|secret-token|token=secret|private pro prompt|private lottery prompt|request-123456|synthetic-user|reset-abcdef|unrelated benefits audit fixture/);
+});
+
+test("fixtures audit --scope session reports session lifecycle evidence", async () => {
+  const stream = io();
+  const calls = [];
+  const fixtures = new Map([
+    ["fixtures/protocol-probes/session-success.json", {
+      operation: "verifySession",
+      status: "success",
+      observedAt: "2026-07-02T03:00:00.000Z",
+      result: { ok: true, userId: "user_123", raw: { token: "secret-token" } },
+    }],
+    ["fixtures/protocol-probes/session-expired.json", {
+      operation: "verifySession",
+      status: "failed",
+      observedAt: "2026-07-03T03:00:00.000Z",
+      result: { ok: false, error: { category: "login_required", status: 401, message: "expired beta-user@example.test token=secret" } },
+    }],
+    ["fixtures/protocol-probes/send-success.json", {
+      operation: "sendMessage",
+      status: "success",
+      observedAt: "2026-07-04T03:00:00.000Z",
+      result: { content: "non-session fixture should not be inspected" },
+    }],
+  ]);
+
+  const result = await runProtocolPoolCli(["fixtures", "audit", "--scope", "session", "--json"], {
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        return Array.from(fixtures.entries()).map(([ref, fixture]) => ({
+          ref,
+          operation: fixture.operation,
+          status: fixture.status,
+        }));
+      },
+      async readFixture(ref) {
+        calls.push("readFixture:" + ref);
+        return fixtures.get(ref);
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [
+    "listFixtures",
+    "readFixture:fixtures/protocol-probes/session-success.json",
+    "readFixture:fixtures/protocol-probes/session-expired.json",
+  ]);
+  const text = stream.stdout.join("");
+  const body = JSON.parse(text);
+  assert.equal(body.scope, "session");
+  assert.equal(body.status, "blocked");
+  assert.equal(body.coverage.successfulSessionVerify.count, 1);
+  assert.equal(body.coverage.expiredSessionSignal.count, 1);
+  assert.equal(body.counts.total, 2);
+  assert.equal(body.counts.success, 1);
+  assert.equal(body.counts.failed, 1);
+  assert.equal(body.lifecycle.observedWindowMs, 86_400_000);
+  assert.equal(body.recoveryStrategy.status, "blocked");
+  assert.deepEqual(body.missing, ["automated_session_refresh_strategy"]);
+  assert.doesNotMatch(text, /beta-user@example.test|secret-token|token=secret|user_123/);
+});
+
+test("fixtures audit --scope session reports calibrated recovery strategy evidence", async () => {
+  const stream = io();
+  const calls = [];
+  const fixtures = new Map([
+    ["fixtures/protocol-probes/session-success.json", {
+      operation: "verifySession",
+      status: "success",
+      observedAt: "2026-07-02T03:00:00.000Z",
+      result: { ok: true, userId: "user_123", raw: { token: "secret-token" } },
+    }],
+    ["fixtures/protocol-probes/session-expired.json", {
+      operation: "verifySession",
+      status: "failed",
+      observedAt: "2026-07-03T03:00:00.000Z",
+      result: { ok: false, error: { category: "login_required", status: 401, message: "expired beta-user@example.test token=secret" } },
+    }],
+    ["fixtures/protocol-probes/session-recovery.json", {
+      kind: "session_recovery_strategy",
+      operation: "recoverSession",
+      status: "success",
+      evidence: {
+        strategy: "automated_reauth",
+        automatedRefresh: "calibrated_reauth_probe",
+        safe: true,
+        sanitized: true,
+        rawPayload: false,
+      },
+      result: { raw: { cookie: "tabbit_session=secret" } },
+    }],
+    ["fixtures/protocol-probes/send-success.json", {
+      operation: "sendMessage",
+      status: "success",
+      observedAt: "2026-07-04T03:00:00.000Z",
+      result: { content: "non-session fixture should not be inspected" },
+    }],
+  ]);
+
+  const result = await runProtocolPoolCli(["fixtures", "audit", "--scope", "session", "--json"], {
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        return Array.from(fixtures.entries()).map(([ref, fixture]) => ({
+          ref,
+          operation: fixture.operation,
+          status: fixture.status,
+        }));
+      },
+      async readFixture(ref) {
+        calls.push("readFixture:" + ref);
+        return fixtures.get(ref);
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [
+    "listFixtures",
+    "readFixture:fixtures/protocol-probes/session-success.json",
+    "readFixture:fixtures/protocol-probes/session-expired.json",
+    "readFixture:fixtures/protocol-probes/session-recovery.json",
+  ]);
+  assert.equal(stream.stderr.length, 0);
+  const text = stream.stdout.join("");
+  const body = JSON.parse(text);
+  assert.equal(body.scope, "session");
+  assert.equal(body.status, "ready");
+  assert.equal(body.counts.total, 2);
+  assert.equal(body.counts.recoveryStrategyEvidence, 1);
+  assert.equal(body.recoveryStrategy.status, "ready");
+  assert.equal(body.recoveryStrategy.current, "automated_reauth");
+  assert.equal(body.recoveryStrategy.automatedRefresh, "calibrated_reauth_probe");
+  assert.deepEqual(body.missing, []);
+  assert.doesNotMatch(text, /beta-user@example.test|secret-token|token=secret|user_123|tabbit_session|non-session fixture/);
+});
+
+test("fixtures audit --scope session uses real fixture store session recovery evidence", async () => {
+  const stream = io();
+  const stateDir = await mkdtemp(path.join(tmpdir(), "tabbit-cli-session-recovery-"));
+  const fixtureDir = path.join(stateDir, "fixtures", "protocol-probes");
+  await mkdir(fixtureDir, { recursive: true });
+  await writeFile(path.join(fixtureDir, "session-success.json"), JSON.stringify({
+    kind: "protocol_probe",
+    operation: "verifySession",
+    status: "success",
+    observedAt: "2026-07-02T03:00:00.000Z",
+    result: { ok: true, userId: "user_123", raw: { token: "secret-token" } },
+  }), "utf8");
+  await writeFile(path.join(fixtureDir, "session-expired.json"), JSON.stringify({
+    kind: "protocol_probe",
+    operation: "verifySession",
+    status: "failed",
+    observedAt: "2026-07-03T03:00:00.000Z",
+    result: { ok: false, error: { category: "login_required", status: 401, message: "expired beta-user@example.test token=secret" } },
+  }), "utf8");
+  await writeFile(path.join(fixtureDir, "session-recovery.json"), JSON.stringify({
+    kind: "session_recovery_strategy",
+    operation: "recoverSession",
+    status: "success",
+    observedAt: "2026-07-04T03:00:00.000Z",
+    evidence: {
+      strategy: "automated_reauth",
+      automatedRefresh: "calibrated_reauth_probe",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+    result: { raw: { cookie: "tabbit_session=secret" } },
+  }), "utf8");
+  await writeFile(path.join(fixtureDir, "send-success.json"), JSON.stringify({
+    kind: "protocol_probe",
+    operation: "sendMessage",
+    status: "success",
+    observedAt: "2026-07-04T04:00:00.000Z",
+    result: { content: "non-session fixture should not be inspected" },
+  }), "utf8");
+
+  const result = await runProtocolPoolCli(["fixtures", "audit", "--scope", "session", "--json"], {
+    protocolFixtureStore: new FileProtocolFixtureStore({ stateDir }),
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(stream.stderr.length, 0);
+  const text = stream.stdout.join("");
+  const body = JSON.parse(text);
+  assert.equal(body.scope, "session");
+  assert.equal(body.status, "ready");
+  assert.equal(body.counts.total, 2);
+  assert.equal(body.counts.recoveryStrategyEvidence, 1);
+  assert.equal(body.recoveryStrategy.status, "ready");
+  assert.equal(body.recoveryStrategy.current, "automated_reauth");
+  assert.equal(body.recoveryStrategy.automatedRefresh, "calibrated_reauth_probe");
+  assert.deepEqual(body.missing, []);
+  assert.doesNotMatch(text, /beta-user@example.test|secret-token|token=secret|user_123|tabbit_session|non-session fixture/);
+});
+
+test("fixtures audit --scope session prints refresh strategy gap in plain output", async () => {
+  const stream = io();
+  const calls = [];
+  const fixtures = new Map([
+    ["fixtures/protocol-probes/session-success.json", {
+      operation: "verifySession",
+      status: "success",
+      observedAt: "2026-07-02T03:00:00.000Z",
+      result: { ok: true, userId: "user_123", raw: { token: "secret-token" } },
+    }],
+    ["fixtures/protocol-probes/session-expired.json", {
+      operation: "verifySession",
+      status: "failed",
+      observedAt: "2026-07-03T03:00:00.000Z",
+      result: { ok: false, error: { category: "login_required", status: 401, message: "expired beta-user@example.test token=secret" } },
+    }],
+    ["fixtures/protocol-probes/send-success.json", {
+      operation: "sendMessage",
+      status: "success",
+      observedAt: "2026-07-04T03:00:00.000Z",
+      result: { content: "non-session fixture should not be inspected" },
+    }],
+  ]);
+
+  const result = await runProtocolPoolCli(["fixtures", "audit", "--scope", "session"], {
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        return Array.from(fixtures.entries()).map(([ref, fixture]) => ({
+          ref,
+          operation: fixture.operation,
+          status: fixture.status,
+        }));
+      },
+      async readFixture(ref) {
+        calls.push("readFixture:" + ref);
+        return fixtures.get(ref);
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [
+    "listFixtures",
+    "readFixture:fixtures/protocol-probes/session-success.json",
+    "readFixture:fixtures/protocol-probes/session-expired.json",
+  ]);
+  assert.equal(stream.stderr.length, 0);
+  const text = stream.stdout.join("");
+  assert.match(text, /^status\tblocked/m);
+  assert.match(text, /^successful_verifySession_fixture\tready\t1/m);
+  assert.match(text, /^expired_verifySession_fixture\tready\t1/m);
+  assert.match(text, /^recovery_strategy\tblocked\tmanual_reimport_then_probe\tnot_calibrated/m);
+  assert.match(text, /^missing\tautomated_session_refresh_strategy/m);
+  assert.doesNotMatch(text, /beta-user@example.test|secret-token|token=secret|user_123|non-session fixture/);
+});
+
+test("fixtures audit --scope upstream reports real upstream boundary evidence", async () => {
+  const stream = io();
+  const calls = [];
+  const fixtures = new Map([
+    ["fixtures/protocol-probes/upstream-error.json", {
+      kind: "protocol_probe",
+      operation: "sendMessage",
+      status: "failed",
+      source: "protocol-client",
+      result: {
+        raw: {
+          kind: "stream",
+          format: "sse",
+          upstream: true,
+          events: [{ event: "error", data: { error: { code: "QUOTA_EXHAUSTED", message: "redacted quota frame" } } }],
+        },
+        error: { category: "quota_exhausted", code: "QUOTA_EXHAUSTED", message: "beta-user@example.test token=secret" },
+      },
+    }],
+    ["fixtures/protocol-probes/upstream-cancel.json", {
+      kind: "protocol_probe",
+      operation: "sendMessage",
+      status: "success",
+      upstreamEvidence: { source: "tabbit-live", cancellation: true },
+      result: { raw: { kind: "stream", format: "sse", async: true } },
+    }],
+    ["fixtures/protocol-probes/upstream-backpressure.json", {
+      kind: "protocol_probe",
+      operation: "sendMessage",
+      status: "success",
+      upstreamEvidence: { source: "tabbit-live", backpressure: true, firstTokenFlush: true, delayedSecondChunk: true },
+      result: { raw: { kind: "stream", format: "sse", async: true } },
+    }],
+    ["fixtures/protocol-probes/local-stream.json", {
+      operation: "sendMessage",
+      status: "success",
+      source: "local-http-test",
+      result: { raw: { kind: "stream", format: "sse" }, streamDeltas: ["local-only fixture"] },
+    }],
+    ["fixtures/protocol-probes/session-success.json", {
+      operation: "verifySession",
+      status: "success",
+      result: { ok: true, userId: "user_123" },
+    }],
+  ]);
+
+  const result = await runProtocolPoolCli(["fixtures", "audit", "--scope", "upstream", "--json"], {
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        return Array.from(fixtures.entries()).map(([ref, fixture]) => ({
+          ref,
+          operation: fixture.operation,
+          status: fixture.status,
+        }));
+      },
+      async readFixture(ref) {
+        calls.push("readFixture:" + ref);
+        return fixtures.get(ref);
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [
+    "listFixtures",
+    "readFixture:fixtures/protocol-probes/upstream-error.json",
+    "readFixture:fixtures/protocol-probes/upstream-cancel.json",
+    "readFixture:fixtures/protocol-probes/upstream-backpressure.json",
+    "readFixture:fixtures/protocol-probes/local-stream.json",
+  ]);
+  const text = stream.stdout.join("");
+  const body = JSON.parse(text);
+  assert.equal(body.scope, "upstream");
+  assert.equal(body.status, "ready");
+  assert.equal(body.counts.total, 4);
+  assert.equal(body.counts.realUpstream, 3);
+  assert.equal(body.coverage.upstreamErrorFrame.count, 1);
+  assert.equal(body.coverage.upstreamCancellation.count, 1);
+  assert.equal(body.coverage.upstreamBackpressure.count, 1);
+  assert.deepEqual(body.missing, []);
+  assert.doesNotMatch(text, /beta-user@example.test|token=secret|local-only fixture|user_123/);
+});
+
+test("fixtures audit --scope upstream requires stream metadata for real upstream markers", async () => {
+  const stream = io();
+  const calls = [];
+  const fixtures = new Map([
+    ["fixtures/protocol-probes/non-stream-upstream-marker.json", {
+      kind: "protocol_probe",
+      operation: "sendMessage",
+      status: "success",
+      upstreamEvidence: {
+        source: "tabbit-live",
+        real: true,
+        cancellation: true,
+        backpressure: true,
+      },
+      result: { contentBlocks: [{ type: "text", text: "secret response text" }] },
+    }],
+  ]);
+
+  const result = await runProtocolPoolCli(["fixtures", "audit", "--scope", "upstream", "--json"], {
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        return Array.from(fixtures.entries()).map(([ref, fixture]) => ({
+          ref,
+          operation: fixture.operation,
+          status: fixture.status,
+        }));
+      },
+      async readFixture(ref) {
+        calls.push("readFixture:" + ref);
+        return fixtures.get(ref);
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [
+    "listFixtures",
+    "readFixture:fixtures/protocol-probes/non-stream-upstream-marker.json",
+  ]);
+  assert.equal(stream.stderr.length, 0);
+  const text = stream.stdout.join("");
+  const body = JSON.parse(text);
+  assert.equal(body.scope, "upstream");
+  assert.equal(body.status, "blocked");
+  assert.equal(body.counts.total, 1);
+  assert.equal(body.counts.realUpstream, 0);
+  assert.equal(body.counts.upstreamErrorFrame, 0);
+  assert.equal(body.counts.upstreamCancellation, 0);
+  assert.equal(body.counts.upstreamBackpressure, 0);
+  assert.equal(body.coverage.upstreamErrorFrame.status, "missing");
+  assert.equal(body.coverage.upstreamCancellation.status, "missing");
+  assert.equal(body.coverage.upstreamBackpressure.status, "missing");
+  assert.deepEqual(body.missing, [
+    "real_upstream_error_frame_fixture",
+    "real_upstream_cancellation_fixture",
+    "real_upstream_backpressure_fixture",
+  ]);
+  assert.doesNotMatch(text, /secret response text/);
+});
+
+test("fixtures audit --scope upstream prints boundary counts in plain output", async () => {
+  const stream = io();
+  const calls = [];
+  const fixtures = new Map([
+    ["fixtures/protocol-probes/upstream-error.json", {
+      kind: "protocol_probe",
+      operation: "sendMessage",
+      status: "failed",
+      source: "protocol-client",
+      result: {
+        raw: {
+          kind: "stream",
+          format: "sse",
+          upstream: true,
+          events: [{ type: "error", data: { error: { code: "QUOTA_EXHAUSTED", message: "redacted quota frame" } } }],
+        },
+      },
+    }],
+    ["fixtures/protocol-probes/local-stream.json", {
+      operation: "sendMessage",
+      status: "success",
+      source: "local-http-test",
+      result: { raw: { kind: "stream", format: "sse" }, streamDeltas: ["local-only fixture"] },
+    }],
+    ["fixtures/protocol-probes/session-success.json", {
+      operation: "verifySession",
+      status: "success",
+      result: { ok: true, userId: "user_123" },
+    }],
+  ]);
+
+  const result = await runProtocolPoolCli(["fixtures", "audit", "--scope", "upstream"], {
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        return Array.from(fixtures.entries()).map(([ref, fixture]) => ({
+          ref,
+          operation: fixture.operation,
+          status: fixture.status,
+        }));
+      },
+      async readFixture(ref) {
+        calls.push("readFixture:" + ref);
+        return fixtures.get(ref);
+      },
+    },
+    now: () => Date.parse("2026-07-02T03:00:00.000Z"),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [
+    "listFixtures",
+    "readFixture:fixtures/protocol-probes/upstream-error.json",
+    "readFixture:fixtures/protocol-probes/local-stream.json",
+  ]);
+  assert.equal(stream.stderr.length, 0);
+  const text = stream.stdout.join("");
+  assert.match(text, /^status\tblocked/m);
+  assert.match(text, /^real_upstream_error_frame_fixture\tready\t1/m);
+  assert.match(text, /^real_upstream_cancellation_fixture\tmissing\t0/m);
+  assert.match(text, /^real_upstream_backpressure_fixture\tmissing\t0/m);
+  assert.match(text, /^real_upstream\t1/m);
+  assert.match(text, /^upstream_error_frame\t1/m);
+  assert.match(text, /^upstream_cancellation\t0/m);
+  assert.match(text, /^upstream_backpressure\t0/m);
+  assert.match(text, /^missing\treal_upstream_cancellation_fixture,real_upstream_backpressure_fixture/m);
+  assert.doesNotMatch(text, /local-only fixture|user_123|QUOTA_EXHAUSTED/);
+});
+
+test("fixtures audit rejects unsupported scopes before reading fixtures", async () => {
+  const stream = io();
+  const calls = [];
+  const result = await runProtocolPoolCli(["fixtures", "audit", "--scope", "secrets", "--json"], {
+    protocolFixtureStore: {
+      async listFixtures() {
+        calls.push("listFixtures");
+        return [];
+      },
+    },
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 2);
+  assert.deepEqual(calls, []);
+  assert.equal(stream.stdout.length, 0);
+  assert.match(stream.stderr.join("\n"), /scope/i);
+  assert.doesNotMatch(stream.stderr.join("\n"), /token|cookie|session|secret-value/);
 });
 
 test("fixtures list --json prints fixture summaries from the fixture store", async () => {

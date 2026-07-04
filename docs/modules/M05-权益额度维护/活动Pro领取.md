@@ -31,6 +31,10 @@ POST /api/commerce/activity/v1/participate
 
 该调用点使用已登录 Cookie、`trace-id` 和 `Content-Type: application/json`，body 由调用方透传，未观察到 `x-signature` / `x-nonce`。`ProtocolTabbitClient.participateActivity({ body, confirmSideEffect:true })` 仅作为显式 probe 暴露；当前还没有安全 evidence 能把某个 body 与“活动 Pro 成功领取”严格绑定，也没有已领取/过期/不符合条件的稳定错误码。因此默认 `claimProIfAvailable()` 不会调用该 POST。
 
+`tabbit-pool fixtures audit --scope benefits --json` 会只读统计 `participateActivity` 成功 evidence。只有 fixture 同时满足 `operation:"participateActivity"`、`status:"success"` 且包含明确 participation/activity/claim/pro success 信号时，`successful_pro_activity_fixture` 才会 ready；单纯 2xx、`ok:true`、泛 `status/result:"success"` 或失败 fixture 不会让默认维护链开启 Pro 领取。
+
+`tabbit-pool readiness doctor --json` 的 `calibrationBacklog.captureCommands` 会为 `successful_pro_activity_fixture` 输出 `prerequisites` / `prerequisitesStatus`；plain `capture_command` 行会显示 `prereq=TABBIT_POOL_PROTOCOL_ACTIVITY_PARTICIPATE_PATH:configured|missing`。该字段只说明显式 activity participate path 是否已配置，不输出真实 path，也不代表 Pro 领取 body、安全副作用边界或成功响应语义已经闭环。真实 capture 仍必须先用 `probe template` 生成脱敏 input、人工确认 `confirmSideEffect:true`，再用 `probe validate --require-confirmed-side-effect` 离线预检，最后只保留 sanitized fixture 供 `fixtures audit --scope benefits` 判定。
+
 ## 流程
 
 1. 查询当前 accessTier。
@@ -45,5 +49,6 @@ POST /api/commerce/activity/v1/participate
 - [x] 领取成功后更新 `accessTier` 与 `proClaimed`。
 - [x] 真实活动/新人探索只读状态接口已校准为 probe operation。
 - [x] 通用 activity participate POST path/header 已校准为显式 probe。
+- [x] 活动 Pro 成功 evidence 可通过 `fixtures audit --scope benefits` 只读审计。
 - [ ] 活动过期返回 skipped 待真实协议错误码接入后补齐。
 - [ ] 活动 Pro 领取的具体 body、成功响应和失败分类仍待安全 evidence 后接入。

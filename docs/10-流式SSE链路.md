@@ -127,7 +127,7 @@ chunked SSE 由 `writeSseStream()` 管理：
 4. 客户端断开时 signal abort，wrapper 请求 iterator `return()`。
 5. 如果上游 body 是 Web `ReadableStream`，协议客户端的 reader 会收到 `cancel("stream_deltas_cancelled")` 并释放锁。
 
-这条链路保证本地路由不会在客户端已经离开后继续等待一个永不结束的上游流。真实 Tabbit fetch 的 backpressure、TCP 断开传播和完整错误帧集合仍要靠后续 fixture 校准。
+这条链路保证本地路由不会在客户端已经离开后继续等待一个永不结束的上游流。真实 Tabbit fetch 的 backpressure、TCP 断开传播和完整错误帧集合仍要靠后续 fixture 校准；当前可通过 `fixtures audit --scope upstream` 只读查看真实上游 error-frame、cancellation 和 backpressure evidence 缺口。
 
 ## 实现地图
 

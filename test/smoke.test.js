@@ -23,6 +23,7 @@ import {
   buildHealthSnapshot,
   buildProtocolProbeFixture,
   buildProtocolFixtureAudit,
+  buildReadinessDoctorReport,
   classifyForbiddenSignal,
   sanitizeProtocolProbeFixture,
   chatCompletionToSseEvents,
@@ -70,6 +71,7 @@ test("package entry exposes foundation APIs", () => {
   assert.equal(typeof createGatewayHealthProvider, "function");
   assert.equal(typeof buildProtocolProbeFixture, "function");
   assert.equal(typeof buildProtocolFixtureAudit, "function");
+  assert.equal(typeof buildReadinessDoctorReport, "function");
   assert.equal(typeof ProtocolProbeRunner, "function");
   assert.equal(typeof FileProtocolFixtureStore, "function");
   assert.equal(typeof ProtocolFixtureStoreError, "function");

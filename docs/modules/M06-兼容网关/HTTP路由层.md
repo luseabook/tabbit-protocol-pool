@@ -240,7 +240,7 @@ data: {"type":"error","error":{"type":"api_error","message":"Current account quo
 
 错误 shape 统一来自 `streamErrorShape(error)`：`message` 使用 `error.message || "Stream failed."`，`type` 固定为 `api_error`，`code` 使用 `error.code || error.category || "stream_error"`。因此 `ProtocolTabbitClient` 抛出的 `ProtocolTabbitError` 会保留 `QUOTA_EXHAUSTED` 等分类信息，HTTP 层只负责协议兼容 framing，不重新分类账号状态。
 
-客户端断开时，`ServerResponse` 的 `close` 事件会 abort close signal。writer 会停止继续写 SSE、不再输出 error frame，并请求当前 events iterator `return()`；streaming adapter 通过 `abortableAsyncIterable()` 对 `stream.deltas.next()` 与 close signal 做 race，close signal 先到时会请求 `stream.deltas` iterator `return()`。这能让可取消 async source 及时停止。真实 Tabbit fetch/body 是否能被立即中断仍取决于协议客户端和真实 runtime 行为，不在 HTTP route adapter 内猜测。
+客户端断开时，`ServerResponse` 的 `close` 事件会 abort close signal。writer 会停止继续写 SSE、不再输出 error frame，并请求当前 events iterator `return()`；streaming adapter 通过 `abortableAsyncIterable()` 对 `stream.deltas.next()` 与 close signal 做 race，close signal 先到时会请求 `stream.deltas` iterator `return()`。这能让可取消 async source 及时停止。真实 Tabbit fetch/body 是否能被立即中断仍取决于协议客户端和真实 runtime 行为，不在 HTTP route adapter 内猜测；真实 evidence 缺口由 `fixtures audit --scope upstream` 跟踪。
 
 ## 未知路由与方法
 

@@ -32,6 +32,28 @@ export function createSecretHydratingProtocolClientFactory(baseFactory, secretSt
       const session = input.session || hydratedAccount.cookieHeader || hydratedAccount.cookie || null;
       return await client.verifySession({ ...input, account: hydratedAccount, session });
     },
+    async sendVerificationCode(input = {}) {
+      const hydratedAccount = await hydrateAccountSecrets(input.account || account, secretStore);
+      const client = baseFactory(hydratedAccount);
+      if (!client || typeof client.sendVerificationCode !== "function") {
+        return {
+          ok: false,
+          error: new ProtocolTabbitError("protocol operation is not configured", { category: "protocol_missing", code: "SEND_VERIFICATION_CODE_MISSING" }),
+        };
+      }
+      return await client.sendVerificationCode({ ...input, account: hydratedAccount });
+    },
+    async submitRegistrationOrLogin(input = {}) {
+      const hydratedAccount = await hydrateAccountSecrets(input.account || account, secretStore);
+      const client = baseFactory(hydratedAccount);
+      if (!client || typeof client.submitRegistrationOrLogin !== "function") {
+        return {
+          ok: false,
+          error: new ProtocolTabbitError("protocol operation is not configured", { category: "protocol_missing", code: "SUBMIT_REGISTRATION_OR_LOGIN_MISSING" }),
+        };
+      }
+      return await client.submitRegistrationOrLogin({ ...input, account: hydratedAccount });
+    },
     async uploadAttachment(input = {}) {
       const hydratedAccount = await hydrateAccountSecrets(input.account || account, secretStore);
       const client = baseFactory(hydratedAccount);
@@ -115,6 +137,14 @@ export function createSecretHydratingProtocolClientFactory(baseFactory, secretSt
       }
       return await client.listBenefitCoupons({ ...input, account: hydratedAccount });
     },
+    async useResetCoupon(input = {}) {
+      const hydratedAccount = await hydrateAccountSecrets(input.account || account, secretStore);
+      const client = baseFactory(hydratedAccount);
+      if (!client || typeof client.useResetCoupon !== "function") {
+        throw new ProtocolTabbitError("protocol operation is not configured", { category: "protocol_missing", code: "USE_RESET_COUPON_MISSING" });
+      }
+      return await client.useResetCoupon({ ...input, account: hydratedAccount });
+    },
     async participateResetCouponActivity(input = {}) {
       const hydratedAccount = await hydrateAccountSecrets(input.account || account, secretStore);
       const client = baseFactory(hydratedAccount);
@@ -185,7 +215,7 @@ export function createDefaultProtocolClientFactory({ protocolClientOptions = {},
 function configuredProtocolClientOptions(config = {}) {
   if (!config.protocol?.enabled) return {};
   const options = {};
-  for (const key of ["baseUrl", "signKeyPath", "modelCatalogPath", "modelCatalogScene", "sendPath", "attachmentUploadPath", "attachmentCompleteUploadPath", "quotaUsagePath", "activityLotteryPath", "newbieExplorationPath", "placementResourcesPath", "rewardCardRecordsPath", "lotteryHitRecordsPath", "signInStatusPath", "signInPath", "benefitCouponListPath", "activityParticipatePath", "usageResetCouponSkuPath", "lotteryAvailableChancesPath", "lotteryActiveMainPoolsPath", "lotteryChanceRecordsPath", "lotteryDrawPath", "sessionVerifyPath", "sessionVerifyMethod", "reqCtx", "defaultChatSessionId"]) {
+  for (const key of ["baseUrl", "signKeyPath", "modelCatalogPath", "modelCatalogScene", "sendPath", "authSendCodePath", "authSendCodeMethod", "authSubmitCodePath", "authSubmitCodeMethod", "attachmentUploadPath", "attachmentCompleteUploadPath", "quotaUsagePath", "activityLotteryPath", "newbieExplorationPath", "placementResourcesPath", "rewardCardRecordsPath", "lotteryHitRecordsPath", "signInStatusPath", "signInPath", "benefitCouponListPath", "benefitCouponUsePath", "activityParticipatePath", "usageResetCouponSkuPath", "lotteryAvailableChancesPath", "lotteryActiveMainPoolsPath", "lotteryChanceRecordsPath", "lotteryDrawPath", "sessionVerifyPath", "sessionVerifyMethod", "reqCtx", "defaultChatSessionId"]) {
     if (config.protocol[key]) options[key] = config.protocol[key];
   }
   return options;
@@ -255,10 +285,15 @@ export async function createProtocolPoolGateway(options = {}) {
     protocolClientFactory,
     retryLimit: config.retryLimit,
   });
+  const localToolLoopConfig = {
+    ...(config.compat?.localToolLoop || {}),
+    ...(options.localToolLoop || {}),
+  };
   const runner = options.toolLoopRunner || new LocalToolLoopRunner({
     runner: baseRunner,
     mode: config.compat?.toolLoopMode,
     executeToolUse: localToolExecutorFromOptions(options),
+    ...localToolLoopConfig,
   });
   const openAiCompat = options.openAiCompat || new OpenAICompat({
     runner,

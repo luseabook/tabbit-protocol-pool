@@ -11,9 +11,11 @@ import { FileProtocolFixtureStore, ProtocolProbeRunner, sanitizeProtocolProbeFix
 import { ProtocolTabbitClient } from "./protocol-tabbit-client.js";
 import { createProtocolPoolGateway } from "./protocol-pool-gateway.js";
 import {
+  BENEFITS_AUDIT_OPERATIONS,
   buildCalibrationReadinessSnapshot,
   buildHealthSnapshot,
   buildProtocolFixtureAudit,
+  buildReadinessDoctorReport,
   formatMaintenanceActionLog,
   protocolProbeAdvice,
   redactAccountForDisplay,
@@ -26,16 +28,18 @@ const HELP = `Usage:
   tabbit-pool accounts probe <id> [--json]
   tabbit-pool health [--json]
   tabbit-pool readiness [--json]
+  tabbit-pool readiness doctor [--json]
   tabbit-pool readiness mark [--codex-verified] [--claude-verified] [--json]
   tabbit-pool serve [--host <host>] [--port <port>] [--json]
   tabbit-pool start [--host <host>] [--port <port>] [--json]
   tabbit-pool smoke gateway [--base-url <url>] [--api-key <key>] [--model <model>] [--json]
   tabbit-pool maintain [--json]
   tabbit-pool fixtures list [--json]
-  tabbit-pool fixtures audit [--json]
+  tabbit-pool fixtures audit [--scope <protocol|auth|benefits|session|upstream>] [--json]
   tabbit-pool fixtures show <ref> [--json]
   tabbit-pool probe advice [--category <category>] [--status <status>] [--code <code>] [--message <text>] [--json]
   tabbit-pool probe template [--operation <name>] [--json]
+  tabbit-pool probe validate [--operation <name>] [--input-json <json> | --input-file <path>] [--require-confirmed-side-effect] [--write-fixture] [--json]
   tabbit-pool probe protocol --account <id> [--operation <name>] [--input-json <json> | --input-file <path>] [--write-fixture] [--json]
 `;
 
@@ -288,9 +292,36 @@ function parseProbeInputJson(text, source) {
 
 const PROBE_INPUT_TEMPLATES = {
   verifySession: {},
+  sendVerificationCode: {
+    confirmSideEffect: false,
+    mobile: "10000000000",
+    uuid: "0000000000000000000000000000000000000000000000000000000000000000",
+    body: {
+      uuid: "0000000000000000000000000000000000000000000000000000000000000000",
+      platform: "1",
+      version: "",
+      app: "1000",
+      mobile: "10000000000",
+    },
+  },
+  submitRegistrationOrLogin: {
+    confirmSideEffect: false,
+    mobile: "10000000000",
+    code: "000000",
+    uuid: "0000000000000000000000000000000000000000000000000000000000000000",
+    body: {
+      uuid: "0000000000000000000000000000000000000000000000000000000000000000",
+      platform: "1",
+      version: "",
+      app: "1000",
+      mobile: "10000000000",
+      smsCode: "000000",
+    },
+  },
   sendMessage: {
     model: "tabbit/priority",
     messages: [{ role: "user", content: "ping" }],
+    stream: true,
   },
   listModels: { force: true },
   refreshQuota: {},
@@ -332,6 +363,12 @@ const PROBE_INPUT_TEMPLATES = {
     confirmSideEffect: false,
     body: {},
   },
+  useResetCoupon: {
+    confirmSideEffect: false,
+    couponCode: "coupon-code",
+    couponType: "weekly_reset_coupon",
+    requestNo: "reset-coupon-use-probe",
+  },
   getUsageResetCouponSku: {},
   getAvailableLotteryChanceCount: {
     activityId: "activity-id",
@@ -348,6 +385,35 @@ const PROBE_INPUT_TEMPLATES = {
     confirmSideEffect: false,
     body: {},
   },
+  consumeResetCoupon: {
+    kind: "reset_coupon_consumption_evidence",
+    operation: "consumeResetCoupon",
+    status: "success",
+    evidence: {
+      endpointHash: "sha256:<redacted-endpoint>",
+      bodyHash: "sha256:<redacted-body>",
+      resultHash: "sha256:<redacted-result>",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+    result: {
+      resetCouponConsumed: true,
+      consumeResult: "success",
+    },
+  },
+  recoverSession: {
+    kind: "session_recovery_strategy",
+    operation: "recoverSession",
+    status: "success",
+    evidence: {
+      strategy: "automated_reauth",
+      automatedRefresh: "calibrated_reauth_probe",
+      safe: true,
+      sanitized: true,
+      rawPayload: false,
+    },
+  },
   uploadAttachment: {
     attachment: {
       filename: "probe.txt",
@@ -358,6 +424,44 @@ const PROBE_INPUT_TEMPLATES = {
 };
 
 const PROBE_TEMPLATE_OPERATIONS = Object.keys(PROBE_INPUT_TEMPLATES);
+const SIDE_EFFECT_PROBE_OPERATIONS = new Set([
+  "sendVerificationCode",
+  "submitRegistrationOrLogin",
+  "dailySignIn",
+  "participateResetCouponActivity",
+  "participateActivity",
+  "useResetCoupon",
+  "drawLottery",
+]);
+const OFFLINE_EVIDENCE_PROBE_OPERATIONS = new Set(["recoverSession", "consumeResetCoupon"]);
+const SESSION_RECOVERY_STRATEGIES = new Set(["automated_reauth", "refresh_token"]);
+const SESSION_RECOVERY_REFRESH_MODES = new Set([
+  "calibrated_reauth_probe",
+  "calibrated_refresh_probe",
+]);
+const RESET_COUPON_CONSUMPTION_OPERATIONS = new Set([
+  "useResetCoupon",
+  "consumeResetCoupon",
+  "consumeResetCouponSku",
+  "redeemResetCoupon",
+]);
+const RESET_COUPON_SUCCESS_VALUES = new Set([
+  "success",
+  "succeeded",
+  "ok",
+  "done",
+  "consumed",
+  "used",
+  "redeemed",
+]);
+const RESET_COUPON_NON_CONSUMPTION_VALUES = new Set([
+  "already_participated",
+  "already participated",
+  "already_signed",
+  "already signed",
+  "already_claimed",
+  "already claimed",
+]);
 
 function cloneJsonObject(value) {
   return JSON.parse(JSON.stringify(value));
@@ -424,9 +528,178 @@ function validateOptionalRequestNo(input, operation) {
   }
 }
 
+function validateRequiredString(input, key, operation) {
+  if (!hasOwn(input, key) || !nonEmptyString(input[key])) {
+    throw new CliUsageError("Probe input for " + operation + "." + key + " must be a non-empty string.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+}
+
+function validateOptionalBodyObject(input, operation) {
+  if (hasOwn(input, "body") && !plainObject(input.body)) {
+    throw new CliUsageError("Probe input for " + operation + ".body must be an object.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+}
+
+function canonicalString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function sessionRecoveryRawPayload(evidence) {
+  if (hasOwn(evidence, "rawPayload")) return evidence.rawPayload;
+  if (hasOwn(evidence, "raw_payload")) return evidence.raw_payload;
+  return undefined;
+}
+
+function resetCouponRawPayload(evidence) {
+  if (hasOwn(evidence, "rawPayload")) return evidence.rawPayload;
+  if (hasOwn(evidence, "raw_payload")) return evidence.raw_payload;
+  return undefined;
+}
+
+function safeSha256Evidence(value) {
+  return typeof value === "string" && /^sha256:[^:\s].*/.test(value.trim());
+}
+
+function valueForAnyKey(input, keys) {
+  if (!plainObject(input)) return undefined;
+  for (const key of keys) {
+    if (hasOwn(input, key)) return input[key];
+  }
+  return undefined;
+}
+
+function stringValueIn(value, allowedValues) {
+  return typeof value === "string" && allowedValues.has(value.trim().toLowerCase());
+}
+
+function resetCouponHasNonConsumptionSignal(result = {}) {
+  const keys = [
+    "participationResult",
+    "participation_result",
+    "consumeResult",
+    "consume_result",
+    "couponResult",
+    "coupon_result",
+    "usageResult",
+    "usage_result",
+    "result",
+    "status",
+  ];
+  return keys.some((key) => stringValueIn(result[key], RESET_COUPON_NON_CONSUMPTION_VALUES));
+}
+
+function resetCouponHasConsumptionSignal(result = {}) {
+  const booleanKeys = [
+    "resetCouponConsumed",
+    "reset_coupon_consumed",
+    "couponConsumed",
+    "coupon_consumed",
+    "consumed",
+    "used",
+    "deducted",
+  ];
+  if (booleanKeys.some((key) => result[key] === true)) return true;
+  const value = valueForAnyKey(result, [
+    "consumeResult",
+    "consume_result",
+    "couponResult",
+    "coupon_result",
+    "usageResult",
+    "usage_result",
+  ]);
+  return stringValueIn(value, RESET_COUPON_SUCCESS_VALUES);
+}
+
+function validateRecoverSessionEvidenceInput(input) {
+  if (input.kind !== "session_recovery_strategy") {
+    throw new CliUsageError("Probe input for recoverSession.kind must be session_recovery_strategy.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+  if (input.operation !== "recoverSession") {
+    throw new CliUsageError("Probe input for recoverSession.operation must be recoverSession.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+  if (input.status !== "success") {
+    throw new CliUsageError("Probe input for recoverSession.status must be success.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+  if (!plainObject(input.evidence)) {
+    throw new CliUsageError("Probe input for recoverSession.evidence must be an object.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+
+  const strategy = canonicalString(input.evidence.strategy || input.evidence.current);
+  const automatedRefresh = canonicalString(input.evidence.automatedRefresh || input.evidence.automated_refresh || input.evidence.mode);
+  if (!SESSION_RECOVERY_STRATEGIES.has(strategy)) {
+    throw new CliUsageError("Probe input for recoverSession.evidence.strategy must be automated_reauth or refresh_token.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+  if (!SESSION_RECOVERY_REFRESH_MODES.has(automatedRefresh)) {
+    throw new CliUsageError("Probe input for recoverSession.evidence.automatedRefresh must be calibrated_reauth_probe or calibrated_refresh_probe.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+  if (input.evidence.safe !== true || input.evidence.sanitized !== true || sessionRecoveryRawPayload(input.evidence) !== false) {
+    throw new CliUsageError("Probe input for recoverSession.evidence requires safe:true, sanitized:true, and rawPayload:false.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+}
+
+function validateResetCouponConsumptionEvidenceInput(input) {
+  if (input.kind !== "reset_coupon_consumption_evidence") {
+    throw new CliUsageError("Probe input for consumeResetCoupon.kind must be reset_coupon_consumption_evidence.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+  if (!RESET_COUPON_CONSUMPTION_OPERATIONS.has(input.operation)) {
+    throw new CliUsageError("Probe input for consumeResetCoupon.operation must be a reset coupon consumption operation.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+  if (input.status !== "success") {
+    throw new CliUsageError("Probe input for consumeResetCoupon.status must be success.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+  if (!plainObject(input.evidence)) {
+    throw new CliUsageError("Probe input for consumeResetCoupon.evidence must be an object.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+  if (
+    !safeSha256Evidence(input.evidence.endpointHash)
+    || !safeSha256Evidence(input.evidence.bodyHash)
+    || !safeSha256Evidence(input.evidence.resultHash)
+  ) {
+    throw new CliUsageError("Probe input for consumeResetCoupon.evidence requires endpointHash, bodyHash, and resultHash sha256 values.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+  if (input.evidence.safe !== true || input.evidence.sanitized !== true || resetCouponRawPayload(input.evidence) !== false) {
+    throw new CliUsageError("Probe input for consumeResetCoupon.evidence requires safe:true, sanitized:true, and rawPayload:false.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+  if (!plainObject(input.result)) {
+    throw new CliUsageError("Probe input for consumeResetCoupon.result must be an object.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+  if (resetCouponHasNonConsumptionSignal(input.result)) {
+    throw new CliUsageError("Probe input for consumeResetCoupon.result contains a non-consumption signal.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+  if (!resetCouponHasConsumptionSignal(input.result)) {
+    throw new CliUsageError("Probe input for consumeResetCoupon.result must prove reset coupon consumption.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+}
+
 function validateProbeInputForOperation(input, operation) {
-  if (input === undefined) return;
   const cleanOperation = String(operation || "verifySession").trim() || "verifySession";
+  if (input === undefined) {
+    if (cleanOperation === "recoverSession") {
+      throw new CliUsageError("Probe input for recoverSession requires explicit sanitized evidence input.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+    }
+    if (cleanOperation === "consumeResetCoupon") {
+      throw new CliUsageError("Probe input for consumeResetCoupon requires explicit sanitized reset coupon consumption evidence input.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+    }
+    return;
+  }
+  if (cleanOperation === "sendVerificationCode" || cleanOperation === "submitRegistrationOrLogin") {
+    validateOptionalBoolean(input, "confirmSideEffect", cleanOperation);
+    if (!nonEmptyString(input.email) && !nonEmptyString(input.mobile)) {
+      throw new CliUsageError("Probe input for " + cleanOperation + " requires a non-empty email or mobile.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+    }
+    if (hasOwn(input, "email") && !nonEmptyString(input.email)) validateRequiredString(input, "email", cleanOperation);
+    if (hasOwn(input, "mobile") && !nonEmptyString(input.mobile)) validateRequiredString(input, "mobile", cleanOperation);
+    if (hasOwn(input, "uuid")) {
+      validateRequiredString(input, "uuid", cleanOperation);
+      if (!/^[A-Za-z0-9]{64}$/.test(input.uuid.trim())) {
+        throw new CliUsageError("Probe input for " + cleanOperation + ".uuid must be a 64-character alphanumeric auth client value.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+      }
+    }
+    validateOptionalBodyObject(input, cleanOperation);
+    if (cleanOperation === "submitRegistrationOrLogin") {
+      validateRequiredString(input, "code", cleanOperation);
+    }
+  }
   if (cleanOperation === "sendMessage") {
     if (hasOwn(input, "model") && !nonEmptyString(input.model)) {
       throw new CliUsageError("Probe input for sendMessage.model must be a non-empty string.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
@@ -434,6 +707,7 @@ function validateProbeInputForOperation(input, operation) {
     if (hasOwn(input, "messages") && (!Array.isArray(input.messages) || input.messages.length === 0)) {
       throw new CliUsageError("Probe input for sendMessage.messages must be a non-empty array.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
     }
+    validateOptionalBoolean(input, "stream", cleanOperation);
   }
   if (cleanOperation === "listModels" && hasOwn(input, "force") && typeof input.force !== "boolean") {
     throw new CliUsageError("Probe input for listModels.force must be a boolean.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
@@ -479,9 +753,20 @@ function validateProbeInputForOperation(input, operation) {
   }
   if (cleanOperation === "participateActivity" || cleanOperation === "drawLottery") {
     validateOptionalBoolean(input, "confirmSideEffect", cleanOperation);
-    if (hasOwn(input, "body") && !plainObject(input.body)) {
-      throw new CliUsageError("Probe input for " + cleanOperation + ".body must be an object.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
-    }
+    validateOptionalBodyObject(input, cleanOperation);
+  }
+  if (cleanOperation === "useResetCoupon") {
+    validateOptionalBoolean(input, "confirmSideEffect", cleanOperation);
+    validateOptionalString(input, "userId", cleanOperation);
+    validateOptionalString(input, "couponCode", cleanOperation);
+    validateOptionalString(input, "couponType", cleanOperation);
+    validateOptionalRequestNo(input, cleanOperation);
+  }
+  if (cleanOperation === "recoverSession") {
+    validateRecoverSessionEvidenceInput(input);
+  }
+  if (cleanOperation === "consumeResetCoupon") {
+    validateResetCouponConsumptionEvidenceInput(input);
   }
   if (cleanOperation === "getAvailableLotteryChanceCount") {
     validateOptionalString(input, "userId", cleanOperation);
@@ -508,6 +793,180 @@ function validateProbeInputForOperation(input, operation) {
       }
     }
   }
+}
+
+function assertConfirmedSideEffectInput(input, operation) {
+  const cleanOperation = String(operation || "verifySession").trim() || "verifySession";
+  if (!SIDE_EFFECT_PROBE_OPERATIONS.has(cleanOperation)) return;
+  if (!input || input.confirmSideEffect !== true) {
+    throw new CliUsageError(
+      "Probe input for " + cleanOperation + " requires confirmSideEffect:true before side-effect capture.",
+      { code: "SIDE_EFFECT_CONFIRMATION_REQUIRED" },
+    );
+  }
+}
+
+function assertProtocolProbeOperationDispatchable(operation) {
+  const cleanOperation = String(operation || "verifySession").trim() || "verifySession";
+  if (!OFFLINE_EVIDENCE_PROBE_OPERATIONS.has(cleanOperation)) return;
+  throw new CliUsageError(
+    "Probe protocol operation " + cleanOperation + " is offline evidence only; use probe template and probe validate, then store a sanitized fixture.",
+    { code: "OFFLINE_EVIDENCE_OPERATION" },
+  );
+}
+
+function probeInputFieldState(input, key) {
+  if (!plainObject(input) || !hasOwn(input, key)) return "missing";
+  const value = input[key];
+  if (plainObject(value)) return "object";
+  if (Array.isArray(value)) return "array";
+  if (value === null) return "null";
+  if (typeof value === "string" && value.trim()) return "present";
+  return typeof value;
+}
+
+function sortedObjectKeys(value) {
+  return plainObject(value) ? Object.keys(value).sort() : [];
+}
+
+function buildProbeInputValidationPreview({ operation = "verifySession", input } = {}) {
+  const cleanOperation = String(operation || "verifySession").trim() || "verifySession";
+  const inputObject = plainObject(input) ? input : {};
+  const evidenceObject = plainObject(inputObject.evidence) ? inputObject.evidence : {};
+  const preview = {
+    status: "valid",
+    operation: cleanOperation,
+    source: input === undefined ? "default" : "input",
+    sideEffect: SIDE_EFFECT_PROBE_OPERATIONS.has(cleanOperation),
+    fields: {
+      confirmSideEffect: probeInputFieldState(inputObject, "confirmSideEffect"),
+      email: probeInputFieldState(inputObject, "email"),
+      mobile: probeInputFieldState(inputObject, "mobile"),
+      code: probeInputFieldState(inputObject, "code"),
+      uuid: probeInputFieldState(inputObject, "uuid"),
+      body: probeInputFieldState(inputObject, "body"),
+      messages: probeInputFieldState(inputObject, "messages"),
+      stream: hasOwn(inputObject, "stream") ? inputObject.stream === true : "missing",
+      attachment: probeInputFieldState(inputObject, "attachment"),
+      requestNo: probeInputFieldState(inputObject, "requestNo"),
+      placementCode: probeInputFieldState(inputObject, "placementCode"),
+      activityId: probeInputFieldState(inputObject, "activityId"),
+      userId: probeInputFieldState(inputObject, "userId"),
+      couponCode: probeInputFieldState(inputObject, "couponCode"),
+      couponType: probeInputFieldState(inputObject, "couponType"),
+      kind: probeInputFieldState(inputObject, "kind"),
+      status: probeInputFieldState(inputObject, "status"),
+      evidence: probeInputFieldState(inputObject, "evidence"),
+      result: probeInputFieldState(inputObject, "result"),
+    },
+    bodyKeys: sortedObjectKeys(inputObject.body),
+    attachmentKeys: sortedObjectKeys(inputObject.attachment),
+    evidenceKeys: sortedObjectKeys(evidenceObject),
+  };
+  if (hasOwn(inputObject, "confirmSideEffect")) {
+    preview.confirmSideEffect = inputObject.confirmSideEffect === true;
+  }
+  if (cleanOperation === "recoverSession") {
+    preview.sessionRecovery = {
+      strategy: canonicalString(evidenceObject.strategy || evidenceObject.current),
+      automatedRefresh: canonicalString(evidenceObject.automatedRefresh || evidenceObject.automated_refresh || evidenceObject.mode),
+      safe: evidenceObject.safe === true,
+      sanitized: evidenceObject.sanitized === true,
+      rawPayload: sessionRecoveryRawPayload(evidenceObject),
+    };
+  }
+  if (cleanOperation === "consumeResetCoupon") {
+    preview.resetCouponConsumption = {
+      endpointHash: safeSha256Evidence(evidenceObject.endpointHash),
+      bodyHash: safeSha256Evidence(evidenceObject.bodyHash),
+      resultHash: safeSha256Evidence(evidenceObject.resultHash),
+      safe: evidenceObject.safe === true,
+      sanitized: evidenceObject.sanitized === true,
+      rawPayload: resetCouponRawPayload(evidenceObject),
+      consumptionSignal: resetCouponHasConsumptionSignal(inputObject.result),
+      nonConsumptionSignal: resetCouponHasNonConsumptionSignal(inputObject.result),
+    };
+  }
+  return preview;
+}
+
+function buildOfflineEvidenceFixture({ operation, input, now } = {}) {
+  const observedAt = safeNowIso(now);
+  if (operation === "recoverSession") {
+    return sanitizeProtocolProbeFixture({
+      kind: "session_recovery_strategy",
+      observedAt,
+      operation: "recoverSession",
+      status: "success",
+      evidence: {
+        strategy: canonicalString(input.evidence.strategy || input.evidence.current),
+        automatedRefresh: canonicalString(input.evidence.automatedRefresh || input.evidence.automated_refresh || input.evidence.mode),
+        safe: true,
+        sanitized: true,
+        rawPayload: false,
+      },
+    });
+  }
+  if (operation === "consumeResetCoupon") {
+    return sanitizeProtocolProbeFixture({
+      kind: "reset_coupon_consumption_evidence",
+      observedAt,
+      operation: input.operation,
+      status: "success",
+      evidence: {
+        endpointHash: input.evidence.endpointHash,
+        bodyHash: input.evidence.bodyHash,
+        resultHash: input.evidence.resultHash,
+        safe: true,
+        sanitized: true,
+        rawPayload: false,
+      },
+      result: {
+        ...(input.result.resetCouponConsumed === true ? { resetCouponConsumed: true } : {}),
+        ...(input.result.reset_coupon_consumed === true ? { reset_coupon_consumed: true } : {}),
+        ...(input.result.couponConsumed === true ? { couponConsumed: true } : {}),
+        ...(input.result.coupon_consumed === true ? { coupon_consumed: true } : {}),
+        ...(input.result.consumed === true ? { consumed: true } : {}),
+        ...(input.result.used === true ? { used: true } : {}),
+        ...(input.result.deducted === true ? { deducted: true } : {}),
+        ...(["consumeResult", "consume_result", "couponResult", "coupon_result", "usageResult", "usage_result"]
+          .reduce((acc, key) => (hasOwn(input.result, key) ? { ...acc, [key]: input.result[key] } : acc), {})),
+      },
+    });
+  }
+  throw new CliUsageError(
+    "Probe validate --write-fixture only supports offline evidence operations.",
+    { code: "OFFLINE_EVIDENCE_WRITE_ONLY" },
+  );
+}
+
+function summarizeOfflineEvidenceFixture(fixture = {}) {
+  const output = {
+    kind: fixture.kind,
+    operation: fixture.operation,
+    status: fixture.status,
+  };
+  if (fixture.observedAt) output.observedAt = fixture.observedAt;
+  if (fixture.kind === "session_recovery_strategy") {
+    output.evidence = {
+      strategy: fixture.evidence?.strategy || "",
+      automatedRefresh: fixture.evidence?.automatedRefresh || "",
+      safe: fixture.evidence?.safe === true,
+      sanitized: fixture.evidence?.sanitized === true,
+      rawPayload: sessionRecoveryRawPayload(fixture.evidence || {}),
+    };
+  }
+  if (fixture.kind === "reset_coupon_consumption_evidence") {
+    output.evidence = {
+      endpointHash: safeSha256Evidence(fixture.evidence?.endpointHash),
+      bodyHash: safeSha256Evidence(fixture.evidence?.bodyHash),
+      resultHash: safeSha256Evidence(fixture.evidence?.resultHash),
+      safe: fixture.evidence?.safe === true,
+      sanitized: fixture.evidence?.sanitized === true,
+      rawPayload: resetCouponRawPayload(fixture.evidence || {}),
+    };
+  }
+  return output;
 }
 
 
@@ -589,7 +1048,7 @@ function protocolNow(now) {
 
 function configuredProtocolClientOptions(protocol = {}) {
   const options = {};
-  for (const key of ["baseUrl", "signKeyPath", "modelCatalogPath", "modelCatalogScene", "sendPath", "attachmentUploadPath", "attachmentCompleteUploadPath", "quotaUsagePath", "activityLotteryPath", "newbieExplorationPath", "placementResourcesPath", "rewardCardRecordsPath", "lotteryHitRecordsPath", "signInStatusPath", "signInPath", "benefitCouponListPath", "activityParticipatePath", "usageResetCouponSkuPath", "lotteryAvailableChancesPath", "lotteryActiveMainPoolsPath", "lotteryChanceRecordsPath", "lotteryDrawPath", "sessionVerifyPath", "sessionVerifyMethod", "reqCtx", "defaultChatSessionId"]) {
+  for (const key of ["baseUrl", "signKeyPath", "modelCatalogPath", "modelCatalogScene", "sendPath", "authSendCodePath", "authSendCodeMethod", "authSubmitCodePath", "authSubmitCodeMethod", "attachmentUploadPath", "attachmentCompleteUploadPath", "quotaUsagePath", "activityLotteryPath", "newbieExplorationPath", "placementResourcesPath", "rewardCardRecordsPath", "lotteryHitRecordsPath", "signInStatusPath", "signInPath", "benefitCouponListPath", "benefitCouponUsePath", "activityParticipatePath", "usageResetCouponSkuPath", "lotteryAvailableChancesPath", "lotteryActiveMainPoolsPath", "lotteryChanceRecordsPath", "lotteryDrawPath", "sessionVerifyPath", "sessionVerifyMethod", "reqCtx", "defaultChatSessionId"]) {
     if (protocol[key]) options[key] = protocol[key];
   }
   return options;
@@ -605,14 +1064,27 @@ function createConfiguredProtocolClientFactory(config, { fetch: fetchImpl, now }
   });
 }
 
-function createConfiguredAccountProtocolClient(protocolClientFactory) {
+function createConfiguredAccountProtocolClient(protocolClientFactory, protocol = {}) {
   if (typeof protocolClientFactory !== "function") return {};
-  return {
+  const client = {
     async verifySession(input = {}) {
-      const client = protocolClientFactory(input.account || {});
-      return await client.verifySession(input);
+      const protocolClient = protocolClientFactory(input.account || {});
+      return await protocolClient.verifySession(input);
     },
   };
+  if (protocol.authSendCodePath) {
+    client.sendVerificationCode = async (input = {}) => {
+      const protocolClient = protocolClientFactory(input.account || {});
+      return await protocolClient.sendVerificationCode(input);
+    };
+  }
+  if (protocol.authSubmitCodePath) {
+    client.submitRegistrationOrLogin = async (input = {}) => {
+      const protocolClient = protocolClientFactory(input.account || {});
+      return await protocolClient.submitRegistrationOrLogin(input);
+    };
+  }
+  return client;
 }
 
 async function hydrateMaintenanceAccountSession(account = {}, secretStore = null) {
@@ -764,14 +1236,18 @@ export function createProtocolPoolCliDependencies(options = {}) {
   const nowDate = () => new Date(typeof now === "function" ? now() : now);
   const accountStore = options.accountStore || new JsonAccountStore({ stateDir: config.stateDir });
   const secretStore = options.secretStore || new FileSecretStore({ stateDir: config.stateDir });
-  const protocolFixtureStore = options.protocolFixtureStore || new FileProtocolFixtureStore({ stateDir: config.stateDir, now });
+  const protocolFixtureStore = options.protocolFixtureStore || new FileProtocolFixtureStore({
+    stateDir: config.stateDir,
+    fixtureDir: config.protocolFixtureDir,
+    now,
+  });
   const configuredProtocolClientFactory = createConfiguredProtocolClientFactory(config, { fetch: options.fetch, now });
   const protocolProbeClientFactory = hasOwn(options, "protocolProbeClientFactory")
     ? options.protocolProbeClientFactory
     : configuredProtocolClientFactory;
   const accountProtocolClient = hasOwn(options, "protocolClient")
     ? options.protocolClient
-    : createConfiguredAccountProtocolClient(configuredProtocolClientFactory);
+    : createConfiguredAccountProtocolClient(configuredProtocolClientFactory, config.protocol || {});
   const maintenanceProtocolClient = hasOwn(options, "maintenanceProtocolClient")
     ? options.maintenanceProtocolClient
     : createConfiguredMaintenanceProtocolClient(configuredProtocolClientFactory, config.protocol || {}, secretStore, now);
@@ -799,6 +1275,7 @@ export function createProtocolPoolCliDependencies(options = {}) {
     config,
     accountStore,
     secretStore,
+    accountProtocolClient,
     benefitsMaintainer,
     accountVerifier,
     protocolFixtureStore,
@@ -948,12 +1425,20 @@ async function handleReadinessMark(args, deps, stdout) {
   return { exitCode: 0 };
 }
 
-async function readProtocolFixtureDetails(protocolFixtureStore) {
+async function readProtocolFixtureDetails(protocolFixtureStore, { operation, operations } = {}) {
   const listedFixtures = protocolFixtureStore && typeof protocolFixtureStore.listFixtures === "function"
     ? await protocolFixtureStore.listFixtures()
     : [];
-  if (!protocolFixtureStore || typeof protocolFixtureStore.readFixture !== "function") return listedFixtures;
-  return await Promise.all((Array.isArray(listedFixtures) ? listedFixtures : []).map(async (fixture) => {
+  const allowedOperations = Array.isArray(operations) ? new Set(operations) : null;
+  const fixturesToRead = Array.isArray(listedFixtures)
+    ? listedFixtures.filter((fixture) => {
+      if (operation) return fixture?.operation === operation;
+      if (allowedOperations) return allowedOperations.has(fixture?.operation);
+      return true;
+    })
+    : [];
+  if (!protocolFixtureStore || typeof protocolFixtureStore.readFixture !== "function") return fixturesToRead;
+  return await Promise.all(fixturesToRead.map(async (fixture) => {
     if (!fixture?.ref) return fixture;
     try {
       return await protocolFixtureStore.readFixture(fixture.ref);
@@ -985,6 +1470,63 @@ async function handleReadiness(args, deps, stdout) {
       `codex_claude\t${snapshot.checks.codexClaudeE2E.status}`,
       `tool_loop\t${snapshot.checks.toolLoopDecision.status}`,
       `forbidden_403\t${snapshot.checks.forbidden403.status}`,
+      "",
+    ].join("\n"));
+  }
+  return { exitCode: 0 };
+}
+
+function plainCaptureCommandLines(commands = []) {
+  return (Array.isArray(commands) ? commands : []).map((item = {}) => [
+    "capture_command",
+    item.missing || "",
+    item.scope || "",
+    "side_effect=" + Boolean(item.sideEffect),
+    "template=" + (item.templateCommand || ""),
+    "validate=" + (item.validateCommand || ""),
+    "confirm_validate=" + (item.confirmedValidateCommand || ""),
+    "probe=" + (item.probeCommand || ""),
+    "write_fixture=" + (item.writeFixtureCommand || ""),
+    "prereq=" + (Array.isArray(item.prerequisites)
+      ? item.prerequisites.map((prerequisite = {}) => `${prerequisite.env || ""}:${prerequisite.status || ""}`).join(",")
+      : ""),
+    "reason=" + (item.reason || ""),
+  ].join("\t"));
+}
+
+async function handleReadinessDoctor(args, deps, stdout) {
+  const accounts = await loadAccounts(deps.accountStore);
+  const fixtures = await readProtocolFixtureDetails(deps.protocolFixtureStore);
+  const readinessState = deps.readinessStateStore && typeof deps.readinessStateStore.readState === "function"
+    ? normalizeReadinessState(await deps.readinessStateStore.readState())
+    : emptyReadinessState();
+  const report = buildReadinessDoctorReport({
+    accounts,
+    config: deps.config,
+    fixtures,
+    readinessState,
+    now: deps.now,
+  });
+  if (hasFlag(args, "--json")) {
+    writeLine(stdout, json(report));
+  } else {
+    const backlog = report.calibrationBacklog || {};
+    const scopes = backlog.scopes || {};
+    const missingCount = (item) => Array.isArray(item?.missing) ? item.missing.length : 0;
+    writeLine(stdout, [
+      `status\t${report.status}`,
+      `state_dir\t${report.stateDir}`,
+      `protocol\t${report.readiness.checks.protocolCalibration.status}`,
+      `fixtures\t${report.fixtureAudit.status}`,
+      `auth_send_endpoint\t${report.protocol.authSendCodePathConfigured ? "configured" : "missing"}`,
+      `auth_submit_endpoint\t${report.protocol.authSubmitCodePathConfigured ? "configured" : "missing"}`,
+      `remaining_work\t${report.remainingWork.length}`,
+      `calibration_backlog\t${backlog.status || ""}\tmissing=${missingCount(backlog)}`,
+      `auth_backlog\t${scopes.auth?.status || ""}\tmissing=${missingCount(scopes.auth)}`,
+      `benefits_backlog\t${scopes.benefits?.status || ""}\tmissing=${missingCount(scopes.benefits)}`,
+      `session_backlog\t${scopes.session?.status || ""}\tmissing=${missingCount(scopes.session)}`,
+      `upstream_backlog\t${scopes.upstream?.status || ""}\tmissing=${missingCount(scopes.upstream)}`,
+      ...plainCaptureCommandLines(backlog.captureCommands),
       "",
     ].join("\n"));
   }
@@ -1072,9 +1614,78 @@ function fixtureTable(fixtures) {
 
 
 async function handleFixturesAudit(args, deps, stdout) {
-  const fixtures = await readProtocolFixtureDetails(deps.protocolFixtureStore);
-  const audit = buildProtocolFixtureAudit({ fixtures, now: deps.now });
+  const rawScope = requiredValueAfter(args, "--scope");
+  const scope = rawScope ? String(rawScope).trim() : "protocol";
+  if (scope !== "protocol" && scope !== "auth" && scope !== "benefits" && scope !== "session" && scope !== "upstream") {
+    throw new CliUsageError("Unsupported fixtures audit scope: " + scope + ".", { code: "UNSUPPORTED_FIXTURES_AUDIT_SCOPE" });
+  }
+  let fixtureReadFilter = {};
+  if (scope === "session") fixtureReadFilter = { operations: ["verifySession", "recoverSession"] };
+  else if (scope === "auth") fixtureReadFilter = { operations: ["sendVerificationCode", "submitRegistrationOrLogin"] };
+  else if (scope === "benefits") fixtureReadFilter = { operations: BENEFITS_AUDIT_OPERATIONS };
+  else if (scope === "upstream") fixtureReadFilter = { operation: "sendMessage" };
+  const fixtures = await readProtocolFixtureDetails(deps.protocolFixtureStore, fixtureReadFilter);
+  const audit = buildProtocolFixtureAudit({ fixtures, now: deps.now, scope });
   if (hasFlag(args, "--json")) writeLine(stdout, json(audit));
+  else if (scope === "auth") {
+    writeLine(stdout, [
+      "status	" + audit.status,
+      "successful_sendVerificationCode_fixture	" + audit.coverage.authSendVerificationCode.status + "	" + audit.coverage.authSendVerificationCode.count,
+      "successful_submitRegistrationOrLogin_fixture	" + audit.coverage.authSubmitRegistrationOrLogin.status + "	" + audit.coverage.authSubmitRegistrationOrLogin.count,
+      "sendVerificationCode_transport_success	" + audit.counts.successfulSendVerificationCode,
+      "sendVerificationCode_delivery_success	" + audit.counts.successfulSendVerificationCodeWithDeliverySignal,
+      "submitRegistrationOrLogin_transport_success	" + audit.counts.successfulSubmitRegistrationOrLogin,
+      "submitRegistrationOrLogin_session_material_success	" + audit.counts.successfulSubmitRegistrationOrLoginWithSessionMaterial,
+      "missing	" + (Array.isArray(audit.missing) ? audit.missing.join(",") : ""),
+      "",
+    ].join("\n"));
+  }
+  else if (scope === "benefits") {
+    writeLine(stdout, [
+      "status	" + audit.status,
+      "successful_daily_sign_in_fixture	" + audit.coverage.dailySignIn.status + "	" + audit.coverage.dailySignIn.count,
+      "successful_pro_activity_fixture	" + audit.coverage.proActivitySuccess.status + "	" + audit.coverage.proActivitySuccess.count,
+      "successful_reset_coupon_consumption_fixture	" + audit.coverage.resetCouponConsumption.status + "	" + audit.coverage.resetCouponConsumption.count,
+      "successful_lottery_draw_fixture	" + audit.coverage.lotteryDrawSuccess.status + "	" + audit.coverage.lotteryDrawSuccess.count,
+      "dailySignIn	" + audit.counts.dailySignIn,
+      "participateActivity	" + audit.counts.participateActivity,
+      "participateResetCouponActivity	" + audit.counts.participateResetCouponActivity,
+      "consumeResetCoupon	" + audit.counts.consumeResetCoupon,
+      "drawLottery	" + audit.counts.drawLottery,
+      "successful_daily_sign_in	" + audit.counts.successfulDailySignIn,
+      "successful_pro_activity	" + audit.counts.successfulProActivity,
+      "successful_reset_coupon_consumption	" + audit.counts.successfulResetCouponConsumption,
+      "successful_lottery_draw	" + audit.counts.successfulLotteryDraw,
+      "missing	" + (Array.isArray(audit.missing) ? audit.missing.join(",") : ""),
+      "",
+    ].join("\n"));
+  }
+  else if (scope === "session") {
+    const recoveryStrategy = audit.recoveryStrategy || {};
+    writeLine(stdout, [
+      "status	" + audit.status,
+      "successful_verifySession_fixture	" + audit.coverage.successfulSessionVerify.status + "	" + audit.coverage.successfulSessionVerify.count,
+      "expired_verifySession_fixture	" + audit.coverage.expiredSessionSignal.status + "	" + audit.coverage.expiredSessionSignal.count,
+      "session_missing	" + audit.counts.sessionMissing,
+      "recovery_strategy	" + (recoveryStrategy.status || "") + "	" + (recoveryStrategy.current || "") + "	" + (recoveryStrategy.automatedRefresh || ""),
+      "missing	" + (Array.isArray(audit.missing) ? audit.missing.join(",") : ""),
+      "",
+    ].join("\n"));
+  }
+  else if (scope === "upstream") {
+    writeLine(stdout, [
+      "status	" + audit.status,
+      "real_upstream_error_frame_fixture	" + audit.coverage.upstreamErrorFrame.status + "	" + audit.coverage.upstreamErrorFrame.count,
+      "real_upstream_cancellation_fixture	" + audit.coverage.upstreamCancellation.status + "	" + audit.coverage.upstreamCancellation.count,
+      "real_upstream_backpressure_fixture	" + audit.coverage.upstreamBackpressure.status + "	" + audit.coverage.upstreamBackpressure.count,
+      "real_upstream	" + audit.counts.realUpstream,
+      "upstream_error_frame	" + audit.counts.upstreamErrorFrame,
+      "upstream_cancellation	" + audit.counts.upstreamCancellation,
+      "upstream_backpressure	" + audit.counts.upstreamBackpressure,
+      "missing	" + (Array.isArray(audit.missing) ? audit.missing.join(",") : ""),
+      "",
+    ].join("\n"));
+  }
   else {
     writeLine(stdout, [
       "status	" + audit.status,
@@ -1113,6 +1724,50 @@ async function handleProbeTemplate(args, stdout) {
   return { exitCode: 0 };
 }
 
+async function handleProbeValidate(args, deps, stdout) {
+  const operation = valueAfter(args, "--operation") || "verifySession";
+  const input = await readProbeInput(args);
+  validateProbeInputForOperation(input, operation);
+  if (hasFlag(args, "--require-confirmed-side-effect")) {
+    assertConfirmedSideEffectInput(input, operation);
+  }
+  const writeFixture = hasFlag(args, "--write-fixture");
+  const cleanOperation = String(operation || "verifySession").trim() || "verifySession";
+  let fixtureRef = null;
+  let fixtureSummary = null;
+  if (writeFixture) {
+    if (!OFFLINE_EVIDENCE_PROBE_OPERATIONS.has(cleanOperation)) {
+      throw new CliUsageError(
+        "Probe validate --write-fixture only supports offline evidence operations.",
+        { code: "OFFLINE_EVIDENCE_WRITE_ONLY" },
+      );
+    }
+    if (!deps.protocolFixtureStore || typeof deps.protocolFixtureStore.writeFixture !== "function") {
+      throw new CliUsageError("Protocol fixture store is required for --write-fixture.", { code: "FIXTURE_STORE_REQUIRED" });
+    }
+    const fixture = buildOfflineEvidenceFixture({ operation: cleanOperation, input, now: deps.now });
+    fixtureRef = await deps.protocolFixtureStore.writeFixture(fixture);
+    fixtureSummary = summarizeOfflineEvidenceFixture(fixture);
+  }
+  const preview = buildProbeInputValidationPreview({ operation, input });
+  const output = {
+    ...preview,
+    ...(fixtureRef ? { fixtureRef, fixture: fixtureSummary } : {}),
+  };
+  if (hasFlag(args, "--json")) writeLine(stdout, json(output));
+  else {
+    writeLine(stdout, [
+      "status	" + output.status,
+      "operation	" + output.operation,
+      "side_effect	" + output.sideEffect,
+      "confirm_side_effect	" + (output.confirmSideEffect ?? ""),
+      ...(fixtureRef ? ["fixture_ref	" + fixtureRef] : []),
+      "",
+    ].join("\n"));
+  }
+  return { exitCode: 0 };
+}
+
 async function handleProbeProtocol(args, deps, stdout, stderr) {
   const accountId = valueAfter(args, "--account") || valueAfter(args, "--account-id");
   if (!accountId || accountId.startsWith("--")) {
@@ -1122,6 +1777,7 @@ async function handleProbeProtocol(args, deps, stdout, stderr) {
   const operation = valueAfter(args, "--operation") || "verifySession";
   const input = await readProbeInput(args);
   validateProbeInputForOperation(input, operation);
+  assertProtocolProbeOperationDispatchable(operation);
   const probeRequest = {
     accountId,
     operation,
@@ -1180,6 +1836,9 @@ export async function runProtocolPoolCli(argv = [], options = {}) {
     if (command === "readiness" && subcommand === "mark") {
       return await handleReadinessMark(args, deps, stdout);
     }
+    if (command === "readiness" && subcommand === "doctor") {
+      return await handleReadinessDoctor(args, deps, stdout);
+    }
     if (command === "readiness") {
       return await handleReadiness(args, deps, stdout);
     }
@@ -1200,6 +1859,9 @@ export async function runProtocolPoolCli(argv = [], options = {}) {
     }
     if (command === "probe" && subcommand === "template") {
       return await handleProbeTemplate(args, stdout);
+    }
+    if (command === "probe" && subcommand === "validate") {
+      return await handleProbeValidate(args, deps, stdout);
     }
     if (command === "probe" && subcommand === "protocol") {
       return await handleProbeProtocol(args, deps, stdout, stderr);

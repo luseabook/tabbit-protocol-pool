@@ -3,6 +3,7 @@ import { PooledRequestError } from "./pooled-request-runner.js";
 const DEFAULT_MODE = "client_executes_tools_first";
 const DEFAULT_MAX_ROUNDS = 4;
 const DEFAULT_MAX_TOOL_RESULT_CHARS = 16_000;
+const DEFAULT_TOOL_TIMEOUT_MS = 0;
 
 function cloneJson(value) {
   if (value === undefined) return undefined;
@@ -22,6 +23,30 @@ function normalizePositiveInteger(value, fallback, label) {
     });
   }
   return value;
+}
+
+function normalizeNonNegativeInteger(value, fallback, label) {
+  if (value === undefined || value === null) return fallback;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new PooledRequestError(`${label} must be a non-negative safe integer.`, {
+      category: "invalid_request",
+      code: "INVALID_LOCAL_TOOL_LOOP_LIMIT",
+    });
+  }
+  return value;
+}
+
+function normalizeAllowedToolNames(value = []) {
+  const raw = Array.isArray(value) ? value : [value];
+  const seen = new Set();
+  const names = [];
+  for (const item of raw) {
+    const name = cleanString(item);
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    names.push(name);
+  }
+  return names;
 }
 
 function normalizedToolDefinition(tool = {}) {
@@ -73,6 +98,18 @@ function errorResult(message, code, detail = null) {
     ok: false,
     error: new PooledRequestError(message, {
       category: "invalid_request",
+      code,
+      retryable: false,
+      detail,
+    }),
+  };
+}
+
+function timeoutResult(message, code, detail = null) {
+  return {
+    ok: false,
+    error: new PooledRequestError(message, {
+      category: "timeout",
       code,
       retryable: false,
       detail,
@@ -241,6 +278,8 @@ export class LocalToolLoopRunner {
     executeToolUse = null,
     maxRounds = DEFAULT_MAX_ROUNDS,
     maxToolResultChars = DEFAULT_MAX_TOOL_RESULT_CHARS,
+    allowedToolNames = [],
+    toolTimeoutMs = DEFAULT_TOOL_TIMEOUT_MS,
   } = {}) {
     if (!runner || typeof runner.run !== "function") {
       throw new PooledRequestError("runner with run() is required", {
@@ -253,6 +292,8 @@ export class LocalToolLoopRunner {
     this.executeToolUse = typeof executeToolUse === "function" ? executeToolUse : null;
     this.maxRounds = normalizePositiveInteger(maxRounds, DEFAULT_MAX_ROUNDS, "maxRounds");
     this.maxToolResultChars = normalizePositiveInteger(maxToolResultChars, DEFAULT_MAX_TOOL_RESULT_CHARS, "maxToolResultChars");
+    this.allowedToolNames = new Set(normalizeAllowedToolNames(allowedToolNames));
+    this.toolTimeoutMs = normalizeNonNegativeInteger(toolTimeoutMs, DEFAULT_TOOL_TIMEOUT_MS, "toolTimeoutMs");
   }
 
   async run(input = {}) {
@@ -274,6 +315,13 @@ export class LocalToolLoopRunner {
       return await this.runner.run(input);
     }
 
+    const disallowedTool = tools.find((tool) => this.allowedToolNames.size > 0 && !this.allowedToolNames.has(tool.name));
+    if (disallowedTool) {
+      return errorResult(`Local tool '${disallowedTool.name}' is not allowed by the configured allowlist.`, "LOCAL_TOOL_NOT_ALLOWED", {
+        name: disallowedTool.name,
+      });
+    }
+
     if (isNoneToolChoice(input.toolChoice)) {
       return await this.runner.run(stripToolFields(input));
     }
@@ -286,6 +334,33 @@ export class LocalToolLoopRunner {
     }
 
     return await this.runLocalToolLoop(input, tools);
+  }
+
+  async executeToolUseWithTimeout(call) {
+    if (this.toolTimeoutMs <= 0) {
+      return { ok: true, value: await this.executeToolUse(call) };
+    }
+
+    let timeoutId;
+    const timeout = new Promise((resolve) => {
+      timeoutId = setTimeout(() => {
+        resolve(timeoutResult(
+          `Local tool '${call.name}' exceeded the configured timeout of ${this.toolTimeoutMs}ms.`,
+          "LOCAL_TOOL_TIMEOUT",
+          { name: call.name, timeoutMs: this.toolTimeoutMs },
+        ));
+      }, this.toolTimeoutMs);
+    });
+
+    try {
+      const result = await Promise.race([
+        Promise.resolve(this.executeToolUse(call)).then((value) => ({ ok: true, value })),
+        timeout,
+      ]);
+      return result;
+    } finally {
+      clearTimeout(timeoutId);
+    }
   }
 
   async runLocalToolLoop(input, tools) {
@@ -333,7 +408,7 @@ export class LocalToolLoopRunner {
           });
         }
 
-        const toolResult = await this.executeToolUse({
+        const toolExecution = await this.executeToolUseWithTimeout({
           id: toolUse.id,
           name: toolUse.name,
           input: cloneJson(toolUse.input),
@@ -341,11 +416,18 @@ export class LocalToolLoopRunner {
           round,
           request: cloneJson(input),
         });
+        if (!toolExecution.ok) {
+          return {
+            ...toolExecution,
+            attemptedAccounts,
+            fallbackHappened,
+          };
+        }
 
         workingMessages.push({
           role: "tool",
           tool_call_id: toolUse.id,
-          content: normalizeToolResultContent(toolResult, this.maxToolResultChars),
+          content: normalizeToolResultContent(toolExecution.value, this.maxToolResultChars),
         });
       }
     }

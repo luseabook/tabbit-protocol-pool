@@ -37,6 +37,7 @@ export {
   buildCalibrationReadinessSnapshot,
   buildHealthSnapshot,
   buildProtocolFixtureAudit,
+  buildReadinessDoctorReport,
   classifyForbiddenSignal,
   createGatewayHealthProvider,
   formatMaintenanceActionLog,

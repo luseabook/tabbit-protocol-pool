@@ -5,6 +5,9 @@ const DEFAULT_PORT = 50124;
 const DEFAULT_API_KEY = "sk-tabbit-local";
 const DEFAULT_RETRY_LIMIT = 1;
 const DEFAULT_TOOL_LOOP_MODE = "client_executes_tools_first";
+const DEFAULT_LOCAL_TOOL_MAX_ROUNDS = 4;
+const DEFAULT_LOCAL_TOOL_TIMEOUT_MS = 0;
+const DEFAULT_LOCAL_TOOL_MAX_RESULT_CHARS = 16_000;
 const TOOL_LOOP_MODES = new Set([
   DEFAULT_TOOL_LOOP_MODE,
   "disabled",
@@ -63,6 +66,24 @@ function normalizeNonNegativeInteger(value, fallback, label) {
   return parsed;
 }
 
+function normalizePositiveInteger(value, fallback, label) {
+  const raw = cleanString(value);
+  if (!raw) {
+    return fallback;
+  }
+
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`Invalid ${label}: ${value}`);
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new Error(`Invalid ${label}: ${value}`);
+  }
+
+  return parsed;
+}
+
 function normalizeToolLoopMode(value) {
   const raw = cleanString(value);
   if (!raw) return DEFAULT_TOOL_LOOP_MODE;
@@ -70,6 +91,39 @@ function normalizeToolLoopMode(value) {
     throw new Error(`Invalid tool loop mode: ${value}`);
   }
   return raw;
+}
+
+function normalizeCommaSeparatedList(value) {
+  const seen = new Set();
+  const result = [];
+  for (const item of cleanString(value).split(",")) {
+    const clean = cleanString(item);
+    if (!clean || seen.has(clean)) continue;
+    seen.add(clean);
+    result.push(clean);
+  }
+  return result;
+}
+
+function loadLocalToolLoopConfig(env) {
+  return {
+    allowedToolNames: normalizeCommaSeparatedList(env.TABBIT_POOL_LOCAL_TOOL_ALLOWLIST),
+    maxRounds: normalizePositiveInteger(
+      env.TABBIT_POOL_LOCAL_TOOL_MAX_ROUNDS,
+      DEFAULT_LOCAL_TOOL_MAX_ROUNDS,
+      "local tool max rounds",
+    ),
+    toolTimeoutMs: normalizeNonNegativeInteger(
+      env.TABBIT_POOL_LOCAL_TOOL_TIMEOUT_MS,
+      DEFAULT_LOCAL_TOOL_TIMEOUT_MS,
+      "local tool timeout",
+    ),
+    maxToolResultChars: normalizePositiveInteger(
+      env.TABBIT_POOL_LOCAL_TOOL_MAX_RESULT_CHARS,
+      DEFAULT_LOCAL_TOOL_MAX_RESULT_CHARS,
+      "local tool max result chars",
+    ),
+  };
 }
 
 function defaultStateDir(env, platform) {
@@ -93,6 +147,10 @@ function loadProtocolConfig(env) {
   const modelCatalogPath = optionalString(env.TABBIT_POOL_PROTOCOL_MODEL_CATALOG_PATH);
   const modelCatalogScene = optionalString(env.TABBIT_POOL_PROTOCOL_MODEL_CATALOG_SCENE) || "chat";
   const sendPath = optionalString(env.TABBIT_POOL_PROTOCOL_SEND_PATH);
+  const authSendCodePath = optionalString(env.TABBIT_POOL_PROTOCOL_AUTH_SEND_CODE_PATH);
+  const authSendCodeMethod = cleanString(env.TABBIT_POOL_PROTOCOL_AUTH_SEND_CODE_METHOD).toUpperCase() || "POST";
+  const authSubmitCodePath = optionalString(env.TABBIT_POOL_PROTOCOL_AUTH_SUBMIT_CODE_PATH);
+  const authSubmitCodeMethod = cleanString(env.TABBIT_POOL_PROTOCOL_AUTH_SUBMIT_CODE_METHOD).toUpperCase() || "POST";
   const attachmentUploadPath = optionalString(env.TABBIT_POOL_PROTOCOL_ATTACHMENT_UPLOAD_PATH);
   const attachmentCompleteUploadPath = optionalString(env.TABBIT_POOL_PROTOCOL_ATTACHMENT_COMPLETE_UPLOAD_PATH);
   const quotaUsagePath = optionalString(env.TABBIT_POOL_PROTOCOL_QUOTA_USAGE_PATH);
@@ -104,6 +162,7 @@ function loadProtocolConfig(env) {
   const signInStatusPath = optionalString(env.TABBIT_POOL_PROTOCOL_SIGN_IN_STATUS_PATH);
   const signInPath = optionalString(env.TABBIT_POOL_PROTOCOL_SIGN_IN_PATH);
   const benefitCouponListPath = optionalString(env.TABBIT_POOL_PROTOCOL_BENEFIT_COUPON_LIST_PATH);
+  const benefitCouponUsePath = optionalString(env.TABBIT_POOL_PROTOCOL_BENEFIT_COUPON_USE_PATH);
   const activityParticipatePath = optionalString(env.TABBIT_POOL_PROTOCOL_ACTIVITY_PARTICIPATE_PATH);
   const usageResetCouponSkuPath = optionalString(env.TABBIT_POOL_PROTOCOL_USAGE_RESET_COUPON_SKU_PATH);
   const lotteryAvailableChancesPath = optionalString(env.TABBIT_POOL_PROTOCOL_LOTTERY_AVAILABLE_CHANCES_PATH);
@@ -119,6 +178,8 @@ function loadProtocolConfig(env) {
     signKeyPath
     || modelCatalogPath
     || sendPath
+    || authSendCodePath
+    || authSubmitCodePath
     || attachmentUploadPath
     || attachmentCompleteUploadPath
     || quotaUsagePath
@@ -130,6 +191,7 @@ function loadProtocolConfig(env) {
     || signInStatusPath
     || signInPath
     || benefitCouponListPath
+    || benefitCouponUsePath
     || activityParticipatePath
     || usageResetCouponSkuPath
     || lotteryAvailableChancesPath
@@ -146,6 +208,10 @@ function loadProtocolConfig(env) {
     modelCatalogPath,
     modelCatalogScene,
     sendPath,
+    authSendCodePath,
+    authSendCodeMethod,
+    authSubmitCodePath,
+    authSubmitCodeMethod,
     attachmentUploadPath,
     attachmentCompleteUploadPath,
     quotaUsagePath,
@@ -157,6 +223,7 @@ function loadProtocolConfig(env) {
     signInStatusPath,
     signInPath,
     benefitCouponListPath,
+    benefitCouponUsePath,
     activityParticipatePath,
     usageResetCouponSkuPath,
     lotteryAvailableChancesPath,
@@ -181,6 +248,7 @@ export function loadConfig(env = globalThis.process?.env ?? {}, options = {}) {
     port: normalizePort(env.TABBIT_POOL_PORT, DEFAULT_PORT),
     apiKey: cleanString(env.TABBIT_POOL_API_KEY) || DEFAULT_API_KEY,
     stateDir: cleanString(env.TABBIT_POOL_STATE_DIR) || defaultStateDir(env, platform),
+    protocolFixtureDir: optionalString(env.TABBIT_POOL_PROTOCOL_FIXTURE_DIR),
     retryLimit: normalizeNonNegativeInteger(
       env.TABBIT_POOL_RETRY_LIMIT,
       DEFAULT_RETRY_LIMIT,
@@ -195,6 +263,7 @@ export function loadConfig(env = globalThis.process?.env ?? {}, options = {}) {
     compat: {
       stripClientTools,
       toolLoopMode,
+      localToolLoop: loadLocalToolLoopConfig(env),
     },
     protocol: loadProtocolConfig(env),
   };

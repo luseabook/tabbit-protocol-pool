@@ -9,11 +9,18 @@ test("loadConfig returns safe local defaults", () => {
   assert.equal(config.host, "127.0.0.1");
   assert.equal(config.port, 50124);
   assert.equal(config.apiKey, "sk-tabbit-local");
+  assert.equal(config.protocolFixtureDir, null);
   assert.equal(config.yydsMailApiKey, null);
   assert.equal(config.mail.enabled, false);
   assert.deepEqual(config.compat, {
     stripClientTools: false,
     toolLoopMode: "client_executes_tools_first",
+    localToolLoop: {
+      allowedToolNames: [],
+      maxRounds: 4,
+      toolTimeoutMs: 0,
+      maxToolResultChars: 16_000,
+    },
   });
   assert.deepEqual(config.protocol, {
     enabled: false,
@@ -22,6 +29,10 @@ test("loadConfig returns safe local defaults", () => {
     modelCatalogPath: null,
     modelCatalogScene: "chat",
     sendPath: null,
+    authSendCodePath: null,
+    authSendCodeMethod: "POST",
+    authSubmitCodePath: null,
+    authSubmitCodeMethod: "POST",
     attachmentUploadPath: null,
     attachmentCompleteUploadPath: null,
     quotaUsagePath: null,
@@ -33,6 +44,7 @@ test("loadConfig returns safe local defaults", () => {
     signInStatusPath: null,
     signInPath: null,
     benefitCouponListPath: null,
+    benefitCouponUsePath: null,
     activityParticipatePath: null,
     usageResetCouponSkuPath: null,
     lotteryAvailableChancesPath: null,
@@ -53,6 +65,7 @@ test("loadConfig applies environment overrides", () => {
     TABBIT_POOL_PORT: "50125",
     TABBIT_POOL_API_KEY: "local-secret",
     TABBIT_POOL_STATE_DIR: "E:/tmp/tabbit-pool",
+    TABBIT_POOL_PROTOCOL_FIXTURE_DIR: "E:/tmp/tabbit-fixtures",
     TABBIT_POOL_RETRY_LIMIT: "3",
     YYDS_MAIL_API_KEY: "AC-test-key",
     TABBIT_POOL_PROTOCOL_ENABLED: "true",
@@ -61,6 +74,10 @@ test("loadConfig applies environment overrides", () => {
     TABBIT_POOL_PROTOCOL_MODEL_CATALOG_PATH: "/fixture/models",
     TABBIT_POOL_PROTOCOL_MODEL_CATALOG_SCENE: "script",
     TABBIT_POOL_PROTOCOL_SEND_PATH: "/fixture/send",
+    TABBIT_POOL_PROTOCOL_AUTH_SEND_CODE_PATH: "/fixture/auth/send-code",
+    TABBIT_POOL_PROTOCOL_AUTH_SEND_CODE_METHOD: "put",
+    TABBIT_POOL_PROTOCOL_AUTH_SUBMIT_CODE_PATH: "/fixture/auth/submit-code",
+    TABBIT_POOL_PROTOCOL_AUTH_SUBMIT_CODE_METHOD: "patch",
     TABBIT_POOL_PROTOCOL_ATTACHMENT_UPLOAD_PATH: "/fixture/attachments/upload",
     TABBIT_POOL_PROTOCOL_ATTACHMENT_COMPLETE_UPLOAD_PATH: "/fixture/attachments/complete-upload",
     TABBIT_POOL_PROTOCOL_QUOTA_USAGE_PATH: "/fixture/quota/usage",
@@ -72,6 +89,7 @@ test("loadConfig applies environment overrides", () => {
     TABBIT_POOL_PROTOCOL_SIGN_IN_STATUS_PATH: "/fixture/activity/sign-in/status",
     TABBIT_POOL_PROTOCOL_SIGN_IN_PATH: "/fixture/activity/sign-in",
     TABBIT_POOL_PROTOCOL_BENEFIT_COUPON_LIST_PATH: "/fixture/benefit/coupon/list",
+    TABBIT_POOL_PROTOCOL_BENEFIT_COUPON_USE_PATH: "/fixture/benefit/coupon/use",
     TABBIT_POOL_PROTOCOL_ACTIVITY_PARTICIPATE_PATH: "/fixture/activity/participate",
     TABBIT_POOL_PROTOCOL_USAGE_RESET_COUPON_SKU_PATH: "/fixture/product/usage-reset-coupon",
     TABBIT_POOL_PROTOCOL_LOTTERY_AVAILABLE_CHANCES_PATH: "/fixture/lottery/available-chances",
@@ -90,12 +108,19 @@ test("loadConfig applies environment overrides", () => {
   assert.equal(config.port, 50125);
   assert.equal(config.apiKey, "local-secret");
   assert.equal(config.stateDir, "E:/tmp/tabbit-pool");
+  assert.equal(config.protocolFixtureDir, "E:/tmp/tabbit-fixtures");
   assert.equal(config.retryLimit, 3);
   assert.equal(config.yydsMailApiKey, "AC-test-key");
   assert.equal(config.mail.enabled, true);
   assert.deepEqual(config.compat, {
     stripClientTools: true,
     toolLoopMode: "disabled",
+    localToolLoop: {
+      allowedToolNames: [],
+      maxRounds: 4,
+      toolTimeoutMs: 0,
+      maxToolResultChars: 16_000,
+    },
   });
   assert.deepEqual(config.protocol, {
     enabled: true,
@@ -104,6 +129,10 @@ test("loadConfig applies environment overrides", () => {
     modelCatalogPath: "/fixture/models",
     modelCatalogScene: "script",
     sendPath: "/fixture/send",
+    authSendCodePath: "/fixture/auth/send-code",
+    authSendCodeMethod: "PUT",
+    authSubmitCodePath: "/fixture/auth/submit-code",
+    authSubmitCodeMethod: "PATCH",
     attachmentUploadPath: "/fixture/attachments/upload",
     attachmentCompleteUploadPath: "/fixture/attachments/complete-upload",
     quotaUsagePath: "/fixture/quota/usage",
@@ -115,6 +144,7 @@ test("loadConfig applies environment overrides", () => {
     signInStatusPath: "/fixture/activity/sign-in/status",
     signInPath: "/fixture/activity/sign-in",
     benefitCouponListPath: "/fixture/benefit/coupon/list",
+    benefitCouponUsePath: "/fixture/benefit/coupon/use",
     activityParticipatePath: "/fixture/activity/participate",
     usageResetCouponSkuPath: "/fixture/product/usage-reset-coupon",
     lotteryAvailableChancesPath: "/fixture/lottery/available-chances",
@@ -137,6 +167,20 @@ test("loadConfig enables protocol wiring when an endpoint path is configured", (
   assert.equal(config.protocol.placementResourcesPath, "/api/commerce/placement/v1/resources");
 });
 
+test("loadConfig enables protocol wiring when an auth endpoint path is configured", () => {
+  const sendCode = loadConfig({
+    TABBIT_POOL_PROTOCOL_AUTH_SEND_CODE_PATH: "/api/auth/send-code",
+  });
+  const submitCode = loadConfig({
+    TABBIT_POOL_PROTOCOL_AUTH_SUBMIT_CODE_PATH: "/api/auth/submit-code",
+  });
+
+  assert.equal(sendCode.protocol.enabled, true);
+  assert.equal(sendCode.protocol.authSendCodePath, "/api/auth/send-code");
+  assert.equal(submitCode.protocol.enabled, true);
+  assert.equal(submitCode.protocol.authSubmitCodePath, "/api/auth/submit-code");
+});
+
 test("loadConfig rejects invalid protocol enabled flags", () => {
   assert.throws(() => loadConfig({ TABBIT_POOL_PROTOCOL_ENABLED: "maybe" }), /Invalid protocol enabled/);
 });
@@ -153,6 +197,29 @@ test("loadConfig accepts explicit local tool execution mode", () => {
   const config = loadConfig({ TABBIT_POOL_TOOL_LOOP_MODE: "local_executes_tools" });
 
   assert.equal(config.compat.toolLoopMode, "local_executes_tools");
+});
+
+test("loadConfig parses local tool loop guardrail env", () => {
+  const config = loadConfig({
+    TABBIT_POOL_TOOL_LOOP_MODE: "local_executes_tools",
+    TABBIT_POOL_LOCAL_TOOL_ALLOWLIST: "lookup, summarize, lookup",
+    TABBIT_POOL_LOCAL_TOOL_MAX_ROUNDS: "2",
+    TABBIT_POOL_LOCAL_TOOL_TIMEOUT_MS: "50",
+    TABBIT_POOL_LOCAL_TOOL_MAX_RESULT_CHARS: "12",
+  });
+
+  assert.deepEqual(config.compat.localToolLoop, {
+    allowedToolNames: ["lookup", "summarize"],
+    maxRounds: 2,
+    toolTimeoutMs: 50,
+    maxToolResultChars: 12,
+  });
+});
+
+test("loadConfig rejects invalid local tool loop guardrail env", () => {
+  assert.throws(() => loadConfig({ TABBIT_POOL_LOCAL_TOOL_MAX_ROUNDS: "0" }), /local tool max rounds/i);
+  assert.throws(() => loadConfig({ TABBIT_POOL_LOCAL_TOOL_TIMEOUT_MS: "-1" }), /local tool timeout/i);
+  assert.throws(() => loadConfig({ TABBIT_POOL_LOCAL_TOOL_MAX_RESULT_CHARS: "0" }), /local tool max result chars/i);
 });
 
 test("normalizePort rejects invalid ports instead of silently changing behavior", () => {

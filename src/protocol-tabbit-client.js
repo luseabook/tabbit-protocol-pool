@@ -10,6 +10,7 @@ const EMPTY_TAB_ENTITY_KEY = "d41d8cd98f00b204e9800998ecf8427e";
 const NEWBIE_EXPLORATION_VIEW_MODES = new Set(["event_gate", "float_collapsed", "float_expanded", "activity_page"]);
 const DEFAULT_DAILY_SIGN_IN_SCENE = "desktop_pet";
 const WEEKLY_RESET_COUPON_TYPE = "weekly_reset_coupon";
+const AUTH_CLIENT_UUID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 export class ProtocolTabbitError extends Error {
   constructor(message, { category = "unknown", status = null, code = null, retryable = false, cooldownMs = 0, detail = null } = {}) {
@@ -63,6 +64,10 @@ export function buildSignaturePayload({ method, path, query, body, timestamp, no
 
 function sha256Hex(value) {
   return createHash("sha256").update(String(value ?? "")).digest("hex");
+}
+
+function sha256Evidence(value) {
+  return `sha256:${sha256Hex(typeof value === "string" ? value : canonicalJson(value))}`;
 }
 
 function buildBrowserSignaturePayload({ bodyText = "", timestamp, signature }) {
@@ -149,6 +154,14 @@ export function createUniqueUuid({ now = () => Date.now(), random = Math.random,
     }
   }
   return [raw.slice(0, 8), raw.slice(8, 12), raw.slice(12, 16), raw.slice(16, 20), raw.slice(20, 32)].join("-");
+}
+
+function createAuthClientUuid({ random = Math.random } = {}) {
+  let value = "";
+  for (let index = 0; index < 64; index += 1) {
+    value += AUTH_CLIENT_UUID_ALPHABET[Math.floor(random() * AUTH_CLIENT_UUID_ALPHABET.length)];
+  }
+  return value;
 }
 
 function escapeHtml(value) {
@@ -238,6 +251,10 @@ function buildRealChatCompletionBody({ account, defaultChatSessionId, chatSessio
 
 function usesRestoredChatCompletionProtocol(path) {
   return normalizePath(path) === "/api/v1/chat/completion";
+}
+
+function usesProxyOauthProtocol(path) {
+  return normalizePath(path).startsWith("/proxy/v0/oauth/");
 }
 
 function hasNativeToolFields({ tools = null, toolChoice = null, parallelToolCalls = null } = {}) {
@@ -1157,12 +1174,17 @@ function normalizeCouponListResponse(body) {
 
 function normalizeCommerceObjectResponse(body, source, label) {
   const data = responseDataObject(body, label);
+  const usageResult = firstDefined(data.use_result, data.usage_result, data.useResult, data.usageResult);
+  const couponResult = firstDefined(data.coupon_result, data.couponResult);
   return {
     ok: true,
     source,
     raw: body,
     ...(data.activity_id !== undefined && data.activity_id !== null && data.activity_id !== "" ? { activityId: String(data.activity_id) } : {}),
     ...(data.participation_result ? { participationResult: String(data.participation_result) } : {}),
+    ...(usageResult ? { usageResult: String(usageResult) } : {}),
+    ...(couponResult ? { couponResult: String(couponResult) } : {}),
+    ...(data.used === true ? { used: true } : {}),
     ...(data.status ? { status: String(data.status) } : {}),
     ...(data.result ? { result: data.result } : {}),
   };
@@ -1206,6 +1228,16 @@ function requireNonEmptyString(value, label, code) {
   throw new ProtocolTabbitError(`${label} must be a non-empty string.`, {
     category: "invalid_request",
     code,
+    retryable: false,
+  });
+}
+
+function requireAuthClientUuid(value) {
+  const text = requireNonEmptyString(value, "uuid", "MISSING_AUTH_CLIENT_UUID");
+  if (/^[A-Za-z0-9]{64}$/.test(text)) return text;
+  throw new ProtocolTabbitError("uuid must be a 64-character alphanumeric auth client value.", {
+    category: "invalid_request",
+    code: "INVALID_AUTH_CLIENT_UUID",
     retryable: false,
   });
 }
@@ -1342,19 +1374,61 @@ function normalizeVerificationResponse(body) {
   };
 }
 
+function headerValue(headers, name) {
+  return headers?.get?.(name) || headers?.get?.(name.toLowerCase()) || null;
+}
+
+function normalizeAuthSubmitResponse(body, headers = null) {
+  const data = isPlainObject(body?.data) ? body.data : body;
+  const userInfo = isPlainObject(data?.user_info) ? data.user_info : data?.userInfo;
+  const cookieHeader = firstDefined(
+    headerValue(headers, "set-cookie"),
+    data?.cookieHeader,
+    data?.cookie_header,
+    data?.session?.cookieHeader,
+    data?.session?.cookie_header,
+  );
+  const cookie = firstDefined(data?.cookie, data?.session?.cookie);
+  const cookieJar = firstDefined(data?.cookieJar, data?.cookie_jar, data?.session?.cookieJar, data?.session?.cookie_jar);
+  const session = firstDefined(data?.session && typeof data.session === "string" ? data.session : null, data?.session?.value);
+  const sessionToken = firstDefined(data?.sessionToken, data?.session_token, data?.session?.token);
+  const token = firstDefined(data?.token, data?.accessToken, data?.access_token);
+  const userId = firstDefined(data?.userId, data?.user_id, data?.user?.id, data?.account?.userId, userInfo?.id);
+  const accessTier = firstDefined(data?.accessTier, data?.access_tier, data?.tier, data?.user?.accessTier, data?.account?.accessTier, userInfo?.accessTier, userInfo?.access_tier, userInfo?.tier);
+  return {
+    ok: true,
+    source: "tabbit-auth-submit-code",
+    ...(cookieHeader ? { cookieHeader: String(cookieHeader) } : {}),
+    ...(cookie ? { cookie: String(cookie) } : {}),
+    ...(cookieJar ? { cookieJar } : {}),
+    ...(session ? { session: String(session) } : {}),
+    ...(sessionToken ? { sessionToken: String(sessionToken) } : {}),
+    ...(token ? { token: String(token) } : {}),
+    ...(userId ? { userId: String(userId) } : {}),
+    ...(accessTier ? { accessTier: String(accessTier) } : {}),
+    raw: body,
+  };
+}
+
 function resultFromError(error) {
   const classified = classifyProtocolError(error);
   return {
     ok: false,
+    category: classified.category,
+    code: classified.code,
+    message: classified.message,
+    retryable: classified.retryable,
+    cooldownMs: classified.cooldownMs,
+    httpStatus: classified.status,
     error: new ProtocolTabbitError(classified.message, classified),
   };
 }
 
 export class ProtocolTabbitClient {
   constructor({
-    baseUrl = DEFAULT_BASE_URL, signKeyPath = DEFAULT_SIGN_KEY_PATH, modelCatalogPath = DEFAULT_MODEL_CATALOG_PATH, modelCatalogScene = DEFAULT_MODEL_CATALOG_SCENE, sendPath = null, attachmentUploadPath = null, attachmentCompleteUploadPath = null, quotaUsagePath = null, activityLotteryPath = null, newbieExplorationPath = null, placementResourcesPath = null, rewardCardRecordsPath = null, lotteryHitRecordsPath = null, signInStatusPath = null, signInPath = null, benefitCouponListPath = null, activityParticipatePath = null, usageResetCouponSkuPath = null, lotteryAvailableChancesPath = null, lotteryActiveMainPoolsPath = null, lotteryChanceRecordsPath = null, lotteryDrawPath = null, sessionVerifyPath = null, sessionVerifyMethod = "GET",
+    baseUrl = DEFAULT_BASE_URL, signKeyPath = DEFAULT_SIGN_KEY_PATH, modelCatalogPath = DEFAULT_MODEL_CATALOG_PATH, modelCatalogScene = DEFAULT_MODEL_CATALOG_SCENE, sendPath = null, authSendCodePath = null, authSendCodeMethod = "POST", authSubmitCodePath = null, authSubmitCodeMethod = "POST", attachmentUploadPath = null, attachmentCompleteUploadPath = null, quotaUsagePath = null, activityLotteryPath = null, newbieExplorationPath = null, placementResourcesPath = null, rewardCardRecordsPath = null, lotteryHitRecordsPath = null, signInStatusPath = null, signInPath = null, benefitCouponListPath = null, benefitCouponUsePath = null, activityParticipatePath = null, usageResetCouponSkuPath = null, lotteryAvailableChancesPath = null, lotteryActiveMainPoolsPath = null, lotteryChanceRecordsPath = null, lotteryDrawPath = null, sessionVerifyPath = null, sessionVerifyMethod = "GET",
     reqCtx = DEFAULT_REQ_CTX, defaultChatSessionId = null,
-    fetch: fetchImpl = globalThis.fetch, now = () => Date.now(), nonce = () => randomUUID(), signature = null, uniqueUuid = null, signKeyTtlMs = 5 * 60_000, modelCatalogTtlMs = 5 * 60_000,
+    fetch: fetchImpl = globalThis.fetch, now = () => Date.now(), nonce = () => randomUUID(), signature = null, uniqueUuid = null, authClientUuid = null, signKeyTtlMs = 5 * 60_000, modelCatalogTtlMs = 5 * 60_000,
   } = {}) {
     if (typeof fetchImpl !== "function") throw new ProtocolTabbitError("fetch implementation is required", { category: "invalid_request", code: "MISSING_FETCH" });
     this.baseUrl = trimTrailingSlash(baseUrl);
@@ -1362,6 +1436,10 @@ export class ProtocolTabbitClient {
     this.modelCatalogPath = normalizePath(modelCatalogPath);
     this.modelCatalogScene = modelCatalogScene;
     this.sendPath = sendPath ? normalizePath(sendPath) : null;
+    this.authSendCodePath = authSendCodePath ? normalizePath(authSendCodePath) : null;
+    this.authSendCodeMethod = String(authSendCodeMethod || "POST").toUpperCase();
+    this.authSubmitCodePath = authSubmitCodePath ? normalizePath(authSubmitCodePath) : null;
+    this.authSubmitCodeMethod = String(authSubmitCodeMethod || "POST").toUpperCase();
     this.attachmentUploadPath = attachmentUploadPath ? normalizePath(attachmentUploadPath) : null;
     this.attachmentCompleteUploadPath = attachmentCompleteUploadPath ? normalizePath(attachmentCompleteUploadPath) : null;
     this.quotaUsagePath = quotaUsagePath ? normalizePath(quotaUsagePath) : null;
@@ -1373,6 +1451,7 @@ export class ProtocolTabbitClient {
     this.signInStatusPath = signInStatusPath ? normalizePath(signInStatusPath) : null;
     this.signInPath = signInPath ? normalizePath(signInPath) : null;
     this.benefitCouponListPath = benefitCouponListPath ? normalizePath(benefitCouponListPath) : null;
+    this.benefitCouponUsePath = benefitCouponUsePath ? normalizePath(benefitCouponUsePath) : null;
     this.activityParticipatePath = activityParticipatePath ? normalizePath(activityParticipatePath) : null;
     this.usageResetCouponSkuPath = usageResetCouponSkuPath ? normalizePath(usageResetCouponSkuPath) : null;
     this.lotteryAvailableChancesPath = lotteryAvailableChancesPath ? normalizePath(lotteryAvailableChancesPath) : null;
@@ -1383,8 +1462,8 @@ export class ProtocolTabbitClient {
     this.sessionVerifyMethod = String(sessionVerifyMethod || "GET").toUpperCase();
     this.reqCtx = reqCtx;
     this.defaultChatSessionId = defaultChatSessionId;
-    this.fetch = fetchImpl; this.now = now; this.nonce = nonce; this.signature = signature || nonce; this.uniqueUuid = uniqueUuid || (() => createUniqueUuid({ now: this.now })); this.signKeyTtlMs = signKeyTtlMs; this.modelCatalogTtlMs = modelCatalogTtlMs;
-    this.signKeyCache = null; this.modelCatalogCache = null;
+    this.fetch = fetchImpl; this.now = now; this.nonce = nonce; this.signature = signature || nonce; this.uniqueUuid = uniqueUuid || (() => createUniqueUuid({ now: this.now })); this.authClientUuid = typeof authClientUuid === "function" ? authClientUuid : (() => authClientUuid || createAuthClientUuid()); this.signKeyTtlMs = signKeyTtlMs; this.modelCatalogTtlMs = modelCatalogTtlMs;
+    this.signKeyCache = null; this.modelCatalogCache = null; this.cachedAuthClientUuid = null;
   }
 
   buildUrl(path, query = {}) {
@@ -1464,6 +1543,126 @@ export class ProtocolTabbitClient {
       return normalizeVerificationResponse(body);
     } catch (error) {
       return verificationFailure(error);
+    }
+  }
+
+  authJsonHeaders(bodyText, signKey) {
+    const timestamp = this.now();
+    return {
+      accept: "application/json",
+      "Content-Type": "application/json",
+      ...(this.reqCtx ? { "x-req-ctx": this.reqCtx } : {}),
+      "unique-uuid": this.uniqueUuid(),
+      ...createSignedHeaders({ bodyText, signKey, timestamp, signature: this.signature() }),
+    };
+  }
+
+  proxyOauthJsonHeaders() {
+    return {
+      accept: "application/json",
+      "Content-Type": "application/json",
+      ...(this.reqCtx ? { "x-req-ctx": this.reqCtx } : {}),
+      "unique-uuid": this.uniqueUuid(),
+    };
+  }
+
+  async postAuthJson({ path, method, body }) {
+    const bodyText = JSON.stringify(body);
+    const headers = usesProxyOauthProtocol(path)
+      ? this.proxyOauthJsonHeaders()
+      : this.authJsonHeaders(bodyText, await this.getSignKey());
+    const response = await this.fetch(this.buildUrl(path), {
+      method,
+      headers,
+      body: bodyText,
+    });
+    const responseBody = await parseBody(response);
+    if (!response.ok) return resultFromError(protocolResponseError(response, responseBody));
+    return { response, responseBody };
+  }
+
+  getAuthClientUuid(candidate = null) {
+    if (candidate !== null && candidate !== undefined && candidate !== "") return requireAuthClientUuid(candidate);
+    if (!this.cachedAuthClientUuid) this.cachedAuthClientUuid = requireAuthClientUuid(this.authClientUuid());
+    return this.cachedAuthClientUuid;
+  }
+
+  buildProxyOauthSendCodeBody({ mobile = null, uuid = null, input = {} } = {}) {
+    return {
+      uuid: this.getAuthClientUuid(firstDefined(uuid, input?.uuid, input?.authClientUuid)),
+      platform: "1",
+      version: "",
+      app: "1000",
+      mobile: requireNonEmptyString(firstDefined(mobile, input?.mobile, input?.phoneNumber, input?.phone_number), "mobile", "MISSING_MOBILE"),
+    };
+  }
+
+  buildProxyOauthSubmitBody({ mobile = null, code = null, uuid = null, input = {} } = {}) {
+    const body = {
+      ...this.buildProxyOauthSendCodeBody({ mobile, uuid, input }),
+      smsCode: requireNonEmptyString(firstDefined(code, input?.code, input?.smsCode), "code", "MISSING_VERIFICATION_CODE"),
+    };
+    const channel = firstDefined(input?.channel, input?.tabChannel);
+    if (channel !== undefined && channel !== null && String(channel).trim()) body.channel = String(channel).trim();
+    return body;
+  }
+
+  async sendVerificationCode({ email = null, mobile = null, uuid = null, body = null, input = {} } = {}) {
+    try {
+      requireConfiguredPath(
+        this.authSendCodePath,
+        "MISSING_AUTH_SEND_CODE_PATH",
+        "Tabbit auth send-code endpoint is not configured.",
+      );
+      const requestBody = body !== null && body !== undefined
+        ? requirePlainObjectInput(body, "body", "INVALID_AUTH_SEND_CODE_BODY")
+        : (isPlainObject(input?.authSendCodeBody)
+            ? input.authSendCodeBody
+            : (usesProxyOauthProtocol(this.authSendCodePath)
+                ? this.buildProxyOauthSendCodeBody({ mobile, uuid, input })
+                : { email: requireNonEmptyString(firstDefined(email, input?.email), "email", "MISSING_EMAIL") }));
+      const result = await this.postAuthJson({
+        path: this.authSendCodePath,
+        method: this.authSendCodeMethod,
+        body: requestBody,
+      });
+      if (result.ok === false) return result;
+      return {
+        ok: true,
+        source: "tabbit-auth-send-code",
+        raw: result.responseBody,
+      };
+    } catch (error) {
+      return resultFromError(error);
+    }
+  }
+
+  async submitRegistrationOrLogin({ email = null, mobile = null, uuid = null, code = null, body = null, input = {} } = {}) {
+    try {
+      requireConfiguredPath(
+        this.authSubmitCodePath,
+        "MISSING_AUTH_SUBMIT_CODE_PATH",
+        "Tabbit auth submit-code endpoint is not configured.",
+      );
+      const requestBody = body !== null && body !== undefined
+        ? requirePlainObjectInput(body, "body", "INVALID_AUTH_SUBMIT_CODE_BODY")
+        : (isPlainObject(input?.authSubmitCodeBody)
+            ? input.authSubmitCodeBody
+            : (usesProxyOauthProtocol(this.authSubmitCodePath)
+                ? this.buildProxyOauthSubmitBody({ mobile, uuid, code, input })
+                : {
+                    email: requireNonEmptyString(firstDefined(email, input?.email), "email", "MISSING_EMAIL"),
+                    code: requireNonEmptyString(firstDefined(code, input?.code), "code", "MISSING_VERIFICATION_CODE"),
+                  }));
+      const result = await this.postAuthJson({
+        path: this.authSubmitCodePath,
+        method: this.authSubmitCodeMethod,
+        body: requestBody,
+      });
+      if (result.ok === false) return result;
+      return normalizeAuthSubmitResponse(result.responseBody, result.response.headers);
+    } catch (error) {
+      return resultFromError(error);
     }
   }
 
@@ -1838,6 +2037,48 @@ export class ProtocolTabbitClient {
     const responseBody = await parseBody(response);
     if (!response.ok) throw protocolResponseError(response, responseBody);
     return normalizeCommerceObjectResponse(responseBody, "tabbit-reset-coupon-activity-participate", "reset coupon activity participate");
+  }
+
+  async useResetCoupon({
+    account = {},
+    userId = null,
+    couponCode = null,
+    couponType = WEEKLY_RESET_COUPON_TYPE,
+    requestNo = null,
+    confirmSideEffect = false,
+  } = {}) {
+    requireSideEffectConfirmation(confirmSideEffect);
+    requireConfiguredPath(
+      this.benefitCouponUsePath,
+      "MISSING_BENEFIT_COUPON_USE_PATH",
+      "Tabbit benefit coupon use endpoint is not configured.",
+    );
+    const finalUserId = requireUserId({ account, userId, purpose: "reset coupon use" });
+    const cookie = requireSessionCookie(account, "reset coupon use");
+    const body = {
+      user_id: finalUserId,
+      coupon_code: requireNonEmptyString(couponCode, "couponCode", "MISSING_COUPON_CODE"),
+      coupon_type: requireNonEmptyString(couponType, "couponType", "MISSING_COUPON_TYPE"),
+      request_no: requireRequestNo(requestNo),
+    };
+    const response = await this.fetch(this.buildUrl(this.benefitCouponUsePath), {
+      method: "POST",
+      headers: this.commerceContextJsonHeaders(cookie),
+      body: JSON.stringify(body),
+    });
+    const responseBody = await parseBody(response);
+    if (!response.ok) throw protocolResponseError(response, responseBody);
+    return {
+      ...normalizeCommerceObjectResponse(responseBody, "tabbit-reset-coupon-use", "reset coupon use"),
+      evidence: {
+        endpointHash: sha256Evidence(this.benefitCouponUsePath),
+        bodyHash: sha256Evidence(body),
+        resultHash: sha256Evidence(responseBody),
+        safe: true,
+        sanitized: true,
+        rawPayload: false,
+      },
+    };
   }
 
   async participateActivity({

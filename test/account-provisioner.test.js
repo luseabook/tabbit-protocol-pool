@@ -194,6 +194,81 @@ test("createAccount keeps provisioning account and redacts timeout errors", asyn
   assert.equal(accountStore.accounts[0].lastError.code, "MAIL_TIMEOUT");
 });
 
+test("createAccount treats ok:false protocol auth results as failed stages", async () => {
+  const sendEvents = [];
+  const sendStore = memoryAccountStore([], sendEvents);
+  const sendProvisioner = new AccountProvisioner(provisionerOptions({
+    events: sendEvents,
+    accountStore: sendStore,
+    secretStore: memorySecretStore(sendEvents),
+    mailProvider: {
+      async createInbox() {
+        return { id: "inbox_send_missing", address: "send-missing@example.test" };
+      },
+      async waitForVerificationCode() {
+        throw new Error("waitForVerificationCode should not run");
+      },
+    },
+    protocolClient: {
+      async sendVerificationCode() {
+        return {
+          ok: false,
+          error: Object.assign(new Error("auth send endpoint is not configured"), {
+            code: "MISSING_AUTH_SEND_CODE_PATH",
+            category: "protocol_missing",
+          }),
+        };
+      },
+    },
+  }));
+
+  const sendResult = await sendProvisioner.createAccount();
+
+  assert.equal(sendResult.account.status, "provisioning");
+  assert.equal(sendResult.actions.at(-1).name, "sendVerificationCode");
+  assert.equal(sendResult.actions.at(-1).status, "failed");
+  assert.equal(sendResult.actions.at(-1).error.code, "MISSING_AUTH_SEND_CODE_PATH");
+  assert.equal(sendStore.accounts[0].lastError.stage, "sendVerificationCode");
+
+  const submitEvents = [];
+  const submitStore = memoryAccountStore([], submitEvents);
+  const submitProvisioner = new AccountProvisioner(provisionerOptions({
+    events: submitEvents,
+    accountStore: submitStore,
+    secretStore: memorySecretStore(submitEvents),
+    mailProvider: {
+      async createInbox() {
+        return { id: "inbox_submit_missing", address: "submit-missing@example.test" };
+      },
+      async waitForVerificationCode() {
+        return { code: "CODE-PLACEHOLDER" };
+      },
+    },
+    protocolClient: {
+      async sendVerificationCode() {
+        return { ok: true };
+      },
+      async submitRegistrationOrLogin() {
+        return {
+          ok: false,
+          error: Object.assign(new Error("auth submit endpoint is not configured"), {
+            code: "MISSING_AUTH_SUBMIT_CODE_PATH",
+            category: "protocol_missing",
+          }),
+        };
+      },
+    },
+  }));
+
+  const submitResult = await submitProvisioner.createAccount();
+
+  assert.equal(submitResult.account.status, "provisioning");
+  assert.equal(submitResult.actions.at(-1).name, "submitRegistrationOrLogin");
+  assert.equal(submitResult.actions.at(-1).status, "failed");
+  assert.equal(submitResult.actions.at(-1).error.code, "MISSING_AUTH_SUBMIT_CODE_PATH");
+  assert.equal(submitStore.accounts[0].lastError.stage, "submitRegistrationOrLogin");
+});
+
 test("createAccount marks suspect when registration succeeds without session material", async () => {
   const events = [];
   const accountStore = memoryAccountStore([], events);

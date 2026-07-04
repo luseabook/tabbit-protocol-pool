@@ -123,6 +123,81 @@ test("local_executes_tools returns invalid_request when no local executor is con
   assert.equal(result.error.code, "LOCAL_TOOL_EXECUTOR_MISSING");
 });
 
+test("local_executes_tools rejects tool definitions outside the configured allowlist", async () => {
+  let baseCalled = false;
+  let executorCalled = false;
+  const runner = new LocalToolLoopRunner({
+    runner: {
+      async run() {
+        baseCalled = true;
+        throw new Error("base runner should not be called");
+      },
+    },
+    mode: "local_executes_tools",
+    allowedToolNames: ["lookup_weather"],
+    executeToolUse: async () => {
+      executorCalled = true;
+      return "unused";
+    },
+  });
+
+  const result = await runner.run({
+    model: "tabbit/priority",
+    messages: [{ role: "user", content: "delete something" }],
+    tools: [{
+      type: "function",
+      function: {
+        name: "delete_file",
+        parameters: { type: "object" },
+      },
+    }],
+    toolChoice: "auto",
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.category, "invalid_request");
+  assert.equal(result.error.code, "LOCAL_TOOL_NOT_ALLOWED");
+  assert.equal(baseCalled, false);
+  assert.equal(executorCalled, false);
+});
+
+test("local_executes_tools times out slow injected tools", async () => {
+  const runner = new LocalToolLoopRunner({
+    runner: {
+      async run() {
+        return {
+          ok: true,
+          contentBlocks: [{
+            type: "text",
+            text: JSON.stringify({
+              type: "tool_use",
+              id: "call_weather",
+              name: "lookup_weather",
+              input: { city: "Shanghai" },
+            }),
+          }],
+        };
+      },
+    },
+    mode: "local_executes_tools",
+    toolTimeoutMs: 5,
+    executeToolUse: async () => new Promise(() => {}),
+  });
+
+  const startedAt = Date.now();
+  const result = await runner.run({
+    model: "tabbit/priority",
+    messages: [{ role: "user", content: "weather?" }],
+    tools,
+    toolChoice: "auto",
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.category, "timeout");
+  assert.equal(result.error.code, "LOCAL_TOOL_TIMEOUT");
+  assert.ok(Date.now() - startedAt < 500);
+});
+
 test("client_executes_tools_first keeps existing native tool pass-through behavior", async () => {
   const calls = [];
   const runner = new LocalToolLoopRunner({

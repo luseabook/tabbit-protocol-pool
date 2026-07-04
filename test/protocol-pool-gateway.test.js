@@ -316,6 +316,116 @@ test("gateway local tool loop mode executes injected tools without native protoc
   });
 });
 
+test("gateway local tool loop applies env guardrails across Chat Responses and Anthropic", async () => {
+  const stateDir = await tempStateDir();
+  await writeAccounts(stateDir, [{
+    id: "acct_guarded_tools",
+    status: "active",
+    accessTier: "unknown",
+  }]);
+  const sendCalls = [];
+  const toolCalls = [];
+
+  const gateway = await createProtocolPoolGateway({
+    env: {
+      TABBIT_POOL_STATE_DIR: stateDir,
+      TABBIT_POOL_API_KEY: "sk-tabbit-local",
+      TABBIT_POOL_RETRY_LIMIT: "0",
+      TABBIT_POOL_TOOL_LOOP_MODE: "local_executes_tools",
+      TABBIT_POOL_LOCAL_TOOL_ALLOWLIST: "lookup",
+      TABBIT_POOL_LOCAL_TOOL_MAX_ROUNDS: "2",
+      TABBIT_POOL_LOCAL_TOOL_TIMEOUT_MS: "100",
+      TABBIT_POOL_LOCAL_TOOL_MAX_RESULT_CHARS: "8",
+    },
+    idFactory: (kind) => `${kind}_guarded_tool_loop`,
+    protocolClientFactory: () => ({
+      async sendMessage(input) {
+        sendCalls.push(input);
+        const hasToolResult = input.messages.some((message) => message.role === "tool");
+        if (!hasToolResult) {
+          return {
+            ok: true,
+            contentBlocks: [{
+              type: "text",
+              text: JSON.stringify({
+                type: "tool_use",
+                id: `call_${sendCalls.length}`,
+                name: "lookup",
+                input: { query: "tabbit" },
+              }),
+            }],
+            selectedModel: input.model,
+          };
+        }
+        return {
+          ok: true,
+          contentBlocks: [{ type: "text", text: "guarded loop accepted" }],
+          selectedModel: input.model,
+        };
+      },
+    }),
+    localToolExecutor: {
+      async execute(call) {
+        toolCalls.push(call);
+        return "0123456789abcdef";
+      },
+    },
+  });
+
+  await withServer(gateway.server, async (baseUrl) => {
+    const chat = await requestJson(baseUrl, "/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: "Bearer sk-tabbit-local", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "tabbit/priority",
+        messages: [{ role: "user", content: "lookup tabbit" }],
+        tools: [{ type: "function", function: { name: "lookup", parameters: { type: "object" } } }],
+        tool_choice: "auto",
+      }),
+    });
+    const responses = await requestJson(baseUrl, "/v1/responses", {
+      method: "POST",
+      headers: { Authorization: "Bearer sk-tabbit-local", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "tabbit/priority",
+        input: "lookup tabbit",
+        tools: [{ type: "function", name: "lookup", parameters: { type: "object" } }],
+        tool_choice: "auto",
+      }),
+    });
+    const anthropic = await requestJson(baseUrl, "/v1/messages", {
+      method: "POST",
+      headers: { "x-api-key": "sk-tabbit-local", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "tabbit/priority",
+        messages: [{ role: "user", content: "lookup tabbit" }],
+        tools: [{ name: "lookup", input_schema: { type: "object" } }],
+        tool_choice: { type: "auto" },
+      }),
+    });
+
+    assert.equal(chat.status, 200);
+    assert.equal(chat.body.choices[0].message.content, "guarded loop accepted");
+    assert.equal(responses.status, 200);
+    assert.equal(responses.body.output_text, "guarded loop accepted");
+    assert.equal(anthropic.status, 200);
+    assert.deepEqual(anthropic.body.content, [{ type: "text", text: "guarded loop accepted" }]);
+  });
+
+  assert.equal(sendCalls.length, 6);
+  for (const call of sendCalls) {
+    assert.equal(call.tools, null);
+    assert.equal(call.toolChoice, null);
+    assert.equal(call.parallelToolCalls, null);
+  }
+  assert.deepEqual(toolCalls.map((call) => call.name), ["lookup", "lookup", "lookup"]);
+  assert.deepEqual(sendCalls.filter((call) => call.messages.some((message) => message.role === "tool")).map((call) => call.messages.at(-1).content), [
+    "01234567\n...[truncated]",
+    "01234567\n...[truncated]",
+    "01234567\n...[truncated]",
+  ]);
+});
+
 test("gateway default protocol client uses explicit protocol env sendPath", async () => {
   const stateDir = await tempStateDir();
   await writeAccounts(stateDir, [{
@@ -377,7 +487,7 @@ test("gateway default protocol client wires restored chat completion env options
     cookieJarRef: "secrets/acct_real_protocol_env.cookie",
   }]);
   await mkdir(join(stateDir, "secrets"), { recursive: true });
-  await writeFile(join(stateDir, "secrets", "acct_real_protocol_env.cookie"), "tabbit_session=real-protocol-env", "utf8");
+  await writeFile(join(stateDir, "secrets", "acct_real_protocol_env.cookie"), "tabbit_session=rpe", "utf8");
   const calls = [];
 
   const gateway = await createProtocolPoolGateway({
@@ -431,7 +541,7 @@ test("gateway default protocol client wires restored chat completion env options
   assert.equal(calls.length, 2);
   assert.equal(calls[0].url, "https://web.tabbit.ai/chat/sign-key");
   assert.equal(calls[1].url, "https://web.tabbit.ai/api/v1/chat/completion");
-  assert.equal(calls[1].options.headers.Cookie, "tabbit_session=real-protocol-env");
+  assert.equal(calls[1].options.headers.Cookie, "tabbit_session=rpe");
   assert.equal(calls[1].options.headers["x-req-ctx"], "ctx-from-env");
   assert.equal(calls[1].options.headers["unique-uuid"], "660001aa-2222-3333-4444-555555555555");
   assert.equal(JSON.parse(calls[1].options.body).chat_session_id, "session_from_env");
@@ -486,7 +596,7 @@ test("gateway chat completions auto uploads raw attachments through configured C
     cookieJarRef: "secrets/acct_raw_upload.cookie",
   }]);
   await mkdir(join(stateDir, "secrets"), { recursive: true });
-  await writeFile(join(stateDir, "secrets", "acct_raw_upload.cookie"), "tabbit_session=protocol-raw-upload", "utf8");
+  await writeFile(join(stateDir, "secrets", "acct_raw_upload.cookie"), "tabbit_session=raw");
   const calls = [];
 
   const gateway = await createProtocolPoolGateway({
@@ -561,7 +671,7 @@ test("gateway chat completions auto uploads raw attachments through configured C
     "/chat/sign-key",
     "/api/v1/chat/completion",
   ]);
-  assert.equal(calls[0].options.headers.Cookie, "tabbit_session=protocol-raw-upload");
+  assert.equal(calls[0].options.headers.Cookie, "tabbit_session=raw");
   assert.deepEqual(JSON.parse(calls[0].options.body), {
     file_category: "document",
     original_filename: "gateway-notes.txt",
@@ -622,7 +732,7 @@ test("gateway protocol client refreshQuota uses explicit quota path with hydrate
 test("gateway protocol client wires read-only benefits paths with hydrated cookies", async () => {
   const stateDir = await tempStateDir();
   await mkdir(join(stateDir, "secrets"), { recursive: true });
-  await writeFile(join(stateDir, "secrets", "acct_benefits.cookie"), "tabbit_session=protocol-benefits", "utf8");
+  await writeFile(join(stateDir, "secrets", "acct_benefits.cookie"), "tabbit_session=ben", "utf8");
   const calls = [];
 
   const gateway = await createProtocolPoolGateway({
@@ -633,6 +743,7 @@ test("gateway protocol client wires read-only benefits paths with hydrated cooki
       TABBIT_POOL_PROTOCOL_PLACEMENT_RESOURCES_PATH: "/api/commerce/placement/v1/resources",
       TABBIT_POOL_PROTOCOL_SIGN_IN_STATUS_PATH: "/api/commerce/activity/v1/sign-in/status",
       TABBIT_POOL_PROTOCOL_BENEFIT_COUPON_LIST_PATH: "/api/commerce/benefit/v1/coupon/list",
+      TABBIT_POOL_PROTOCOL_BENEFIT_COUPON_USE_PATH: "/api/commerce/benefit/v1/coupon/use",
     },
     now: () => NOW,
     protocolClientOptions: {
@@ -653,6 +764,9 @@ test("gateway protocol client wires read-only benefits paths with hydrated cooki
           results: [{ scene_code: "desktop_pet", signed_today: false }],
         }, { headers: { "content-type": "application/json" } });
       }
+      if (url.includes("/coupon/use")) {
+        return jsonResponse({ coupon_result: "success", used: true }, { headers: { "content-type": "application/json" } });
+      }
       return jsonResponse({ total: 0, records: [] }, { headers: { "content-type": "application/json" } });
     },
   });
@@ -667,23 +781,38 @@ test("gateway protocol client wires read-only benefits paths with hydrated cooki
   const placement = await client.getPlacementResources({ placementCode: "home.input_below" });
   const signIn = await client.getDailySignInStatus({ sceneCodes: ["desktop_pet"] });
   const coupons = await client.listBenefitCoupons({ limit: 50 });
+  const useCoupon = await client.useResetCoupon({
+    couponCode: "coupon-code",
+    couponType: "weekly_reset_coupon",
+    requestNo: "reset-coupon-use-probe",
+    confirmSideEffect: true,
+  });
 
   assert.equal(newbie.ok, true);
   assert.equal(reward.ok, true);
   assert.equal(placement.ok, true);
   assert.equal(signIn.ok, true);
   assert.equal(coupons.ok, true);
-  assert.equal(calls.length, 5);
+  assert.equal(useCoupon.ok, true);
+  assert.equal(calls.length, 6);
   assert.equal(calls[0].url, "https://web.tabbit.ai/api/commerce/activity/v1/newbie-exploration/me?view_mode=activity_page&include_completions=true&include_rewards=true");
   assert.equal(calls[1].url, "https://web.tabbit.ai/api/commerce/reward/v1/card-records?user_id=user_gateway_benefits&offset=0&limit=10&order.field=award_time&order.order=desc");
   assert.equal(calls[2].url, "https://web.tabbit.ai/api/commerce/placement/v1/resources?placement_code=home.input_below");
   assert.equal(calls[3].url, "https://web.tabbit.ai/api/commerce/activity/v1/sign-in/status?scene_codes=desktop_pet");
   assert.equal(calls[4].url, "https://web.tabbit.ai/api/commerce/benefit/v1/coupon/list?user_id=user_gateway_benefits&coupon_type=weekly_reset_coupon&offset=0&limit=50");
-  assert.equal(calls[0].options.headers.Cookie, "tabbit_session=protocol-benefits");
-  assert.equal(calls[1].options.headers.Cookie, "tabbit_session=protocol-benefits");
-  assert.equal(calls[2].options.headers.Cookie, "tabbit_session=protocol-benefits");
-  assert.equal(calls[3].options.headers.Cookie, "tabbit_session=protocol-benefits");
-  assert.equal(calls[4].options.headers.Cookie, "tabbit_session=protocol-benefits");
+  assert.equal(calls[5].url, "https://web.tabbit.ai/api/commerce/benefit/v1/coupon/use");
+  assert.equal(calls[0].options.headers.Cookie, "tabbit_session=ben");
+  assert.equal(calls[1].options.headers.Cookie, "tabbit_session=ben");
+  assert.equal(calls[2].options.headers.Cookie, "tabbit_session=ben");
+  assert.equal(calls[3].options.headers.Cookie, "tabbit_session=ben");
+  assert.equal(calls[4].options.headers.Cookie, "tabbit_session=ben");
+  assert.equal(calls[5].options.headers.Cookie, "tabbit_session=ben");
+  assert.deepEqual(JSON.parse(calls[5].options.body), {
+    user_id: "user_gateway_benefits",
+    coupon_code: "coupon-code",
+    coupon_type: "weekly_reset_coupon",
+    request_no: "reset-coupon-use-probe",
+  });
 });
 
 test("gateway stream preserves configured protocol SSE text deltas as separate OpenAI chat chunks", async () => {
@@ -759,7 +888,7 @@ test("gateway streams configured protocol SSE body before upstream completion", 
     cookieJarRef: "secrets/acct_protocol_async_stream.cookie",
   }]);
   await mkdir(join(stateDir, "secrets"), { recursive: true });
-  await writeFile(join(stateDir, "secrets", "acct_protocol_async_stream.cookie"), "tabbit_session=protocol-async-stream", "utf8");
+  await writeFile(join(stateDir, "secrets", "acct_protocol_async_stream.cookie"), "tabbit_session=str", "utf8");
   const calls = [];
 
   const gateway = await createProtocolPoolGateway({
@@ -823,7 +952,7 @@ test("gateway streams configured protocol SSE body before upstream completion", 
 
   assert.equal(calls.length, 2);
   assert.equal(calls[1].url, "https://web.tabbit.ai/chat/send");
-  assert.equal(calls[1].options.headers.Cookie, "tabbit_session=protocol-async-stream");
+  assert.equal(calls[1].options.headers.Cookie, "tabbit_session=str");
 });
 
 test("gateway default models provider uses explicit protocol env model catalog path", async () => {
@@ -1030,6 +1159,46 @@ test("secret hydrating protocol factory forwards verifySession with stored sessi
   assert.deepEqual(calls, [
     ["readSecret", "secrets/acct_a.cookie"],
     ["verifySession", "acct_a", "tabbit_session=hydrated", "tabbit_session=hydrated"],
+  ]);
+});
+
+test("secret hydrating protocol factory forwards auth registration operations", async () => {
+  const calls = [];
+  const secretStore = {
+    async readSecret(ref) {
+      calls.push(["readSecret", ref]);
+      return "tabbit_session=hydrated-auth";
+    },
+  };
+  const factory = createSecretHydratingProtocolClientFactory((account) => ({
+    async sendVerificationCode(input) {
+      calls.push(["sendVerificationCode", account.id, input.account.cookieHeader, input.email]);
+      return { ok: true };
+    },
+    async submitRegistrationOrLogin(input) {
+      calls.push(["submitRegistrationOrLogin", account.id, input.account.cookieHeader, input.email, input.code]);
+      return { ok: true, cookieHeader: "tabbit_session=new-placeholder", userId: "user_auth" };
+    },
+  }), secretStore);
+
+  const client = factory({ id: "acct_auth", cookieJarRef: "secrets/acct_auth.cookie" });
+  const send = await client.sendVerificationCode({
+    account: { id: "acct_auth", cookieJarRef: "secrets/acct_auth.cookie" },
+    email: "new-user@example.test",
+  });
+  const submit = await client.submitRegistrationOrLogin({
+    account: { id: "acct_auth", cookieJarRef: "secrets/acct_auth.cookie" },
+    email: "new-user@example.test",
+    code: "CODE-PLACEHOLDER",
+  });
+
+  assert.equal(send.ok, true);
+  assert.equal(submit.ok, true);
+  assert.deepEqual(calls, [
+    ["readSecret", "secrets/acct_auth.cookie"],
+    ["sendVerificationCode", "acct_auth", "tabbit_session=hydrated-auth", "new-user@example.test"],
+    ["readSecret", "secrets/acct_auth.cookie"],
+    ["submitRegistrationOrLogin", "acct_auth", "tabbit_session=hydrated-auth", "new-user@example.test", "CODE-PLACEHOLDER"],
   ]);
 });
 
