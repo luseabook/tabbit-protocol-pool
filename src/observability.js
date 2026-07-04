@@ -266,6 +266,74 @@ function combinedDoctorStatus(readinessStatus, fixtureAuditStatus) {
   return "partial";
 }
 
+const MANUAL_COOKIE_MODE = "manual_reimport_then_probe";
+const MANUAL_COOKIE_EXPIRED_SESSION_ACTION = "login_expired_then_manual_reimport";
+const AUTOMATED_SESSION_REFRESH_STRATEGY_MISSING = "automated_session_refresh_strategy";
+
+function buildManualCookieOperationsStatus({
+  successfulVerifySession = 0,
+  expiredVerifySession = 0,
+  automatedRefreshReady = false,
+} = {}) {
+  const missing = [];
+  if (successfulVerifySession <= 0) missing.push("successful_verifySession_fixture");
+  if (expiredVerifySession <= 0) missing.push("expired_verifySession_fixture");
+  const backlogMissing = automatedRefreshReady ? [] : [AUTOMATED_SESSION_REFRESH_STRATEGY_MISSING];
+  const nextActions = [];
+  if (missing.includes("successful_verifySession_fixture")) {
+    nextActions.push("Run probe protocol --operation verifySession --write-fixture and keep a sanitized success fixture.");
+  }
+  if (missing.includes("expired_verifySession_fixture")) {
+    nextActions.push("After a session expires, run read-only probe protocol --operation verifySession --write-fixture and keep a sanitized 401/login_required fixture.");
+  }
+  return {
+    status: missing.length ? "blocked" : "ready",
+    mode: MANUAL_COOKIE_MODE,
+    expiredSessionAction: MANUAL_COOKIE_EXPIRED_SESSION_ACTION,
+    automatedRefreshRequired: false,
+    automatedRefreshBacklog: AUTOMATED_SESSION_REFRESH_STRATEGY_MISSING,
+    missing,
+    blockingMissing: [...missing],
+    backlogMissing,
+    nextActions,
+  };
+}
+
+function readinessMissingNames(readiness = {}) {
+  const checks = readiness?.checks && typeof readiness.checks === "object" ? readiness.checks : {};
+  return uniqueStrings(Object.values(checks).flatMap((check = {}) => Array.isArray(check.missing) ? check.missing : []));
+}
+
+function buildManualCookieMode({ readiness = {}, fixtureAudit = {}, sessionAudit = {} } = {}) {
+  const manualCookieOperations = sessionAudit.manualCookieOperations || {};
+  const missing = uniqueStrings([
+    ...readinessMissingNames(readiness),
+    ...(Array.isArray(fixtureAudit.missing) ? fixtureAudit.missing : []),
+    ...(Array.isArray(manualCookieOperations.missing) ? manualCookieOperations.missing : []),
+  ]).filter((item) => item !== AUTOMATED_SESSION_REFRESH_STRATEGY_MISSING);
+  const recoveryReady = sessionAudit?.recoveryStrategy?.status === "ready";
+  const backlogMissing = recoveryReady ? [] : [AUTOMATED_SESSION_REFRESH_STRATEGY_MISSING];
+  return {
+    status: missing.length ? "blocked" : "ready",
+    mode: MANUAL_COOKIE_MODE,
+    releaseTarget: "manual_cookie_operations",
+    expiredSessionAction: MANUAL_COOKIE_EXPIRED_SESSION_ACTION,
+    missing,
+    blockingMissing: [...missing],
+    backlogMissing,
+    nextActions: uniqueStrings([
+      ...(Array.isArray(readiness.nextActions) ? readiness.nextActions : []),
+      ...(Array.isArray(fixtureAudit.nextActions) ? fixtureAudit.nextActions : []),
+      ...(Array.isArray(manualCookieOperations.nextActions) ? manualCookieOperations.nextActions : []),
+    ]),
+    automatedSessionRefresh: {
+      status: recoveryReady ? "ready" : "backlog",
+      requiredForCurrentRelease: false,
+      missing: backlogMissing,
+    },
+  };
+}
+
 function protocolDoctorSummary(config = {}) {
   const protocol = config?.protocol || {};
   const compat = config?.compat || {};
@@ -291,13 +359,28 @@ function readinessDoctorCommands(stateDir) {
     benefitsFixturesAudit: "node bin\\tabbit-pool.js fixtures audit --scope benefits --json",
     sessionFixturesAudit: "node bin\\tabbit-pool.js fixtures audit --scope session --json",
     upstreamFixturesAudit: "node bin\\tabbit-pool.js fixtures audit --scope upstream --json",
+    accountPreflightReadOnly: "node bin\\tabbit-pool.js accounts probe <account-id> --read-only --json",
+    codexE2EMark: "node bin\\tabbit-pool.js readiness mark --codex-verified --json",
+    claudeE2EMark: "node bin\\tabbit-pool.js readiness mark --claude-verified --json",
+    combinedE2EMark: "node bin\\tabbit-pool.js readiness mark --codex-verified --claude-verified --json",
     serveGateway: "node bin\\tabbit-pool.js serve --host 127.0.0.1 --port 50124",
   };
 }
 
-function probeTemplateCommand(operation) {
+const DEFAULT_CAPTURE_STREAM_EVIDENCE_DELTAS = 2;
+const SEND_MESSAGE_REVIEW_REQUIREMENT = "replace_redacted_message_content";
+
+function probeTemplateCommand(operation, recommendedInput = null) {
   if (!operation) return null;
-  return "node bin\\tabbit-pool.js probe template --operation " + operation + " --json";
+  const streamEvidence = recommendedInput?.streamEvidence;
+  const streamEvidenceArgs = streamEvidence?.mode
+    ? " --stream-evidence "
+      + streamEvidence.mode
+      + (Number.isInteger(streamEvidence.maxDeltas) && streamEvidence.maxDeltas !== DEFAULT_CAPTURE_STREAM_EVIDENCE_DELTAS
+        ? " --max-deltas " + streamEvidence.maxDeltas
+        : "")
+    : "";
+  return "node bin\\tabbit-pool.js probe template --operation " + operation + streamEvidenceArgs + " --json";
 }
 
 function probeValidateCommand(operation) {
@@ -404,6 +487,45 @@ const CALIBRATION_CAPTURE_SPECS = {
     }],
     reason: "Generate a redacted lottery draw input file from the template and only run it for an account with a disposable lottery chance.",
   },
+  successful_sendMessage_fixture: {
+    scope: "protocol",
+    operation: "sendMessage",
+    sideEffect: false,
+    prerequisites: [{
+      name: "protocol_send_endpoint",
+      env: "TABBIT_POOL_PROTOCOL_SEND_PATH",
+      protocolKey: "sendPath",
+    }],
+    reason: "Generate a redacted sendMessage input file and keep the sanitized success fixture after a real Tabbit response.",
+  },
+  streaming_text_fixture: {
+    scope: "protocol",
+    operation: "sendMessage",
+    sideEffect: false,
+    recommendedInput: {
+      stream: true,
+    },
+    prerequisites: [{
+      name: "protocol_send_endpoint",
+      env: "TABBIT_POOL_PROTOCOL_SEND_PATH",
+      protocolKey: "sendPath",
+    }],
+    reason: "Generate a redacted stream:true sendMessage input file and keep the sanitized SSE or NDJSON text fixture after a real Tabbit stream.",
+  },
+  tool_call_fixture: {
+    scope: "protocol",
+    operation: "sendMessage",
+    sideEffect: false,
+    recommendedInput: {
+      toolEvidence: "tool_call_or_unsupported_native_tool",
+    },
+    prerequisites: [{
+      name: "protocol_send_endpoint",
+      env: "TABBIT_POOL_PROTOCOL_SEND_PATH",
+      protocolKey: "sendPath",
+    }],
+    reason: "Capture a sanitized tool-call fixture or a sanitized unsupported-native-tool fixture; this does not claim Tabbit native tool fields are supported.",
+  },
   successful_verifySession_fixture: {
     scope: "session",
     operation: "verifySession",
@@ -414,6 +536,17 @@ const CALIBRATION_CAPTURE_SPECS = {
       protocolKey: "sessionVerifyPath",
     }],
     reason: "Run a read-only verifySession probe and keep the sanitized success fixture.",
+  },
+  forbidden_403_fixture: {
+    scope: "protocol",
+    operation: "verifySession",
+    sideEffect: false,
+    prerequisites: [{
+      name: "session_verify_endpoint",
+      env: "TABBIT_POOL_PROTOCOL_SESSION_VERIFY_PATH",
+      protocolKey: "sessionVerifyPath",
+    }],
+    reason: "Run a read-only verifySession probe only after safety review, and keep the sanitizer output only if it classifies a real 403/forbidden response.",
   },
   expired_verifySession_fixture: {
     scope: "session",
@@ -437,6 +570,10 @@ const CALIBRATION_CAPTURE_SPECS = {
     scope: "upstream",
     operation: "sendMessage",
     sideEffect: false,
+    recommendedInput: {
+      stream: true,
+      streamEvidence: { mode: "error_frame", maxDeltas: 2 },
+    },
     prerequisites: [{
       name: "protocol_send_endpoint",
       env: "TABBIT_POOL_PROTOCOL_SEND_PATH",
@@ -448,6 +585,10 @@ const CALIBRATION_CAPTURE_SPECS = {
     scope: "upstream",
     operation: "sendMessage",
     sideEffect: false,
+    recommendedInput: {
+      stream: true,
+      streamEvidence: { mode: "cancel_after_first_delta", maxDeltas: 2 },
+    },
     prerequisites: [{
       name: "protocol_send_endpoint",
       env: "TABBIT_POOL_PROTOCOL_SEND_PATH",
@@ -459,6 +600,10 @@ const CALIBRATION_CAPTURE_SPECS = {
     scope: "upstream",
     operation: "sendMessage",
     sideEffect: false,
+    recommendedInput: {
+      stream: true,
+      streamEvidence: { mode: "first_token_backpressure", maxDeltas: 2 },
+    },
     prerequisites: [{
       name: "protocol_send_endpoint",
       env: "TABBIT_POOL_PROTOCOL_SEND_PATH",
@@ -480,16 +625,22 @@ function captureCommandForMissing(missingName, config = {}) {
   const spec = CALIBRATION_CAPTURE_SPECS[missingName];
   if (!spec) return null;
   const prerequisites = capturePrerequisitesForSpec(spec, config);
+  const requiresReviewedInput = spec.operation === "sendMessage";
   return {
     missing: missingName,
     scope: spec.scope,
     operation: spec.operation,
     sideEffect: Boolean(spec.sideEffect),
-    templateCommand: probeTemplateCommand(spec.operation),
+    templateCommand: probeTemplateCommand(spec.operation, spec.recommendedInput),
     validateCommand: probeValidateCommand(spec.operation),
     confirmedValidateCommand: spec.protocolProbe === false ? null : probeConfirmedSideEffectValidateCommand(spec.operation, spec.sideEffect),
     probeCommand: spec.protocolProbe === false ? null : probeProtocolCommand(spec.operation),
     writeFixtureCommand: writeFixtureCommandForMissing(missingName, spec.operation),
+    ...(spec.recommendedInput ? { recommendedInput: spec.recommendedInput } : {}),
+    ...(requiresReviewedInput ? {
+      requiresReviewedInput: true,
+      reviewRequirement: SEND_MESSAGE_REVIEW_REQUIREMENT,
+    } : {}),
     prerequisitesStatus: prerequisites.every((item) => item.status === "configured") ? "ready" : "blocked",
     prerequisites,
     reason: spec.reason,
@@ -526,6 +677,11 @@ function fixtureMatchesSendMessage(fixture = {}) {
   return fixture?.operation === "sendMessage";
 }
 
+function fixtureMatchesStreamEvidenceNotCaptured(fixture = {}) {
+  if (!fixtureMatchesSendMessage(fixture) || fixture?.status !== "failed") return false;
+  return fixtureError(fixture)?.code === "STREAM_EVIDENCE_NOT_CAPTURED";
+}
+
 function fixtureMatchesSessionVerifySuccess(fixture = {}) {
   return fixture?.operation === "verifySession" && fixture?.status === "success";
 }
@@ -550,6 +706,10 @@ function fixtureMatchesSessionMissing(fixture = {}) {
   if (fixture?.operation !== "verifySession" || fixture?.status !== "failed") return false;
   const error = fixtureError(fixture);
   return error?.category === "session_missing" || error?.code === "SESSION_MISSING";
+}
+
+function fixtureMatchesSessionRecoveryCandidate(fixture = {}) {
+  return fixture?.kind === "session_recovery_strategy" || fixture?.operation === "recoverSession";
 }
 
 const SESSION_RECOVERY_STRATEGIES = new Set([
@@ -585,7 +745,16 @@ function sessionRecoveryStrategyEvidence(fixture = {}) {
   const automatedRefresh = lowerString(evidence.automatedRefresh || evidence.automated_refresh || evidence.mode);
   if (!SESSION_RECOVERY_STRATEGIES.has(current)) return null;
   if (!SESSION_RECOVERY_REFRESH_MODES.has(automatedRefresh)) return null;
-  return { status: "ready", current, automatedRefresh };
+  if (!positiveInteger(evidence.observedWindowMs)) return null;
+  if (!safeSha256Evidence(evidence.resultHash)) return null;
+  const result = fixtureResult(fixture);
+  if (result?.expiredBeforeRecovery !== true || result?.recoveredVerifySession !== true) return null;
+  return {
+    status: "ready",
+    current,
+    automatedRefresh,
+    observedWindowMs: evidence.observedWindowMs,
+  };
 }
 
 function fixtureMatchesForbidden(fixture = {}) {
@@ -633,6 +802,10 @@ function fixtureUpstreamEvidence(fixture = {}) {
   return evidence && typeof evidence === "object" && !Array.isArray(evidence) ? evidence : {};
 }
 
+function sourceTextLooksRealUpstream(value = "") {
+  return /(^|[^a-z0-9])(tabbit|upstream|live)([^a-z0-9]|$)/.test(value);
+}
+
 function fixtureIsRealUpstreamEvidence(fixture = {}) {
   if (!fixtureMatchesSendMessage(fixture)) return false;
   const sourceText = fixtureSourceText(fixture);
@@ -641,8 +814,7 @@ function fixtureIsRealUpstreamEvidence(fixture = {}) {
   const result = fixtureResult(fixture);
   const evidence = fixtureUpstreamEvidence(fixture);
   return Boolean(
-    fixture?.kind === "protocol_probe"
-    || /tabbit|protocol|upstream|live/.test(sourceText)
+    sourceTextLooksRealUpstream(sourceText)
     || evidence.real === true
     || result?.raw?.upstream === true
   );
@@ -668,6 +840,7 @@ function streamEventLooksLikeError(event = {}) {
 }
 
 function fixtureMatchesUpstreamErrorFrame(fixture = {}) {
+  if (fixtureMatchesStreamEvidenceNotCaptured(fixture)) return false;
   if (!fixtureIsRealUpstreamEvidence(fixture)) return false;
   const result = fixtureResult(fixture);
   const evidence = fixtureUpstreamEvidence(fixture);
@@ -795,6 +968,10 @@ function observedWindowMs(startIso, endIso) {
   const end = Date.parse(endIso);
   if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
   return Math.max(0, end - start);
+}
+
+function positiveInteger(value) {
+  return Number.isInteger(value) && value > 0;
 }
 
 function fixtureMatchesAuthSendSuccess(fixture = {}) {
@@ -1153,9 +1330,11 @@ function buildBenefitsFixtureAudit({ fixtures = [], now = () => Date.now() } = {
 function buildSessionFixtureAudit({ fixtures = [], now = () => Date.now() } = {}) {
   const fixtureList = Array.isArray(fixtures) ? fixtures : [];
   const sessionFixtures = fixtureList.filter((fixture) => fixture?.operation === "verifySession");
-  const recoveryEvidence = fixtureList
+  const recoveryCandidates = fixtureList.filter(fixtureMatchesSessionRecoveryCandidate);
+  const recoveryEvidence = recoveryCandidates
     .map(sessionRecoveryStrategyEvidence)
     .filter(Boolean);
+  const rejectedRecoveryStrategyEvidence = Math.max(0, recoveryCandidates.length - recoveryEvidence.length);
   const successfulFixtures = sessionFixtures.filter(fixtureMatchesSessionVerifySuccess);
   const expiredFixtures = sessionFixtures.filter(fixtureMatchesSessionExpired);
   const sessionMissingFixtures = sessionFixtures.filter(fixtureMatchesSessionMissing);
@@ -1175,7 +1354,7 @@ function buildSessionFixtureAudit({ fixtures = [], now = () => Date.now() } = {}
     ...Object.values(coverage)
     .filter((item) => item.status !== "ready")
       .map((item) => item.missingName),
-    ...(recoveryStrategy.status === "ready" ? [] : ["automated_session_refresh_strategy"]),
+    ...(recoveryStrategy.status === "ready" ? [] : [AUTOMATED_SESSION_REFRESH_STRATEGY_MISSING]),
   ];
   const nextActions = [];
   if (missing.includes("successful_verifySession_fixture")) {
@@ -1184,11 +1363,16 @@ function buildSessionFixtureAudit({ fixtures = [], now = () => Date.now() } = {}
   if (missing.includes("expired_verifySession_fixture")) {
     nextActions.push("After a session expires, run read-only probe protocol --operation verifySession --write-fixture and keep a sanitized 401/login_required fixture.");
   }
-  if (missing.includes("automated_session_refresh_strategy")) {
+  if (missing.includes(AUTOMATED_SESSION_REFRESH_STRATEGY_MISSING)) {
     nextActions.push("Capture and test a safe session refresh or re-auth recovery path before enabling automated session recovery.");
   }
   const lastSuccessfulAt = latestObservedAt(successfulFixtures);
   const lastExpiredAt = latestObservedAt(expiredFixtures);
+  const manualCookieOperations = buildManualCookieOperationsStatus({
+    successfulVerifySession,
+    expiredVerifySession,
+    automatedRefreshReady: recoveryStrategy.status === "ready",
+  });
 
   return {
     scope: "session",
@@ -1201,6 +1385,7 @@ function buildSessionFixtureAudit({ fixtures = [], now = () => Date.now() } = {}
       expiredVerifySession,
       sessionMissing,
       recoveryStrategyEvidence: recoveryEvidence.length,
+      rejectedRecoveryStrategyEvidence,
       success: sessionFixtures.filter((fixture) => fixture?.status === "success").length,
       failed: sessionFixtures.filter((fixture) => fixture?.status === "failed").length,
     },
@@ -1211,6 +1396,7 @@ function buildSessionFixtureAudit({ fixtures = [], now = () => Date.now() } = {}
       observedWindowMs: observedWindowMs(lastSuccessfulAt, lastExpiredAt),
     },
     recoveryStrategy,
+    manualCookieOperations,
     missing,
     nextActions,
   };
@@ -1222,6 +1408,7 @@ function buildUpstreamFixtureAudit({ fixtures = [], now = () => Date.now() } = {
   const upstreamErrorFrame = fixtureList.filter(fixtureMatchesUpstreamErrorFrame).length;
   const upstreamCancellation = fixtureList.filter(fixtureMatchesUpstreamCancellation).length;
   const upstreamBackpressure = fixtureList.filter(fixtureMatchesUpstreamBackpressure).length;
+  const streamEvidenceNotCaptured = fixtureList.filter(fixtureMatchesStreamEvidenceNotCaptured).length;
   const coverage = {
     upstreamErrorFrame: coverageItem(upstreamErrorFrame, "real_upstream_error_frame_fixture", "real_upstream_error_frame_fixture"),
     upstreamCancellation: coverageItem(upstreamCancellation, "real_upstream_cancellation_fixture", "real_upstream_cancellation_fixture"),
@@ -1252,6 +1439,7 @@ function buildUpstreamFixtureAudit({ fixtures = [], now = () => Date.now() } = {
       upstreamErrorFrame,
       upstreamCancellation,
       upstreamBackpressure,
+      streamEvidenceNotCaptured,
       success: fixtureList.filter((fixture) => fixture?.status === "success").length,
       failed: fixtureList.filter((fixture) => fixture?.status === "failed").length,
     },
@@ -1431,6 +1619,10 @@ export function buildReadinessDoctorReport({
     ...(Array.isArray(sessionAudit.nextActions) ? sessionAudit.nextActions : []),
     ...(Array.isArray(upstreamAudit.nextActions) ? upstreamAudit.nextActions : []),
   ]);
+  const captureCommandMissing = uniqueStrings([
+    ...calibrationBacklogMissing,
+    ...(Array.isArray(fixtureAudit.missing) ? fixtureAudit.missing : []),
+  ]);
 
   return {
     status: combinedDoctorStatus(readiness.status, fixtureAudit.status),
@@ -1439,6 +1631,7 @@ export function buildReadinessDoctorReport({
     protocol: protocolDoctorSummary(config),
     readiness,
     fixtureAudit,
+    manualCookieMode: buildManualCookieMode({ readiness, fixtureAudit, sessionAudit }),
     calibrationBacklog: {
       status: authAudit.status === "ready" && benefitsAudit.status === "ready" && sessionAudit.status === "ready" && upstreamAudit.status === "ready" ? "ready" : "blocked",
       scopes: {
@@ -1449,7 +1642,7 @@ export function buildReadinessDoctorReport({
       },
       missing: calibrationBacklogMissing,
       nextActions: calibrationBacklogNextActions,
-      captureCommands: buildCalibrationCaptureCommands(calibrationBacklogMissing, config),
+      captureCommands: buildCalibrationCaptureCommands(captureCommandMissing, config),
     },
     remainingWork,
     commands: readinessDoctorCommands(config?.stateDir || "<state-dir>"),

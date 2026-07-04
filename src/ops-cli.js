@@ -25,11 +25,13 @@ import {
 const HELP = `Usage:
   tabbit-pool accounts list [--json]
   tabbit-pool accounts import-session [--id <id>] [--email <email>] [--cookie-header <text> | --session <text> | --cookie-file <path> | --session-file <path>] [--json]
-  tabbit-pool accounts probe <id> [--json]
+  tabbit-pool accounts probe <id> [--read-only] [--json]
   tabbit-pool health [--json]
   tabbit-pool readiness [--json]
   tabbit-pool readiness doctor [--json]
   tabbit-pool readiness mark [--codex-verified] [--claude-verified] [--json]
+  tabbit-pool production preflight [--json]
+  tabbit-pool production init-key [--json]
   tabbit-pool serve [--host <host>] [--port <port>] [--json]
   tabbit-pool start [--host <host>] [--port <port>] [--json]
   tabbit-pool smoke gateway [--base-url <url>] [--api-key <key>] [--model <model>] [--json]
@@ -38,10 +40,13 @@ const HELP = `Usage:
   tabbit-pool fixtures audit [--scope <protocol|auth|benefits|session|upstream>] [--json]
   tabbit-pool fixtures show <ref> [--json]
   tabbit-pool probe advice [--category <category>] [--status <status>] [--code <code>] [--message <text>] [--json]
-  tabbit-pool probe template [--operation <name>] [--json]
+  tabbit-pool probe template [--operation <name>] [--stream-evidence <mode>] [--max-deltas <n>] [--json]
   tabbit-pool probe validate [--operation <name>] [--input-json <json> | --input-file <path>] [--require-confirmed-side-effect] [--write-fixture] [--json]
   tabbit-pool probe protocol --account <id> [--operation <name>] [--input-json <json> | --input-file <path>] [--write-fixture] [--json]
 `;
+
+const DEFAULT_GATEWAY_API_KEY = "sk-tabbit-local";
+const GATEWAY_API_KEY_SECRET_REF = "secrets/gateway-api-key.txt";
 
 function writeLine(writer, value) {
   writer(String(value));
@@ -49,6 +54,17 @@ function writeLine(writer, value) {
 
 function json(value) {
   return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+function uniqueStrings(values = []) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    if (typeof value !== "string" || !value || seen.has(value)) continue;
+    seen.add(value);
+    result.push(value);
+  }
+  return result;
 }
 
 function redactErrorMessage(error) {
@@ -290,6 +306,9 @@ function parseProbeInputJson(text, source) {
   return parsed;
 }
 
+const REDACTED_MESSAGE_CONTENT_PLACEHOLDER = "<redacted-message-content>";
+const SEND_MESSAGE_REVIEW_REQUIREMENT = "replace_redacted_message_content";
+
 const PROBE_INPUT_TEMPLATES = {
   verifySession: {},
   sendVerificationCode: {
@@ -320,7 +339,7 @@ const PROBE_INPUT_TEMPLATES = {
   },
   sendMessage: {
     model: "tabbit/priority",
-    messages: [{ role: "user", content: "ping" }],
+    messages: [{ role: "user", content: REDACTED_MESSAGE_CONTENT_PLACEHOLDER }],
     stream: true,
   },
   listModels: { force: true },
@@ -409,9 +428,15 @@ const PROBE_INPUT_TEMPLATES = {
     evidence: {
       strategy: "automated_reauth",
       automatedRefresh: "calibrated_reauth_probe",
+      observedWindowMs: 86400000,
+      resultHash: "sha256:<redacted-recovery-result>",
       safe: true,
       sanitized: true,
       rawPayload: false,
+    },
+    result: {
+      expiredBeforeRecovery: true,
+      recoveredVerifySession: true,
     },
   },
   uploadAttachment: {
@@ -462,12 +487,19 @@ const RESET_COUPON_NON_CONSUMPTION_VALUES = new Set([
   "already_claimed",
   "already claimed",
 ]);
+const STREAM_EVIDENCE_MODES = new Set([
+  "first_token_backpressure",
+  "cancel_after_first_delta",
+  "error_frame",
+]);
+const DEFAULT_STREAM_EVIDENCE_DELTAS = 2;
+const MAX_STREAM_EVIDENCE_DELTAS = 5;
 
 function cloneJsonObject(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function buildProbeInputTemplate(operation) {
+function buildProbeInputTemplate(operation, { streamEvidence = null } = {}) {
   const cleanOperation = String(operation || "verifySession").trim() || "verifySession";
   const template = PROBE_INPUT_TEMPLATES[cleanOperation];
   if (!template) {
@@ -476,7 +508,12 @@ function buildProbeInputTemplate(operation) {
       { code: "UNSUPPORTED_PROBE_TEMPLATE_OPERATION" },
     );
   }
-  return cloneJsonObject(template);
+  const output = cloneJsonObject(template);
+  if (streamEvidence) {
+    output.stream = true;
+    output.streamEvidence = { ...streamEvidence };
+  }
+  return output;
 }
 
 function hasOwn(value, key) {
@@ -513,6 +550,56 @@ function validateOptionalBoolean(input, key, operation) {
   if (hasOwn(input, key) && typeof input[key] !== "boolean") {
     throw new CliUsageError("Probe input for " + operation + "." + key + " must be a boolean.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
   }
+}
+
+function validateStreamEvidenceInput(input, operation) {
+  if (!hasOwn(input, "streamEvidence")) return;
+  if (input.stream !== true) {
+    throw new CliUsageError("Probe input for " + operation + ".streamEvidence requires stream:true.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+  const evidence = input.streamEvidence;
+  if (!plainObject(evidence)) {
+    throw new CliUsageError("Probe input for " + operation + ".streamEvidence must be an object.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+  const mode = String(evidence.mode || "").trim();
+  if (!STREAM_EVIDENCE_MODES.has(mode)) {
+    throw new CliUsageError(
+      "Probe input for " + operation + ".streamEvidence.mode must be one of " + Array.from(STREAM_EVIDENCE_MODES).join(", ") + ".",
+      { code: "INVALID_PROBE_INPUT_SCHEMA" },
+    );
+  }
+  if (hasOwn(evidence, "maxDeltas") && (!Number.isInteger(evidence.maxDeltas) || evidence.maxDeltas < 1 || evidence.maxDeltas > MAX_STREAM_EVIDENCE_DELTAS)) {
+    throw new CliUsageError("Probe input for " + operation + ".streamEvidence.maxDeltas must be an integer from 1 to " + MAX_STREAM_EVIDENCE_DELTAS + ".", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
+}
+
+function parseStreamEvidenceTemplateOptions(args, operation) {
+  const hasStreamEvidence = hasFlag(args, "--stream-evidence");
+  const hasMaxDeltas = hasFlag(args, "--max-deltas");
+  if (!hasStreamEvidence && !hasMaxDeltas) return null;
+  const cleanOperation = String(operation || "verifySession").trim() || "verifySession";
+  if (!hasStreamEvidence) {
+    throw new CliUsageError("Probe template --max-deltas requires --stream-evidence.", { code: "INVALID_PROBE_TEMPLATE_STREAM_EVIDENCE" });
+  }
+  if (cleanOperation !== "sendMessage") {
+    throw new CliUsageError("Probe template --stream-evidence is only supported for sendMessage.", { code: "INVALID_PROBE_TEMPLATE_STREAM_EVIDENCE" });
+  }
+  const mode = requiredValueAfter(args, "--stream-evidence").trim();
+  if (!STREAM_EVIDENCE_MODES.has(mode)) {
+    throw new CliUsageError(
+      "Probe template sendMessage.streamEvidence.mode must be one of " + Array.from(STREAM_EVIDENCE_MODES).join(", ") + ".",
+      { code: "INVALID_PROBE_TEMPLATE_STREAM_EVIDENCE" },
+    );
+  }
+  const maxDeltasValue = hasMaxDeltas ? requiredValueAfter(args, "--max-deltas") : String(DEFAULT_STREAM_EVIDENCE_DELTAS);
+  if (!/^\d+$/.test(maxDeltasValue)) {
+    throw new CliUsageError("Probe template sendMessage.streamEvidence.maxDeltas must be an integer from 1 to " + MAX_STREAM_EVIDENCE_DELTAS + ".", { code: "INVALID_PROBE_TEMPLATE_STREAM_EVIDENCE" });
+  }
+  const maxDeltas = Number(maxDeltasValue);
+  if (!Number.isInteger(maxDeltas) || maxDeltas < 1 || maxDeltas > MAX_STREAM_EVIDENCE_DELTAS) {
+    throw new CliUsageError("Probe template sendMessage.streamEvidence.maxDeltas must be an integer from 1 to " + MAX_STREAM_EVIDENCE_DELTAS + ".", { code: "INVALID_PROBE_TEMPLATE_STREAM_EVIDENCE" });
+  }
+  return { mode, maxDeltas };
 }
 
 function validateOptionalString(input, key, operation) {
@@ -558,6 +645,10 @@ function resetCouponRawPayload(evidence) {
 
 function safeSha256Evidence(value) {
   return typeof value === "string" && /^sha256:[^:\s].*/.test(value.trim());
+}
+
+function positiveInteger(value) {
+  return Number.isInteger(value) && value > 0;
 }
 
 function valueForAnyKey(input, keys) {
@@ -635,6 +726,15 @@ function validateRecoverSessionEvidenceInput(input) {
   if (input.evidence.safe !== true || input.evidence.sanitized !== true || sessionRecoveryRawPayload(input.evidence) !== false) {
     throw new CliUsageError("Probe input for recoverSession.evidence requires safe:true, sanitized:true, and rawPayload:false.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
   }
+  if (
+    !positiveInteger(input.evidence.observedWindowMs)
+    || !safeSha256Evidence(input.evidence.resultHash)
+    || !plainObject(input.result)
+    || input.result.expiredBeforeRecovery !== true
+    || input.result.recoveredVerifySession !== true
+  ) {
+    throw new CliUsageError("Probe input for recoverSession requires positive observedWindowMs, resultHash sha256, and post-recovery verifySession evidence with expiredBeforeRecovery:true and recoveredVerifySession:true.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
+  }
 }
 
 function validateResetCouponConsumptionEvidenceInput(input) {
@@ -708,6 +808,7 @@ function validateProbeInputForOperation(input, operation) {
       throw new CliUsageError("Probe input for sendMessage.messages must be a non-empty array.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
     }
     validateOptionalBoolean(input, "stream", cleanOperation);
+    validateStreamEvidenceInput(input, cleanOperation);
   }
   if (cleanOperation === "listModels" && hasOwn(input, "force") && typeof input.force !== "boolean") {
     throw new CliUsageError("Probe input for listModels.force must be a boolean.", { code: "INVALID_PROBE_INPUT_SCHEMA" });
@@ -806,6 +907,51 @@ function assertConfirmedSideEffectInput(input, operation) {
   }
 }
 
+function messageContentStrings(message = {}) {
+  const content = message?.content;
+  if (typeof content === "string") return [content];
+  if (Array.isArray(content)) {
+    return content.flatMap((item) => {
+      if (typeof item === "string") return [item];
+      if (item && typeof item === "object" && typeof item.text === "string") return [item.text];
+      return [];
+    });
+  }
+  return [];
+}
+
+function assertProbeInputReadyForProtocol(input, operation) {
+  const cleanOperation = String(operation || "verifySession").trim() || "verifySession";
+  if (cleanOperation !== "sendMessage") return;
+  if (!plainObject(input) || !Array.isArray(input.messages) || input.messages.length === 0) {
+    throw new CliUsageError("Probe protocol sendMessage requires explicit reviewed messages before dispatch.", { code: "PROBE_INPUT_NOT_REVIEWED" });
+  }
+  const messageContents = input.messages.flatMap((message) => messageContentStrings(message));
+  const hasReviewedContent = messageContents.some((content) => {
+    const text = String(content || "").trim();
+    return text && text !== REDACTED_MESSAGE_CONTENT_PLACEHOLDER;
+  });
+  if (!hasReviewedContent) {
+    throw new CliUsageError("Probe protocol sendMessage requires replacing redacted message content before dispatch.", { code: "PROBE_INPUT_NOT_REVIEWED" });
+  }
+}
+
+function buildSendMessageReviewSummary(input = {}) {
+  const messages = Array.isArray(input.messages) ? input.messages : [];
+  const messageContents = messages.flatMap((message) => messageContentStrings(message));
+  const redactedMessageContentPresent = messageContents.some((content) => String(content || "").trim() === REDACTED_MESSAGE_CONTENT_PLACEHOLDER);
+  const protocolDispatchReady = messageContents.some((content) => {
+    const text = String(content || "").trim();
+    return text && text !== REDACTED_MESSAGE_CONTENT_PLACEHOLDER;
+  });
+  return {
+    requiresReviewedInput: true,
+    reviewRequirement: SEND_MESSAGE_REVIEW_REQUIREMENT,
+    redactedMessageContentPresent,
+    protocolDispatchReady,
+  };
+}
+
 function assertProtocolProbeOperationDispatchable(operation) {
   const cleanOperation = String(operation || "verifySession").trim() || "verifySession";
   if (!OFFLINE_EVIDENCE_PROBE_OPERATIONS.has(cleanOperation)) return;
@@ -858,6 +1004,7 @@ function buildProbeInputValidationPreview({ operation = "verifySession", input }
       status: probeInputFieldState(inputObject, "status"),
       evidence: probeInputFieldState(inputObject, "evidence"),
       result: probeInputFieldState(inputObject, "result"),
+      streamEvidence: probeInputFieldState(inputObject, "streamEvidence"),
     },
     bodyKeys: sortedObjectKeys(inputObject.body),
     attachmentKeys: sortedObjectKeys(inputObject.attachment),
@@ -866,13 +1013,28 @@ function buildProbeInputValidationPreview({ operation = "verifySession", input }
   if (hasOwn(inputObject, "confirmSideEffect")) {
     preview.confirmSideEffect = inputObject.confirmSideEffect === true;
   }
+  if (plainObject(inputObject.streamEvidence)) {
+    preview.streamEvidence = {
+      mode: String(inputObject.streamEvidence.mode || ""),
+      maxDeltas: Number.isInteger(inputObject.streamEvidence.maxDeltas)
+        ? inputObject.streamEvidence.maxDeltas
+        : 2,
+    };
+  }
+  if (cleanOperation === "sendMessage") {
+    preview.sendMessageReview = buildSendMessageReviewSummary(inputObject);
+  }
   if (cleanOperation === "recoverSession") {
     preview.sessionRecovery = {
       strategy: canonicalString(evidenceObject.strategy || evidenceObject.current),
       automatedRefresh: canonicalString(evidenceObject.automatedRefresh || evidenceObject.automated_refresh || evidenceObject.mode),
+      observedWindowMs: positiveInteger(evidenceObject.observedWindowMs),
+      resultHash: safeSha256Evidence(evidenceObject.resultHash),
       safe: evidenceObject.safe === true,
       sanitized: evidenceObject.sanitized === true,
       rawPayload: sessionRecoveryRawPayload(evidenceObject),
+      expiredBeforeRecovery: inputObject.result?.expiredBeforeRecovery === true,
+      recoveredVerifySession: inputObject.result?.recoveredVerifySession === true,
     };
   }
   if (cleanOperation === "consumeResetCoupon") {
@@ -901,9 +1063,15 @@ function buildOfflineEvidenceFixture({ operation, input, now } = {}) {
       evidence: {
         strategy: canonicalString(input.evidence.strategy || input.evidence.current),
         automatedRefresh: canonicalString(input.evidence.automatedRefresh || input.evidence.automated_refresh || input.evidence.mode),
+        observedWindowMs: input.evidence.observedWindowMs,
+        resultHash: input.evidence.resultHash,
         safe: true,
         sanitized: true,
         rawPayload: false,
+      },
+      result: {
+        expiredBeforeRecovery: true,
+        recoveredVerifySession: true,
       },
     });
   }
@@ -951,9 +1119,13 @@ function summarizeOfflineEvidenceFixture(fixture = {}) {
     output.evidence = {
       strategy: fixture.evidence?.strategy || "",
       automatedRefresh: fixture.evidence?.automatedRefresh || "",
+      observedWindowMs: positiveInteger(fixture.evidence?.observedWindowMs),
+      resultHash: safeSha256Evidence(fixture.evidence?.resultHash),
       safe: fixture.evidence?.safe === true,
       sanitized: fixture.evidence?.sanitized === true,
       rawPayload: sessionRecoveryRawPayload(fixture.evidence || {}),
+      expiredBeforeRecovery: fixture.result?.expiredBeforeRecovery === true,
+      recoveredVerifySession: fixture.result?.recoveredVerifySession === true,
     };
   }
   if (fixture.kind === "reset_coupon_consumption_evidence") {
@@ -1260,14 +1432,14 @@ export function createProtocolPoolCliDependencies(options = {}) {
     now,
   });
   const accountVerifier = options.accountVerifier || {
-    verifyAccount(accountId) {
+    verifyAccount(accountId, verifyOptions = {}) {
       const provisioner = new AccountProvisioner({
         accountStore,
         secretStore,
         protocolClient: accountProtocolClient || {},
         now: nowDate,
       });
-      return provisioner.verifyAccount(accountId);
+      return provisioner.verifyAccount(accountId, verifyOptions);
     },
   };
 
@@ -1476,37 +1648,56 @@ async function handleReadiness(args, deps, stdout) {
   return { exitCode: 0 };
 }
 
-function plainCaptureCommandLines(commands = []) {
-  return (Array.isArray(commands) ? commands : []).map((item = {}) => [
-    "capture_command",
-    item.missing || "",
-    item.scope || "",
-    "side_effect=" + Boolean(item.sideEffect),
-    "template=" + (item.templateCommand || ""),
-    "validate=" + (item.validateCommand || ""),
-    "confirm_validate=" + (item.confirmedValidateCommand || ""),
-    "probe=" + (item.probeCommand || ""),
-    "write_fixture=" + (item.writeFixtureCommand || ""),
-    "prereq=" + (Array.isArray(item.prerequisites)
-      ? item.prerequisites.map((prerequisite = {}) => `${prerequisite.env || ""}:${prerequisite.status || ""}`).join(",")
-      : ""),
-    "reason=" + (item.reason || ""),
-  ].join("\t"));
+function readinessDoctorMissingNames(report = {}) {
+  const checks = report.readiness?.checks && typeof report.readiness.checks === "object" ? report.readiness.checks : {};
+  return uniqueStrings([
+    ...Object.values(checks).flatMap((check = {}) => Array.isArray(check.missing) ? check.missing : []),
+    ...(Array.isArray(report.fixtureAudit?.missing) ? report.fixtureAudit.missing : []),
+  ]);
 }
 
-async function handleReadinessDoctor(args, deps, stdout) {
+async function buildDoctorReportForCli(deps) {
   const accounts = await loadAccounts(deps.accountStore);
   const fixtures = await readProtocolFixtureDetails(deps.protocolFixtureStore);
   const readinessState = deps.readinessStateStore && typeof deps.readinessStateStore.readState === "function"
     ? normalizeReadinessState(await deps.readinessStateStore.readState())
     : emptyReadinessState();
-  const report = buildReadinessDoctorReport({
+  return buildReadinessDoctorReport({
     accounts,
     config: deps.config,
     fixtures,
     readinessState,
     now: deps.now,
   });
+}
+
+function plainCaptureCommandLines(commands = []) {
+  return (Array.isArray(commands) ? commands : []).map((item = {}) => {
+    const streamEvidence = item.recommendedInput?.streamEvidence;
+    return [
+      "capture_command",
+      item.missing || "",
+      item.scope || "",
+      "side_effect=" + Boolean(item.sideEffect),
+      "template=" + (item.templateCommand || ""),
+      "validate=" + (item.validateCommand || ""),
+      "confirm_validate=" + (item.confirmedValidateCommand || ""),
+      "probe=" + (item.probeCommand || ""),
+      "write_fixture=" + (item.writeFixtureCommand || ""),
+      ...(streamEvidence?.mode
+        ? ["stream_evidence=" + streamEvidence.mode + ":" + (Number.isInteger(streamEvidence.maxDeltas) ? streamEvidence.maxDeltas : "")]
+        : []),
+      ...(item.reviewRequirement ? ["review=" + item.reviewRequirement] : []),
+      "prereq=" + (Array.isArray(item.prerequisites)
+        ? item.prerequisites.map((prerequisite = {}) => `${prerequisite.env || ""}:${prerequisite.status || ""}`).join(",")
+        : ""),
+      "reason=" + (item.reason || ""),
+    ].join("\t");
+  });
+}
+
+async function handleReadinessDoctor(args, deps, stdout) {
+  const report = await buildDoctorReportForCli(deps);
   if (hasFlag(args, "--json")) {
     writeLine(stdout, json(report));
   } else {
@@ -1521,6 +1712,11 @@ async function handleReadinessDoctor(args, deps, stdout) {
       `auth_send_endpoint\t${report.protocol.authSendCodePathConfigured ? "configured" : "missing"}`,
       `auth_submit_endpoint\t${report.protocol.authSubmitCodePathConfigured ? "configured" : "missing"}`,
       `remaining_work\t${report.remainingWork.length}`,
+      `manual_cookie_mode\t${report.manualCookieMode?.status || ""}\tmode=${report.manualCookieMode?.mode || ""}\tautomated_refresh=${report.manualCookieMode?.automatedSessionRefresh?.status || ""}\tmissing=${Array.isArray(report.manualCookieMode?.missing) ? report.manualCookieMode.missing.join(",") : ""}\trelease_blocking_missing=${Array.isArray(report.manualCookieMode?.blockingMissing) ? report.manualCookieMode.blockingMissing.join(",") : ""}\tbacklog_missing=${Array.isArray(report.manualCookieMode?.backlogMissing) ? report.manualCookieMode.backlogMissing.join(",") : ""}`,
+      `preflight_command\taccount_read_only\t${report.commands?.accountPreflightReadOnly || ""}`,
+      `mark_command\tcodex_e2e\t${report.commands?.codexE2EMark || ""}`,
+      `mark_command\tclaude_code_e2e\t${report.commands?.claudeE2EMark || ""}`,
+      `mark_command\tcombined_e2e\t${report.commands?.combinedE2EMark || ""}`,
       `calibration_backlog\t${backlog.status || ""}\tmissing=${missingCount(backlog)}`,
       `auth_backlog\t${scopes.auth?.status || ""}\tmissing=${missingCount(scopes.auth)}`,
       `benefits_backlog\t${scopes.benefits?.status || ""}\tmissing=${missingCount(scopes.benefits)}`,
@@ -1531,6 +1727,115 @@ async function handleReadinessDoctor(args, deps, stdout) {
     ].join("\n"));
   }
   return { exitCode: 0 };
+}
+
+function buildProductionPreflightReport({ doctorReport, config = {} } = {}) {
+  const apiKeyMissing = config.apiKey && config.apiKey !== DEFAULT_GATEWAY_API_KEY
+    ? []
+    : ["non_default_api_key"];
+  const readinessMissing = doctorReport?.status === "ready" ? [] : readinessDoctorMissingNames(doctorReport);
+  const manualCookieMissing = Array.isArray(doctorReport?.manualCookieMode?.blockingMissing)
+    ? doctorReport.manualCookieMode.blockingMissing
+    : ["manual_cookie_mode_ready"];
+  const missing = uniqueStrings([
+    ...apiKeyMissing,
+    ...readinessMissing,
+    ...manualCookieMissing,
+  ]);
+
+  return {
+    status: missing.length ? "blocked" : "ready",
+    observedAt: doctorReport?.observedAt || safeNowIso(),
+    stateDir: String(doctorReport?.stateDir || config.stateDir || ""),
+    checks: {
+      gatewayApiKey: {
+        status: apiKeyMissing.length ? "blocked" : "ready",
+        missing: apiKeyMissing,
+      },
+      readinessDoctor: {
+        status: doctorReport?.status || "blocked",
+        missing: readinessMissing,
+      },
+      manualCookieMode: {
+        status: doctorReport?.manualCookieMode?.status || "blocked",
+        mode: doctorReport?.manualCookieMode?.mode || "",
+        missing: manualCookieMissing,
+        backlogMissing: Array.isArray(doctorReport?.manualCookieMode?.backlogMissing)
+          ? doctorReport.manualCookieMode.backlogMissing
+          : [],
+      },
+    },
+    missing,
+    ...(apiKeyMissing.length ? {
+      commands: {
+        initGatewayKey: "node bin\\tabbit-pool.js production init-key --json",
+      },
+    } : {}),
+    nextActions: uniqueStrings([
+      ...(apiKeyMissing.length ? ["Set TABBIT_POOL_API_KEY to a non-default secret or create stateDir/secrets/gateway-api-key.txt before exposing the gateway."] : []),
+      ...(Array.isArray(doctorReport?.remainingWork) ? doctorReport.remainingWork : []),
+      ...(Array.isArray(doctorReport?.manualCookieMode?.nextActions) ? doctorReport.manualCookieMode.nextActions : []),
+    ]),
+  };
+}
+
+function generateGatewayApiKey() {
+  return "sk-tabbit-pool-" + randomBytes(32).toString("base64url");
+}
+
+async function handleProductionInitKey(args, deps, stdout) {
+  const existingSource = deps.config?.productionState?.apiKeySource || (deps.config?.apiKey === DEFAULT_GATEWAY_API_KEY ? "default" : "unknown");
+  const alreadyConfigured = deps.config?.apiKey && deps.config.apiKey !== DEFAULT_GATEWAY_API_KEY;
+  let changed = false;
+  if (!alreadyConfigured) {
+    if (deps.config?.productionState?.source === "default_local") {
+      throw new CliUsageError("No production stateDir is configured or auto-discovered for production init-key.", { code: "PRODUCTION_STATE_DIR_MISSING" });
+    }
+    const key = generateGatewayApiKey();
+    try {
+      await deps.secretStore.writeSecret(GATEWAY_API_KEY_SECRET_REF, key + "\n");
+    } catch (error) {
+      throw new Error("Unable to write gateway API key secret. Check stateDir permissions and retry production init-key.");
+    }
+    changed = true;
+  }
+
+  const report = {
+    changed,
+    stateDir: deps.config?.stateDir || "",
+    secretRef: GATEWAY_API_KEY_SECRET_REF,
+    apiKeySource: changed ? "state_secret" : existingSource,
+  };
+  if (hasFlag(args, "--json")) {
+    writeLine(stdout, json(report));
+  } else {
+    writeLine(stdout, [
+      `changed\t${report.changed}`,
+      `state_dir\t${report.stateDir}`,
+      `secret_ref\t${report.secretRef}`,
+      `api_key_source\t${report.apiKeySource}`,
+      "",
+    ].join("\n"));
+  }
+  return { exitCode: 0 };
+}
+
+async function handleProductionPreflight(args, deps, stdout) {
+  const doctorReport = await buildDoctorReportForCli(deps);
+  const report = buildProductionPreflightReport({ doctorReport, config: deps.config });
+  if (hasFlag(args, "--json")) {
+    writeLine(stdout, json(report));
+  } else {
+    writeLine(stdout, [
+      `status\t${report.status}`,
+      `gateway_api_key\t${report.checks.gatewayApiKey.status}`,
+      `readiness_doctor\t${report.checks.readinessDoctor.status}`,
+      `manual_cookie_mode\t${report.checks.manualCookieMode.status}\tmissing=${report.checks.manualCookieMode.missing.join(",")}\tbacklog_missing=${report.checks.manualCookieMode.backlogMissing.join(",")}`,
+      `missing\t${report.missing.join(",")}`,
+      "",
+    ].join("\n"));
+  }
+  return { exitCode: report.status === "ready" ? 0 : 1 };
 }
 
 function probeAdviceFromVerification(result = {}) {
@@ -1545,8 +1850,9 @@ async function handleAccountsProbe(args, deps, stdout, stderr) {
     writeLine(stderr, "Missing account id for accounts probe.\n" + HELP);
     return { exitCode: 2 };
   }
+  const readOnly = hasFlag(args, "--read-only");
 
-  const result = await deps.accountVerifier.verifyAccount(accountId);
+  const result = await deps.accountVerifier.verifyAccount(accountId, { readOnly });
   const events = formatMaintenanceActionLog({
     accountId: result.account?.id || accountId,
     actions: result.actions,
@@ -1556,13 +1862,16 @@ async function handleAccountsProbe(args, deps, stdout, stderr) {
 
   if (hasFlag(args, "--json")) {
     writeLine(stdout, json({
+      readOnly: Boolean(result.readOnly || readOnly),
       changed: Boolean(result.changed),
+      wouldChange: Boolean(result.wouldChange),
       account: result.account ? redactAccountForDisplay(result.account) : null,
       events,
       advice,
     }));
   } else {
     const lines = events.map((event) => `${event.accountId || "-"}	${event.action}	${event.status}`);
+    lines.push(`read_only	${Boolean(result.readOnly || readOnly)}	would_change=${Boolean(result.wouldChange)}`);
     lines.push(`advice	${advice.category}	${advice.severity}`);
     writeLine(stdout, `${lines.join("\n")}\n`);
   }
@@ -1662,12 +1971,16 @@ async function handleFixturesAudit(args, deps, stdout) {
   }
   else if (scope === "session") {
     const recoveryStrategy = audit.recoveryStrategy || {};
+    const lifecycle = audit.lifecycle || {};
     writeLine(stdout, [
       "status	" + audit.status,
       "successful_verifySession_fixture	" + audit.coverage.successfulSessionVerify.status + "	" + audit.coverage.successfulSessionVerify.count,
       "expired_verifySession_fixture	" + audit.coverage.expiredSessionSignal.status + "	" + audit.coverage.expiredSessionSignal.count,
       "session_missing	" + audit.counts.sessionMissing,
+      "session_lifecycle	last_successful_at=" + (lifecycle.lastSuccessfulAt || "") + "	last_expired_at=" + (lifecycle.lastExpiredAt || "") + "	observed_window_ms=" + (Number.isFinite(lifecycle.observedWindowMs) ? lifecycle.observedWindowMs : ""),
+      "manual_cookie_mode	" + (audit.manualCookieOperations?.status || "") + "	mode=" + (audit.manualCookieOperations?.mode || "") + "	expired_session_action=" + (audit.manualCookieOperations?.expiredSessionAction || "") + "	automated_refresh_required=" + Boolean(audit.manualCookieOperations?.automatedRefreshRequired) + "	release_blocking_missing=" + (Array.isArray(audit.manualCookieOperations?.blockingMissing) ? audit.manualCookieOperations.blockingMissing.join(",") : "") + "	backlog_missing=" + (Array.isArray(audit.manualCookieOperations?.backlogMissing) ? audit.manualCookieOperations.backlogMissing.join(",") : ""),
       "recovery_strategy	" + (recoveryStrategy.status || "") + "	" + (recoveryStrategy.current || "") + "	" + (recoveryStrategy.automatedRefresh || ""),
+      "recovery_strategy_rejected	" + audit.counts.rejectedRecoveryStrategyEvidence,
       "missing	" + (Array.isArray(audit.missing) ? audit.missing.join(",") : ""),
       "",
     ].join("\n"));
@@ -1682,6 +1995,7 @@ async function handleFixturesAudit(args, deps, stdout) {
       "upstream_error_frame	" + audit.counts.upstreamErrorFrame,
       "upstream_cancellation	" + audit.counts.upstreamCancellation,
       "upstream_backpressure	" + audit.counts.upstreamBackpressure,
+      "stream_evidence_not_captured	" + audit.counts.streamEvidenceNotCaptured,
       "missing	" + (Array.isArray(audit.missing) ? audit.missing.join(",") : ""),
       "",
     ].join("\n"));
@@ -1720,7 +2034,8 @@ async function handleFixturesShow(args, deps, stdout, stderr) {
 
 async function handleProbeTemplate(args, stdout) {
   const operation = requiredValueAfter(args, "--operation") || "verifySession";
-  writeLine(stdout, json(buildProbeInputTemplate(operation)));
+  const streamEvidence = parseStreamEvidenceTemplateOptions(args, operation);
+  writeLine(stdout, json(buildProbeInputTemplate(operation, { streamEvidence })));
   return { exitCode: 0 };
 }
 
@@ -1777,6 +2092,7 @@ async function handleProbeProtocol(args, deps, stdout, stderr) {
   const operation = valueAfter(args, "--operation") || "verifySession";
   const input = await readProbeInput(args);
   validateProbeInputForOperation(input, operation);
+  assertProbeInputReadyForProtocol(input, operation);
   assertProtocolProbeOperationDispatchable(operation);
   const probeRequest = {
     accountId,
@@ -1785,8 +2101,9 @@ async function handleProbeProtocol(args, deps, stdout, stderr) {
   };
   if (input !== undefined) probeRequest.input = input;
   const result = await deps.protocolProbeRunner.probeAccount(probeRequest);
-  if (hasFlag(args, "--json")) writeLine(stdout, json(result));
-  else writeLine(stdout, `${result.status}	${operation}	${result.advice?.category || "unknown"}	${result.fixtureRef || ""}
+  const safeResult = sanitizeProtocolProbeFixture(result);
+  if (hasFlag(args, "--json")) writeLine(stdout, json(safeResult));
+  else writeLine(stdout, `${safeResult.status}	${operation}	${safeResult.advice?.category || "unknown"}	${safeResult.fixtureRef || ""}
 `);
   return { exitCode: 0 };
 }
@@ -1841,6 +2158,12 @@ export async function runProtocolPoolCli(argv = [], options = {}) {
     }
     if (command === "readiness") {
       return await handleReadiness(args, deps, stdout);
+    }
+    if (command === "production" && subcommand === "preflight") {
+      return await handleProductionPreflight(args, deps, stdout);
+    }
+    if (command === "production" && subcommand === "init-key") {
+      return await handleProductionInitKey(args, deps, stdout);
     }
     if (command === "maintain") {
       return await handleMaintain(args, deps, stdout);

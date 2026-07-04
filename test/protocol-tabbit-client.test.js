@@ -818,7 +818,7 @@ test("sendMessage classifies buffered stream error frames", async () => {
 test("sendMessage returns async streamDeltas before the upstream stream completes", async () => {
   const releaseSecond = createDeferred();
   const client = new ProtocolTabbitClient({
-    sendPath: "/chat/send",
+    sendPath: "/api/v1/chat/completion",
     now: () => 1700000000000,
     nonce: () => "nonce-async-stream",
     fetch: async (url) => url.endsWith("/chat/sign-key")
@@ -832,7 +832,8 @@ test("sendMessage returns async streamDeltas before the upstream stream complete
 
   const pendingResult = client.sendMessage({
     account: { cookie: "placeholder-cookie-valuebc" },
-    model: "Claude-Sonnet-4.6",
+    chatSessionId: "session_live",
+    model: "tabbit/priority",
     messages: [{ role: "user", content: "hello" }],
     stream: true,
   });
@@ -855,6 +856,13 @@ test("sendMessage returns async streamDeltas before the upstream stream complete
   assert.equal(result.raw.kind, "stream");
   assert.equal(result.raw.format, "sse");
   assert.equal(result.raw.async, true);
+  assert.deepEqual(result.upstreamEvidence, {
+    source: "tabbit-live",
+    real: true,
+    stream: true,
+    format: "sse",
+  });
+  assert.doesNotMatch(JSON.stringify(result.upstreamEvidence), /placeholder-cookie|hello/i);
 
   const iterator = result.streamDeltas[Symbol.asyncIterator]();
   assert.deepEqual(await iterator.next(), { value: "Hel", done: false });
@@ -922,6 +930,7 @@ test("async streamDeltas emits OpenAI tool_call delta objects", async () => {
   });
 
   assert.equal(result.ok, true);
+  assert.equal(result.upstreamEvidence, undefined);
   const iterator = result.streamDeltas[Symbol.asyncIterator]();
   assert.deepEqual(await iterator.next(), {
     value: {

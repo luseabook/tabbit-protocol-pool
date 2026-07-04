@@ -1,10 +1,31 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import path from "node:path";
 
 import { loadConfig, normalizePort } from "../src/config.js";
 
+function fakeSyncFs({ existing = [], files = {} } = {}) {
+  const existingSet = new Set(existing.map((item) => path.resolve(item)));
+  const fileMap = new Map(Object.entries(files).map(([key, value]) => [path.resolve(key), value]));
+  return {
+    existsSync(target) {
+      return existingSet.has(path.resolve(target)) || fileMap.has(path.resolve(target));
+    },
+    readFileSync(target, encoding) {
+      assert.equal(encoding, "utf8");
+      const key = path.resolve(target);
+      if (!fileMap.has(key)) {
+        const error = new Error("not found");
+        error.code = "ENOENT";
+        throw error;
+      }
+      return fileMap.get(key);
+    },
+  };
+}
+
 test("loadConfig returns safe local defaults", () => {
-  const config = loadConfig({ LOCALAPPDATA: "C:/Users/A/AppData/Local" }, { platform: "win32" });
+  const config = loadConfig({ LOCALAPPDATA: "C:/Users/A/AppData/Local" }, { platform: "win32", fs: fakeSyncFs() });
 
   assert.equal(config.host, "127.0.0.1");
   assert.equal(config.port, 50124);
@@ -57,6 +78,104 @@ test("loadConfig returns safe local defaults", () => {
     defaultChatSessionId: null,
   });
   assert.match(config.stateDir, /tabbit-protocol-pool$/);
+});
+
+test("loadConfig protocol enabled uses calibrated Tabbit defaults", () => {
+  const config = loadConfig({
+    TABBIT_POOL_PROTOCOL_ENABLED: "true",
+  });
+
+  assert.equal(config.protocol.enabled, true);
+  assert.equal(config.protocol.baseUrl, "https://web.tabbit.ai");
+  assert.equal(config.protocol.signKeyPath, "/chat/sign-key");
+  assert.equal(config.protocol.modelCatalogPath, "/proxy/v1/model_config/models");
+  assert.equal(config.protocol.modelCatalogScene, "chat");
+  assert.equal(config.protocol.sendPath, "/api/v1/chat/completion");
+  assert.equal(config.protocol.sessionVerifyPath, "/api/v0/user/base-info");
+  assert.equal(config.protocol.sessionVerifyMethod, "GET");
+  assert.equal(config.protocol.reqCtx, "MS4zLjI2KDEwMTAzMDI2KQ==");
+});
+
+test("loadConfig adopts a complete external production state by default", () => {
+  const cwd = path.resolve("E:/tabbit-protocol-pool");
+  const stateDir = path.resolve("E:/tabbit-live-state");
+  const apiKeyFile = path.join(stateDir, "secrets", "gateway-api-key.txt");
+  const config = loadConfig({}, {
+    cwd,
+    platform: "win32",
+    fs: fakeSyncFs({
+      existing: [
+        path.join(stateDir, "accounts.json"),
+        path.join(stateDir, "readiness.json"),
+        path.join(stateDir, "fixtures", "protocol-probes"),
+        path.join(stateDir, "secrets"),
+      ],
+      files: {
+        [apiKeyFile]: "prod-file-key\n",
+      },
+    }),
+  });
+
+  assert.equal(config.stateDir, stateDir);
+  assert.equal(config.apiKey, "prod-file-key");
+  assert.equal(config.productionState.source, "auto_discovered");
+  assert.equal(config.productionState.apiKeySource, "state_secret");
+  assert.equal(config.protocol.enabled, true);
+  assert.equal(config.protocol.baseUrl, "https://web.tabbit.ai");
+  assert.equal(config.protocol.sendPath, "/api/v1/chat/completion");
+  assert.equal(config.protocol.sessionVerifyPath, "/api/v0/user/base-info");
+});
+
+test("loadConfig does not auto-discover legacy tabbit2api state by default", () => {
+  const cwd = path.resolve("E:/tabbit-protocol-pool");
+  const legacyStateDir = path.resolve("E:/tabbit2api/output/tabbit-live-state");
+  const config = loadConfig({ LOCALAPPDATA: "C:/Users/A/AppData/Local" }, {
+    cwd,
+    platform: "win32",
+    fs: fakeSyncFs({
+      existing: [
+        path.join(legacyStateDir, "accounts.json"),
+        path.join(legacyStateDir, "readiness.json"),
+        path.join(legacyStateDir, "fixtures", "protocol-probes"),
+        path.join(legacyStateDir, "secrets"),
+      ],
+      files: {
+        [path.join(legacyStateDir, "secrets", "gateway-api-key.txt")]: "prod-file-key\n",
+      },
+    }),
+  });
+
+  assert.match(config.stateDir, /tabbit-protocol-pool$/);
+  assert.equal(config.apiKey, "sk-tabbit-local");
+  assert.equal(config.productionState.source, "default_local");
+  assert.equal(config.productionState.apiKeySource, "default");
+  assert.equal(config.protocol.enabled, false);
+});
+
+test("loadConfig ignores incomplete external production state candidates", () => {
+  const cwd = path.resolve("E:/tabbit-protocol-pool");
+  const stateDir = path.resolve("E:/tabbit2api/output/tabbit-live-state");
+  const config = loadConfig({ LOCALAPPDATA: "C:/Users/A/AppData/Local" }, {
+    cwd,
+    platform: "win32",
+    fs: fakeSyncFs({
+      existing: [
+        path.join(stateDir, "accounts.json"),
+      ],
+      files: {
+        [path.join(stateDir, "secrets", "gateway-api-key.txt")]: "prod-file-key\n",
+      },
+    }),
+    productionStateDirCandidates: [stateDir],
+  });
+
+  assert.match(config.stateDir, /tabbit-protocol-pool$/);
+  assert.equal(config.apiKey, "sk-tabbit-local");
+  assert.equal(config.productionState.source, "default_local");
+  assert.equal(config.productionState.apiKeySource, "default");
+  assert.equal(config.protocol.enabled, false);
+  assert.equal(config.protocol.sendPath, null);
+  assert.equal(config.protocol.sessionVerifyPath, null);
 });
 
 test("loadConfig applies environment overrides", () => {

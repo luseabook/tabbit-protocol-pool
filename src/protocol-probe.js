@@ -61,6 +61,14 @@ const USER_ID_HYDRATED_PROBE_METHODS = {
   getAvailableLotteryChanceCount: "getAvailableLotteryChanceCount",
   drawLottery: "drawLottery",
 };
+const STREAM_EVIDENCE_MODES = new Set([
+  "first_token_backpressure",
+  "cancel_after_first_delta",
+  "error_frame",
+]);
+const DEFAULT_STREAM_EVIDENCE_DELTAS = 2;
+const MAX_STREAM_EVIDENCE_DELTAS = 5;
+const REDACTED_MESSAGE_CONTENT_PLACEHOLDER = "<redacted-message-content>";
 
 function nonEmptyInputValue(value) {
   if (typeof value === "string") return value.trim() ? value : null;
@@ -79,6 +87,96 @@ function bodyWithUserId(body, userId) {
   if (!body || typeof body !== "object" || Array.isArray(body) || !userId) return body;
   if (nonEmptyInputValue(body.user_id) || nonEmptyInputValue(body.userId)) return body;
   return { ...body, user_id: userId };
+}
+
+function plainObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isAsyncIterable(value) {
+  return value && typeof value[Symbol.asyncIterator] === "function";
+}
+
+function streamEvidenceInput(input = {}) {
+  const evidence = input?.streamEvidence;
+  if (!plainObject(evidence)) return null;
+  const mode = String(evidence.mode || "").trim();
+  if (!STREAM_EVIDENCE_MODES.has(mode)) return null;
+  const maxDeltas = Number.isInteger(evidence.maxDeltas)
+    ? evidence.maxDeltas
+    : DEFAULT_STREAM_EVIDENCE_DELTAS;
+  if (maxDeltas < 1 || maxDeltas > MAX_STREAM_EVIDENCE_DELTAS) return null;
+  return { mode, maxDeltas };
+}
+
+function hasRealUpstreamStreamMarker(result = {}) {
+  const evidence = result?.upstreamEvidence;
+  return evidence?.source === "tabbit-live" && evidence.real === true && evidence.stream === true;
+}
+
+function mergeUpstreamEvidence(result, markers) {
+  result.upstreamEvidence = {
+    ...(plainObject(result.upstreamEvidence) ? result.upstreamEvidence : {}),
+    ...markers,
+  };
+}
+
+function streamEvidenceNotCapturedError() {
+  return protocolError("stream evidence was requested but not captured", {
+    category: "protocol_changed",
+    code: "STREAM_EVIDENCE_NOT_CAPTURED",
+  });
+}
+
+async function captureStreamEvidence(result, input = {}) {
+  const capture = streamEvidenceInput(input);
+  if (!capture) return null;
+  if (!plainObject(result) || !hasRealUpstreamStreamMarker(result) || !isAsyncIterable(result.streamDeltas)) {
+    return streamEvidenceNotCapturedError();
+  }
+
+  const iterator = result.streamDeltas[Symbol.asyncIterator]();
+  let observedDeltas = 0;
+  let streamDone = false;
+  try {
+    while (observedDeltas < capture.maxDeltas) {
+      const next = await iterator.next();
+      if (next.done) {
+        streamDone = true;
+        break;
+      }
+      observedDeltas += 1;
+      if (capture.mode === "cancel_after_first_delta") {
+        if (typeof iterator.return === "function") await iterator.return();
+        streamDone = true;
+        mergeUpstreamEvidence(result, { cancellation: true });
+        return null;
+      }
+    }
+  } catch (error) {
+    if (capture.mode === "error_frame") {
+      mergeUpstreamEvidence(result, { streamErrorFrame: true });
+      return protocolError("upstream stream error frame observed", {
+        category: error?.category || "protocol_changed",
+        code: error?.code || "UPSTREAM_STREAM_ERROR_FRAME",
+        status: error?.status,
+      });
+    }
+    throw error;
+  }
+  if (!streamDone && observedDeltas >= capture.maxDeltas && typeof iterator.return === "function") {
+    await iterator.return();
+  }
+
+  if (capture.mode === "first_token_backpressure" && observedDeltas >= 2) {
+    mergeUpstreamEvidence(result, {
+      backpressure: true,
+      firstTokenFlush: true,
+      delayedSecondChunk: true,
+    });
+    return null;
+  }
+  return streamEvidenceNotCapturedError();
 }
 
 export class ProtocolFixtureStoreError extends Error {
@@ -442,7 +540,7 @@ export class ProtocolProbeRunner {
       return {
         result: await client.sendMessage({
           model: input?.model || "tabbit/priority",
-          messages: input?.messages || [{ role: "user", content: "ping" }],
+          messages: input?.messages || [{ role: "user", content: REDACTED_MESSAGE_CONTENT_PLACEHOLDER }],
           stream: false,
           ...input,
           account: runtimeAccount,
@@ -710,6 +808,21 @@ export class ProtocolProbeRunner {
         return await this.finalize({ account, accountId: cleanAccountId, operation: cleanOp, input, status: "failed", error: dispatched.error, writeFixture });
       }
       const result = dispatched.result;
+      const streamEvidenceError = cleanOp === "sendMessage"
+        ? await captureStreamEvidence(result, probeInput)
+        : null;
+      if (streamEvidenceError) {
+        return await this.finalize({
+          account,
+          accountId: cleanAccountId,
+          operation: cleanOp,
+          input,
+          status: "failed",
+          result,
+          error: streamEvidenceError,
+          writeFixture,
+        });
+      }
       if (result?.ok === false) {
         return await this.finalize({
           account,

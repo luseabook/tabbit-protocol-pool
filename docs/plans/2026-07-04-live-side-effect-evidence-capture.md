@@ -178,7 +178,7 @@ No raw fixture body, cookie, session, JWT, bearer-style credential, API key, pro
 
 - `probe validate --operation dailySignIn --require-confirmed-side-effect` with `confirmSideEffect:false` failed as expected before touching network.
 - The same daily sign-in input with `confirmSideEffect:true` passed offline validation and printed only field-shape metadata.
-- `sendMessage` safe `ping` input passed offline validation.
+- `sendMessage` safe placeholder input passed offline validation; current templates use `<redacted-message-content>` before operator review and replacement.
 
 ### GREEN: Writable Fixture Directory
 
