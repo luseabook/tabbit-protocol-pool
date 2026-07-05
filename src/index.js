@@ -28,7 +28,7 @@ export {
   writeSse,
 } from "./http-server.js";
 export { AccountStoreError, JsonAccountStore, StoredAccountPool, normalizeAccountStoreDocument, resolveAccountStorePath, sanitizeAccountForStorage } from "./account-store.js";
-export { closeServer, createDefaultProtocolClientFactory, createProtocolPoolGateway, createSecretHydratingProtocolClientFactory, hydrateAccountSecrets, listen } from "./protocol-pool-gateway.js";
+export { closeServer, createAdminStatusProvider, createDefaultProtocolClientFactory, createProtocolPoolGateway, createSecretHydratingProtocolClientFactory, hydrateAccountSecrets, listen } from "./protocol-pool-gateway.js";
 export { FileSecretStore, SecretStoreError, resolveSecretRefPath } from "./secret-store.js";
 export { AnthropicCompat, anthropicErrorForCategory, buildAnthropicMessageResponse, normalizeAnthropicMessagesRequest } from "./anthropic-compat.js";
 export { BenefitsMaintainer, BenefitsMaintainerError, normalizeQuotaState } from "./benefits-maintainer.js";

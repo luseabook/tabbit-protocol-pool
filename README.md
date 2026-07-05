@@ -106,10 +106,14 @@ node bin\tabbit-pool.js start --host 127.0.0.1 --port 50124 --json
 可用路由：
 
 - `GET /health`
+- `GET /admin`
+- `GET /admin/api/status`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `POST /v1/messages`
+
+`/admin` 是内置 Web 运维后台。页面本身不包含密钥；浏览器调用 `/admin/api/status` 时需要输入同一个 gateway API key。后台第一版只显示聚合状态、stateDir、API key 来源、协议开关和账号池摘要，不展示或返回真实 API key、cookie、session、token、`cookieJarRef`、prompt 或 raw fixture payload。生产环境建议仍只监听 `127.0.0.1`，通过内网/VPN/HTTPS 反向代理访问 `/admin`。
 
 本地冒烟检查：
 
@@ -145,6 +149,7 @@ node bin\tabbit-pool.js production init-key --json
 - 使用 PM2、NSSM、Windows Task Scheduler、systemd 或容器平台托管 Node 进程。
 - 只在内网或本机监听；需要公网访问时放在 HTTPS 反向代理后面。
 - 必须设置强 `TABBIT_POOL_API_KEY`，不要使用默认 `sk-tabbit-local` 暴露服务。
+- Web 后台共用 gateway API key；反向代理应限制 `/admin` 只给可信网络或已登录用户访问。
 - `stateDir`、cookie 文件、fixture store、日志和浏览器 profile 不要放进仓库。
 - 部署后先运行 `production preflight`、`readiness doctor` 和 `smoke gateway`，确认聚合状态再接入客户端。
 

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { runInNewContext } from "node:vm";
 
 import {
   anthropicMessageToSseEvents,
@@ -99,6 +100,118 @@ test("GET /health returns protocol-pool health without authentication", async ()
     assert.equal(response.status, 200);
     assert.match(response.contentType, /^application\/json/);
     assert.deepEqual(response.body, { status: "ok", mode: "protocol-pool" });
+  });
+});
+
+test("GET /admin serves the management shell without exposing secrets", async () => {
+  const server = createProtocolPoolServer({
+    compat: {
+      async handleChatCompletions() { throw new Error("not used"); },
+      async handleResponses() { throw new Error("not used"); },
+    },
+    admin: {
+      async statusProvider() {
+        return { status: "blocked" };
+      },
+    },
+  });
+
+  await withServer(server, async (baseUrl) => {
+    const response = await requestText(baseUrl, "/admin");
+
+    assert.equal(response.status, 200);
+    assert.match(response.contentType, /^text\/html/);
+    assert.match(response.body, /Tabbit Pool Admin/);
+    assert.match(response.body, /admin-root/);
+    assert.doesNotMatch(response.body, /sk-tabbit-local|tabbit_session|Bearer\s+/);
+  });
+});
+
+test("GET /admin renders status values as escaped text", async () => {
+  const server = createProtocolPoolServer({
+    compat: {
+      async handleChatCompletions() { throw new Error("not used"); },
+      async handleResponses() { throw new Error("not used"); },
+    },
+    admin: {
+      async statusProvider() {
+        return { status: "blocked" };
+      },
+    },
+  });
+
+  await withServer(server, async (baseUrl) => {
+    const response = await requestText(baseUrl, "/admin");
+    const script = response.body.match(/<script>([\s\S]*)<\/script>/)?.[1];
+    assert.ok(script);
+
+    const elements = new Map();
+    function getElementById(id) {
+      if (!elements.has(id)) {
+        elements.set(id, {
+          id,
+          value: "",
+          innerHTML: "",
+          textContent: "",
+          addEventListener() {},
+        });
+      }
+      return elements.get(id);
+    }
+
+    await runInNewContext(script, {
+      document: { getElementById },
+      sessionStorage: {
+        getItem() { return "admin-key"; },
+        setItem() {},
+      },
+      fetch: async () => ({
+        ok: true,
+        json: async () => ({
+          status: 'ok"><img src=x onerror=alert(1)>',
+          stateDir: '<img src=x onerror=alert(2)>',
+          gatewayApiKey: { status: "configured", source: "env" },
+          protocol: {},
+          health: { accounts: {} },
+        }),
+      }),
+      JSON,
+      String,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.doesNotMatch(getElementById("summary").innerHTML, /<img/);
+    assert.match(getElementById("summary").innerHTML, /&lt;img/);
+  });
+});
+
+test("GET /admin/api/status requires the gateway API key", async () => {
+  const server = createProtocolPoolServer({
+    apiKey: "admin-secret-key",
+    compat: {
+      async handleChatCompletions() { throw new Error("not used"); },
+      async handleResponses() { throw new Error("not used"); },
+    },
+    admin: {
+      async statusProvider() {
+        return { status: "blocked", stateDir: "E:\\tabbit-live-state" };
+      },
+    },
+  });
+
+  await withServer(server, async (baseUrl) => {
+    const rejected = await requestJson(baseUrl, "/admin/api/status");
+    const accepted = await requestJson(baseUrl, "/admin/api/status", {
+      headers: { "x-api-key": "admin-secret-key" },
+    });
+
+    assert.equal(rejected.status, 401);
+    assert.equal(rejected.body.error.code, "invalid_api_key");
+    assert.equal(accepted.status, 200);
+    assert.deepEqual(accepted.body, {
+      status: "blocked",
+      stateDir: "E:\\tabbit-live-state",
+    });
   });
 });
 

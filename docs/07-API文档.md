@@ -11,6 +11,7 @@
 - 已实现 Observability foundation，并默认接入 protocol-pool gateway `/health` 账号池摘要。
 - 已实现 M08 本地运维 CLI foundation：`tabbit-pool accounts list`、`tabbit-pool accounts import-session`、`tabbit-pool accounts probe`、`tabbit-pool health`、`tabbit-pool readiness`、`tabbit-pool readiness doctor`、`tabbit-pool readiness mark`、`tabbit-pool production preflight`、`tabbit-pool production init-key`、`tabbit-pool serve/start`、`tabbit-pool smoke gateway`、`tabbit-pool maintain`、`tabbit-pool fixtures list`、`tabbit-pool fixtures audit`、`tabbit-pool fixtures show`、`tabbit-pool probe advice`、`tabbit-pool probe template`、`tabbit-pool probe validate`、`tabbit-pool probe protocol`（含 `--input-json/--input-file`、refreshQuota/uploadAttachment/只读 commerce 查询/M05 side-effect probe 模板、离线 recoverSession evidence 模板/校验/fixture 写入、离线 consumeResetCoupon evidence 模板/校验/fixture 写入、operation-aware schema validation 和 `--require-confirmed-side-effect` 离线副作用确认门禁）。
 - 已实现原生 HTTP server JSON 骨架与 OpenAI/Anthropic SSE adapter：`/health`、`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`。详见 [HTTP 路由层](modules/M06-兼容网关/HTTP路由层.md) 与 [流式 SSE 链路](10-流式SSE链路.md)。
+- 已实现内置 Web 运维后台：`GET /admin` 返回静态管理页面，`GET /admin/api/status` 使用 gateway API key 认证后返回脱敏聚合状态，不输出 API key、cookie、session、token、`cookieJarRef`、prompt 或 raw fixture payload。
 - 已实现 protocol-pool gateway 启动工厂和 `tabbit-pool serve/start` CLI，可从 config/stateDir 组合 JSON account store、FileSecretStore、StoredAccountPool、runner、OpenAICompat 与 HTTP server，并输出 OpenAI/Anthropic base URL。详见 [启动工厂](modules/M06-兼容网关/启动工厂.md)。
 - 真实 Tabbit 文本发送 endpoint `/api/v1/chat/completion`、session verify endpoint `/api/v0/user/base-info`、quota usage endpoint `/api/commerce/quota/v1/usage`、已验证只读 commerce 状态/资源 endpoint、M05 显式 side-effect probe endpoint、真实重置券消耗 endpoint/body/result 语义、浏览器校准签名头、真实 `display_name` 模型目录、`Default` 可用模型映射、已上传附件引用结构和完整配置上传链时的 raw/base64 附件自动上传已接入；注册/登录 auth 入口已有显式配置和响应归一化，但真实 send-code delivery/session-material success evidence、活动 Pro 成功领取 body 和抽奖成功响应仍待安全 evidence 后接入。`ProtocolTabbitClient.sendMessage()` 已具备真实 SSE/旧显式 sendPath SSE/NDJSON buffered 响应聚合解析、buffered OpenAI stream `tool_calls` 聚合、buffered Anthropic stream `tool_use` / `input_json_delta` 聚合、数组 `streamDeltas` 保留、可读 response.body 的 async `streamDeltas` producer、async OpenAI/Anthropic 工具 delta producer，以及 stream error frame 基础分类传播。`ProtocolTabbitClient.uploadAttachment()` 已具备显式 `attachmentUploadPath` 的签名上传骨架和真实 COS 三步上传；`sendMessage({ attachments })` 在真实分支支持已上传文件引用并映射为 `references[].metadata.file_id`，完整配置上传链时会自动上传 raw/base64 附件后发送。`ProtocolTabbitClient.refreshQuota()` 只有显式 `quotaUsagePath` 时才会用已登录 Cookie + `user_id` 查询 usage 百分比；只读 activity/newbie/placement/reward/lottery 方法只做 GET 查询。默认 `maintain` 不触网；显式配置 quota usage path 后可自动刷新额度，显式配置 sign-in path 后可自动执行已验证每日签到；活动 Pro、抽奖和真实重置券消耗仍不会自动执行，真实用券当前只通过显式 `useResetCoupon` probe/gateway 方法触发。OpenAI Chat/Responses 与 Anthropic Messages handler 会把这些 deltas 作为非公开 `stream.deltas` 元数据交给 HTTP SSE adapter；没有上游 delta 时仍支持基于完整 JSON 结果的 fallback SSE。
 
@@ -51,6 +52,14 @@
 ~~~
 
 后续可扩展 accountPool、modelCache、lastError、uptimeMs 等字段，但不能破坏 status 和 mode 的最小契约。
+
+### GET /admin
+
+返回内置 Web 运维后台 HTML。页面本身不包含密钥或账号明细；浏览器会让操作者输入 gateway API key，并用 `x-api-key` 请求 `/admin/api/status`。生产环境应通过内网、VPN 或 HTTPS 反向代理限制访问。
+
+### GET /admin/api/status
+
+返回后台状态摘要，需要 gateway API key。输出包含 `status`、`stateDir`、`productionState.source`、`gatewayApiKey.status/source`、协议配置布尔值和 `/health` 同源账号池摘要。该接口不返回真实 API key、cookie、session、token、`cookieJarRef`、账号邮箱、prompt 或 raw fixture payload。
 
 ### GET /v1/models
 

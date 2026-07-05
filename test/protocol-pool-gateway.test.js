@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { createProtocolPoolGateway, createSecretHydratingProtocolClientFactory } from "../src/protocol-pool-gateway.js";
+import { createAdminStatusProvider, createProtocolPoolGateway, createSecretHydratingProtocolClientFactory } from "../src/protocol-pool-gateway.js";
 
 const NOW = Date.parse("2026-07-02T03:00:00.000Z");
 
@@ -1089,6 +1089,88 @@ test("gateway default health exposes redacted account summary", async () => {
     assert.equal(JSON.stringify(response.body).includes("tabbit_session"), false);
     assert.equal(JSON.stringify(response.body).includes("secret-token"), false);
   });
+});
+
+test("gateway exposes admin status without leaking the configured API key", async () => {
+  const stateDir = await tempStateDir();
+  await writeAccounts(stateDir, [{
+    id: "acct_admin_status",
+    email: "admin-status@example.test",
+    status: "active",
+    cookieHeader: "tabbit_session=secret",
+  }]);
+
+  const gateway = await createProtocolPoolGateway({
+    env: {
+      TABBIT_POOL_STATE_DIR: stateDir,
+      TABBIT_POOL_API_KEY: "secret-admin-key",
+      TABBIT_POOL_PROTOCOL_ENABLED: "true",
+    },
+    now: () => NOW,
+    protocolClientFactory: () => ({
+      async sendMessage() {
+        throw new Error("not used");
+      },
+    }),
+  });
+
+  await withServer(gateway.server, async (baseUrl) => {
+    const response = await requestJson(baseUrl, "/admin/api/status", {
+      headers: { "x-api-key": "secret-admin-key" },
+    });
+    const serialized = JSON.stringify(response.body);
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.status, "ok");
+    assert.equal(response.body.stateDir, stateDir);
+    assert.equal(response.body.gatewayApiKey.status, "configured");
+    assert.equal(response.body.gatewayApiKey.source, "env");
+    assert.equal(response.body.protocol.enabled, true);
+    assert.equal(response.body.health.accounts.total, 1);
+    assert.doesNotMatch(serialized, /secret-admin-key|tabbit_session|admin-status@example\.test|cookieHeader|cookieJarRef/);
+  });
+});
+
+test("admin status provider summarizes health without leaking raw health secrets", async () => {
+  const provider = createAdminStatusProvider({
+    config: {
+      apiKey: "secret-admin-key",
+      stateDir: "E:\\tabbit-live-state",
+      protocol: { enabled: true },
+      productionState: { source: "explicit_env", apiKeySource: "env" },
+    },
+    health: {
+      status: "raw-admin@example.test tabbit_session=secret",
+      mode: "protocol-pool",
+      accounts: {
+        total: 1,
+        active: 0,
+        unavailable: 1,
+        byStatus: { login_expired: 1, "raw-admin@example.test": 1 },
+        raw: [{ email: "raw-admin@example.test", cookieHeader: "tabbit_session=secret" }],
+      },
+      alerts: [{
+        code: "session",
+        severity: "warning",
+        message: "raw-admin@example.test tabbit_session=secret",
+      }],
+      apiKey: "secret-admin-key",
+      cookieHeader: "tabbit_session=secret",
+    },
+    now: () => NOW,
+  });
+
+  const status = await provider();
+  const serialized = JSON.stringify(status);
+
+  assert.equal(status.status, "unknown");
+  assert.equal(status.health.status, "unknown");
+  assert.equal(status.health.accounts.total, 1);
+  assert.equal(status.health.accounts.active, 0);
+  assert.equal(status.health.accounts.byStatus.login_expired, 1);
+  assert.equal(status.health.accounts.byStatus["raw-admin@example.test"], undefined);
+  assert.equal(status.health.accounts.raw, undefined);
+  assert.doesNotMatch(serialized, /secret-admin-key|tabbit_session=secret|raw-admin@example\.test|cookieHeader/);
 });
 
 test("gateway hydrates cookieJarRef from the secret store without persisting raw cookies", async () => {

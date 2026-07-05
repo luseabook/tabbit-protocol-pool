@@ -19,6 +19,240 @@ export function writeJson(res, status, body) {
   res.end(text);
 }
 
+function writeHtml(res, status, body) {
+  res.writeHead(status, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+    "Cache-Control": "no-store",
+  });
+  res.end(body);
+}
+
+function adminDashboardHtml() {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tabbit Pool Admin</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --text: #1b1f24;
+      --muted: #667085;
+      --line: #d8dee8;
+      --accent: #0f766e;
+      --warn: #b45309;
+      --bad: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      letter-spacing: 0;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.2;
+      font-weight: 700;
+    }
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 20px auto;
+      display: grid;
+      gap: 16px;
+    }
+    .toolbar {
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) auto;
+      gap: 10px;
+      width: min(560px, 100%);
+    }
+    input {
+      min-width: 0;
+      height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0 10px;
+      font: inherit;
+      background: #fff;
+    }
+    button {
+      height: 38px;
+      border: 0;
+      border-radius: 6px;
+      padding: 0 14px;
+      font: inherit;
+      font-weight: 650;
+      background: var(--accent);
+      color: #fff;
+      cursor: pointer;
+    }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    h2 {
+      margin: 0 0 12px;
+      font-size: 14px;
+      line-height: 1.3;
+    }
+    dl {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+      gap: 10px;
+      margin: 0;
+    }
+    dt {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 3px;
+    }
+    dd {
+      margin: 0;
+      font-size: 15px;
+      overflow-wrap: anywhere;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .status-ok { color: var(--accent); }
+    .status-blocked, .status-degraded { color: var(--warn); }
+    .status-error { color: var(--bad); }
+    pre {
+      margin: 0;
+      max-height: 360px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 12px;
+      line-height: 1.5;
+      background: #101828;
+      color: #e4e7ec;
+      border-radius: 6px;
+      padding: 12px;
+    }
+    @media (max-width: 680px) {
+      header { align-items: stretch; flex-direction: column; padding: 16px; }
+      .toolbar { grid-template-columns: 1fr; }
+      main { width: calc(100% - 20px); margin: 10px auto; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Tabbit Pool Admin</h1>
+    <form class="toolbar" id="admin-auth">
+      <input id="admin-key" name="key" type="password" autocomplete="current-password" placeholder="Gateway API key" aria-label="Gateway API key">
+      <button type="submit">刷新</button>
+    </form>
+  </header>
+  <main id="admin-root">
+    <section>
+      <h2>状态</h2>
+      <dl id="summary"></dl>
+    </section>
+    <div class="grid">
+      <section>
+        <h2>账号池</h2>
+        <dl id="accounts"></dl>
+      </section>
+      <section>
+        <h2>协议</h2>
+        <dl id="protocol"></dl>
+      </section>
+    </div>
+    <section>
+      <h2>原始摘要</h2>
+      <pre id="raw">等待加载</pre>
+    </section>
+  </main>
+  <script>
+    const form = document.getElementById("admin-auth");
+    const keyInput = document.getElementById("admin-key");
+    const raw = document.getElementById("raw");
+    const summary = document.getElementById("summary");
+    const accounts = document.getElementById("accounts");
+    const protocol = document.getElementById("protocol");
+    keyInput.value = sessionStorage.getItem("tabbit-admin-key") || "";
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (char) => {
+        if (char === "&") return "&amp;";
+        if (char === "<") return "&lt;";
+        if (char === ">") return "&gt;";
+        if (char === '"') return "&quot;";
+        return "&#39;";
+      });
+    }
+    function safeClassName(value) {
+      const text = String(value || "");
+      return /^[A-Za-z0-9_-]+$/.test(text) ? text : "";
+    }
+    function item(label, value, className = "") {
+      const cssClass = safeClassName(className);
+      return "<div><dt>" + escapeHtml(label) + "</dt><dd" + (cssClass ? " class=\\"" + cssClass + "\\"" : "") + ">" + escapeHtml(value) + "</dd></div>";
+    }
+    function render(data) {
+      const statusClass = "status-" + String(data.status || "unknown");
+      summary.innerHTML = [
+        item("Gateway", data.status || "unknown", statusClass),
+        item("StateDir", data.stateDir || ""),
+        item("API Key", data.gatewayApiKey?.status || "unknown"),
+        item("Key Source", data.gatewayApiKey?.source || ""),
+      ].join("");
+      const accountSummary = data.health?.accounts || {};
+      accounts.innerHTML = [
+        item("Total", accountSummary.total ?? 0),
+        item("Active", accountSummary.active ?? 0),
+        item("Login Expired", accountSummary.byStatus?.login_expired ?? 0),
+        item("Suspect", accountSummary.byStatus?.suspect ?? 0),
+      ].join("");
+      protocol.innerHTML = [
+        item("Enabled", data.protocol?.enabled === true),
+        item("Send Path", data.protocol?.sendPathConfigured === true),
+        item("Session Verify", data.protocol?.sessionVerifyPathConfigured === true),
+        item("Model Catalog", data.protocol?.modelCatalogPathConfigured === true),
+      ].join("");
+      raw.textContent = JSON.stringify(data, null, 2);
+    }
+    async function loadStatus(event) {
+      if (event) event.preventDefault();
+      const key = keyInput.value.trim();
+      if (key) sessionStorage.setItem("tabbit-admin-key", key);
+      raw.textContent = "加载中";
+      const response = await fetch("/admin/api/status", { headers: key ? { "x-api-key": key } : {} });
+      const body = await response.json();
+      if (!response.ok) {
+        raw.textContent = JSON.stringify(body, null, 2);
+        return;
+      }
+      render(body);
+    }
+    form.addEventListener("submit", loadStatus);
+    if (keyInput.value) loadStatus();
+  </script>
+</body>
+</html>`;
+}
+
 export function sseData(payload) {
   const data = typeof payload === "string" ? payload : JSON.stringify(payload);
   return `data: ${data}\n\n`;
@@ -846,13 +1080,33 @@ async function handleCompatJsonRoute(req, res, compat, handlerName, { streamKind
   writeJson(res, result.status, result.body);
 }
 
-export function createProtocolPoolServer({ apiKey = DEFAULT_API_KEY, compat, modelsProvider = null, health = null } = {}) {
+async function resolveAdminStatus(admin) {
+  if (typeof admin?.statusProvider === "function") return await admin.statusProvider();
+  return { status: "unknown" };
+}
+
+export function createProtocolPoolServer({ apiKey = DEFAULT_API_KEY, compat, modelsProvider = null, health = null, admin = null } = {}) {
   return http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url || "/", "http://127.0.0.1");
 
       if (req.method === "GET" && url.pathname === "/health") {
         writeJson(res, 200, { status: "ok", mode: "protocol-pool", ...(await resolveHealth(health)) });
+        return;
+      }
+
+      if (admin && req.method === "GET" && (url.pathname === "/admin" || url.pathname === "/admin/")) {
+        writeHtml(res, 200, adminDashboardHtml());
+        return;
+      }
+
+      if (admin && url.pathname.startsWith("/admin/api/") && !isAuthorized(req, apiKey)) {
+        writeError(res, openAiHttpError(401, "Missing or invalid API key.", "authentication_error", "invalid_api_key"));
+        return;
+      }
+
+      if (admin && req.method === "GET" && url.pathname === "/admin/api/status") {
+        writeJson(res, 200, await resolveAdminStatus(admin));
         return;
       }
 

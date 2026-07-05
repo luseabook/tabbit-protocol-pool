@@ -8,6 +8,9 @@ import { ProtocolTabbitClient, ProtocolTabbitError } from "./protocol-tabbit-cli
 import { createProtocolPoolServer } from "./http-server.js";
 import { FileSecretStore } from "./secret-store.js";
 import { createGatewayHealthProvider } from "./observability.js";
+import { redactSensitiveValue } from "./redact.js";
+
+const DEFAULT_GATEWAY_API_KEY = "sk-tabbit-local";
 
 export async function hydrateAccountSecrets(account = {}, secretStore = null) {
   const hydrated = { ...account, audit: Array.isArray(account.audit) ? [...account.audit] : account.audit };
@@ -231,6 +234,95 @@ function createProtocolModelsProvider(baseProtocolClientFactory, config = {}) {
   };
 }
 
+async function resolveGatewayHealth(health) {
+  if (typeof health === "function") return await health();
+  return health || {};
+}
+
+function finiteNumber(value, fallback = 0) {
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function adminText(value, fallback = "") {
+  if (value === null || value === undefined || value === "") return fallback;
+  return String(redactSensitiveValue(value));
+}
+
+function adminStatus(value) {
+  const text = adminText(value, "unknown");
+  return /^[a-z][a-z0-9_-]{0,40}$/.test(text) ? text : "unknown";
+}
+
+function adminStatusCounts(byStatus = {}) {
+  if (!byStatus || typeof byStatus !== "object" || Array.isArray(byStatus)) return {};
+  return Object.fromEntries(
+    Object.entries(byStatus)
+      .filter(([key, value]) => /^[a-z][a-z0-9_-]{0,40}$/.test(String(key)) && Number.isFinite(value))
+      .map(([key, value]) => [String(key), value]),
+  );
+}
+
+function summarizeAdminHealth(healthSnapshot = {}) {
+  const snapshot = healthSnapshot && typeof healthSnapshot === "object" && !Array.isArray(healthSnapshot)
+    ? healthSnapshot
+    : {};
+  const accounts = snapshot.accounts && typeof snapshot.accounts === "object" && !Array.isArray(snapshot.accounts)
+    ? snapshot.accounts
+    : {};
+  const summary = {
+    status: adminStatus(snapshot.status),
+    accounts: {
+      total: finiteNumber(accounts.total),
+      active: finiteNumber(accounts.active),
+      unavailable: finiteNumber(accounts.unavailable),
+      byStatus: adminStatusCounts(accounts.byStatus),
+    },
+  };
+  if (snapshot.mode) summary.mode = adminText(snapshot.mode);
+  if (snapshot.observedAt) summary.observedAt = adminText(snapshot.observedAt);
+  if (Number.isFinite(snapshot.uptimeMs)) summary.uptimeMs = snapshot.uptimeMs;
+  if (Array.isArray(snapshot.alerts)) {
+    summary.alerts = snapshot.alerts.map((alert = {}) => ({
+      code: adminText(alert.code),
+      severity: adminText(alert.severity),
+      message: adminText(alert.message),
+    }));
+  }
+  return summary;
+}
+
+export function createAdminStatusProvider({ config = {}, health = null, now = () => Date.now() } = {}) {
+  return async () => {
+    const healthSnapshot = await resolveGatewayHealth(health);
+    const healthSummary = summarizeAdminHealth(healthSnapshot);
+    const apiKeyConfigured = Boolean(config.apiKey && config.apiKey !== DEFAULT_GATEWAY_API_KEY);
+    return {
+      status: healthSummary.status,
+      observedAt: new Date(now()).toISOString(),
+      stateDir: config.stateDir || "",
+      productionState: {
+        source: config.productionState?.source || "unknown",
+        apiKeySource: config.productionState?.apiKeySource || (apiKeyConfigured ? "env" : "default"),
+      },
+      gatewayApiKey: {
+        status: apiKeyConfigured ? "configured" : "default",
+        source: config.productionState?.apiKeySource || (apiKeyConfigured ? "env" : "default"),
+      },
+      protocol: {
+        enabled: Boolean(config.protocol?.enabled),
+        baseUrlConfigured: Boolean(config.protocol?.baseUrl),
+        signKeyPathConfigured: Boolean(config.protocol?.signKeyPath),
+        modelCatalogPathConfigured: Boolean(config.protocol?.modelCatalogPath),
+        sendPathConfigured: Boolean(config.protocol?.sendPath),
+        sessionVerifyPathConfigured: Boolean(config.protocol?.sessionVerifyPath),
+        compatStripClientTools: Boolean(config.compat?.stripClientTools),
+        toolLoopMode: config.compat?.toolLoopMode || "",
+      },
+      health: healthSummary,
+    };
+  };
+}
+
 function localToolExecutorFromOptions(options = {}) {
   if (typeof options.executeLocalToolUse === "function") return options.executeLocalToolUse;
   if (typeof options.localToolExecutor === "function") return options.localToolExecutor;
@@ -323,11 +415,17 @@ export async function createProtocolPoolGateway(options = {}) {
   const modelsProvider = Object.prototype.hasOwnProperty.call(options, "modelsProvider")
     ? options.modelsProvider
     : createProtocolModelsProvider(baseProtocolClientFactory, config);
+  const admin = options.admin === false
+    ? null
+    : (Object.prototype.hasOwnProperty.call(options, "admin")
+      ? options.admin
+      : { statusProvider: createAdminStatusProvider({ config, health, now: accountNow }) });
   const server = options.server || createProtocolPoolServer({
     apiKey: config.apiKey,
     compat,
     modelsProvider,
     health,
+    admin,
   });
 
   return {
