@@ -123,6 +123,12 @@ test("GET /admin serves the management shell without exposing secrets", async ()
     assert.match(response.contentType, /^text\/html/);
     assert.match(response.body, /Tabbit Pool Admin/);
     assert.match(response.body, /admin-root/);
+    assert.match(response.body, /admin-shell/);
+    assert.match(response.body, /ops-rail/);
+    assert.match(response.body, /motion-grid/);
+    assert.match(response.body, /metric-wall/);
+    assert.match(response.body, /incident-strip/);
+    assert.match(response.body, /raw-drawer/);
     assert.doesNotMatch(response.body, /sk-tabbit-local|tabbit_session|Bearer\s+/);
   });
 });

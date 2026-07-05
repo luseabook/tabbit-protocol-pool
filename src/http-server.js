@@ -38,14 +38,19 @@ function adminDashboardHtml() {
   <style>
     :root {
       color-scheme: light;
-      --bg: #f6f7f9;
+      --bg: #ffffff;
       --panel: #ffffff;
-      --text: #1b1f24;
-      --muted: #667085;
-      --line: #d8dee8;
-      --accent: #0f766e;
-      --warn: #b45309;
-      --bad: #b42318;
+      --text: #050505;
+      --muted: #626262;
+      --line: #050505;
+      --line-soft: #d7d7d7;
+      --accent: #00d7ff;
+      --acid: #eaff00;
+      --hot: #ff5a3c;
+      --ok: #008a45;
+      --warn: #b25b00;
+      --bad: #c1121f;
+      --shadow: 8px 8px 0 #050505;
     }
     * { box-sizing: border-box; }
     body {
@@ -155,36 +160,502 @@ function adminDashboardHtml() {
       .toolbar { grid-template-columns: 1fr; }
       main { width: calc(100% - 20px); margin: 10px auto; }
     }
+    html { min-height: 100%; }
+    body {
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+    .motion-grid {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      background:
+        linear-gradient(90deg, rgba(5, 5, 5, 0.06) 1px, transparent 1px),
+        linear-gradient(0deg, rgba(5, 5, 5, 0.06) 1px, transparent 1px),
+        repeating-linear-gradient(135deg, transparent 0 28px, rgba(0, 215, 255, 0.16) 28px 30px, transparent 30px 58px);
+      background-size: 44px 44px, 44px 44px, 120px 120px;
+      animation: grid-drift 18s linear infinite;
+    }
+    .motion-grid::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: repeating-linear-gradient(90deg, transparent 0 84px, rgba(234, 255, 0, 0.28) 84px 88px, transparent 88px 178px);
+      clip-path: polygon(58% 0, 100% 0, 100% 100%, 72% 100%);
+      animation: slice-drift 9s ease-in-out infinite alternate;
+    }
+    .admin-shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 252px minmax(0, 1fr);
+      gap: 22px;
+      padding: 18px;
+    }
+    .ops-rail {
+      position: sticky;
+      top: 18px;
+      align-self: start;
+      min-height: calc(100vh - 36px);
+      border: 2px solid var(--line);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      padding: 18px;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 22px;
+      transform: skewY(-1deg);
+    }
+    .ops-rail > * { transform: skewY(1deg); }
+    .brand-lockup {
+      display: grid;
+      grid-template-columns: 48px 1fr;
+      gap: 12px;
+      align-items: center;
+    }
+    .brand-mark {
+      width: 48px;
+      height: 48px;
+      display: grid;
+      place-items: center;
+      border: 2px solid var(--line);
+      background: var(--acid);
+      font-weight: 900;
+      box-shadow: 4px 4px 0 var(--line);
+    }
+    .eyebrow {
+      margin: 0 0 3px;
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      font-weight: 800;
+    }
+    .rail-nav {
+      display: grid;
+      gap: 8px;
+      align-content: start;
+    }
+    .rail-nav a {
+      color: var(--text);
+      text-decoration: none;
+      border: 2px solid var(--line);
+      background: #fff;
+      padding: 10px 12px;
+      font-weight: 800;
+      box-shadow: 3px 3px 0 var(--line);
+    }
+    .rail-nav a:nth-child(2) { transform: translateX(10px); }
+    .rail-nav a:nth-child(3) { transform: translateX(-4px); }
+    .rail-nav a.active {
+      background: var(--text);
+      color: #fff;
+    }
+    .rail-status {
+      border: 2px solid var(--line);
+      padding: 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 850;
+      background: var(--accent);
+    }
+    .pulse-dot {
+      width: 12px;
+      height: 12px;
+      border: 2px solid var(--line);
+      background: var(--acid);
+      animation: pulse-dot 1.8s steps(2, end) infinite;
+    }
+    .console-stage {
+      width: auto;
+      margin: 0;
+      min-width: 0;
+      display: grid;
+      gap: 18px;
+    }
+    .topbar {
+      min-height: 136px;
+      border: 2px solid var(--line);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      padding: 20px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(320px, 470px);
+      gap: 20px;
+      align-items: end;
+      justify-content: stretch;
+      position: relative;
+      overflow: hidden;
+    }
+    .topbar::before {
+      content: "";
+      position: absolute;
+      inset: auto -40px 18px 48%;
+      height: 18px;
+      border-top: 2px solid var(--line);
+      border-bottom: 2px solid var(--line);
+      background: var(--acid);
+      transform: rotate(-3deg);
+      animation: scan-line 4s ease-in-out infinite alternate;
+    }
+    .title-block {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      gap: 10px;
+    }
+    .kicker-row {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    .kicker-row span {
+      border: 2px solid var(--line);
+      padding: 4px 8px;
+      background: #fff;
+    }
+    .topbar h2 {
+      margin: 0;
+      font-size: clamp(32px, 5vw, 64px);
+      line-height: 0.92;
+      font-weight: 950;
+      max-width: 760px;
+    }
+    .subline {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .auth-panel {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      border: 2px solid var(--line);
+      background: #fff;
+      padding: 10px;
+      box-shadow: 5px 5px 0 var(--line);
+    }
+    .auth-panel input {
+      height: 44px;
+      border: 2px solid var(--line);
+      border-radius: 0;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .auth-panel button {
+      height: 44px;
+      border: 2px solid var(--line);
+      border-radius: 0;
+      background: var(--text);
+      color: #fff;
+      font-weight: 900;
+      box-shadow: 3px 3px 0 var(--acid);
+      white-space: nowrap;
+    }
+    .incident-strip {
+      border: 2px solid var(--line);
+      background: var(--text);
+      color: #fff;
+      min-height: 64px;
+      display: grid;
+      grid-template-columns: 160px minmax(0, 1fr) auto;
+      gap: 14px;
+      align-items: center;
+      padding: 14px 18px;
+      box-shadow: 6px 6px 0 var(--accent);
+    }
+    .incident-strip span {
+      color: #d8d8d8;
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    .incident-strip strong {
+      font-size: clamp(20px, 3vw, 34px);
+      line-height: 1;
+      overflow-wrap: anywhere;
+    }
+    .metric-wall {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      border: 0;
+      background: transparent;
+      padding: 0;
+    }
+    .metric {
+      background: var(--panel);
+      border: 2px solid var(--line);
+      padding: 16px;
+      min-height: 124px;
+      display: grid;
+      align-content: space-between;
+      box-shadow: 5px 5px 0 var(--line);
+      position: relative;
+      overflow: hidden;
+    }
+    .metric:nth-child(2) { transform: translateY(14px); }
+    .metric:nth-child(3) { transform: translateY(-6px); }
+    .metric:nth-child(4) { transform: translateY(8px); }
+    .metric::after {
+      content: "";
+      position: absolute;
+      right: -20px;
+      bottom: 12px;
+      width: 96px;
+      height: 12px;
+      border: 2px solid var(--line);
+      background: var(--accent);
+      transform: rotate(-12deg);
+    }
+    .metric.tone-ok::after { background: var(--acid); }
+    .metric.tone-blocked::after,
+    .metric.tone-degraded::after { background: var(--hot); }
+    .metric-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }
+    .metric-value {
+      margin: 0;
+      font-size: clamp(22px, 3vw, 36px);
+      line-height: 1;
+      font-weight: 950;
+      overflow-wrap: anywhere;
+      position: relative;
+      z-index: 1;
+    }
+    .control-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.95fr);
+      gap: 18px;
+      align-items: start;
+    }
+    .ops-panel {
+      border: 2px solid var(--line);
+      background: var(--panel);
+      padding: 16px;
+      box-shadow: 6px 6px 0 var(--line);
+    }
+    .ops-panel:nth-child(2) {
+      transform: translateY(18px);
+      box-shadow: 6px 6px 0 var(--accent);
+    }
+    .ops-panel.wide {
+      grid-column: 1 / -1;
+      transform: translateX(12px);
+      width: calc(100% - 12px);
+      box-shadow: 6px 6px 0 var(--acid);
+    }
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      border-bottom: 2px solid var(--line);
+      padding-bottom: 10px;
+      margin-bottom: 12px;
+    }
+    .panel-head h2 {
+      margin: 0;
+      font-size: 16px;
+      line-height: 1.2;
+      font-weight: 950;
+    }
+    .panel-tag {
+      border: 2px solid var(--line);
+      background: var(--acid);
+      color: var(--text);
+      padding: 3px 7px;
+      font-size: 11px;
+      font-weight: 900;
+      white-space: nowrap;
+    }
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .detail-item {
+      border: 2px solid var(--line-soft);
+      padding: 10px;
+      min-height: 70px;
+      background: #fff;
+    }
+    .detail-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 850;
+      text-transform: uppercase;
+    }
+    .detail-value {
+      margin-top: 6px;
+      font-size: 22px;
+      font-weight: 950;
+      overflow-wrap: anywhere;
+    }
+    .status-ok { color: var(--ok); }
+    .status-blocked, .status-degraded { color: var(--warn); }
+    .status-error, .status-unhealthy { color: var(--bad); }
+    .raw-drawer {
+      border: 2px solid var(--line);
+      background: var(--panel);
+      box-shadow: 6px 6px 0 var(--hot);
+      overflow: hidden;
+    }
+    .raw-drawer .panel-head {
+      margin: 0;
+      padding: 14px 16px;
+      background: var(--text);
+      color: #fff;
+      border-bottom: 2px solid var(--line);
+    }
+    .raw-drawer pre {
+      max-height: 380px;
+      background: #fff;
+      color: var(--text);
+      border: 0;
+      border-radius: 0;
+      padding: 16px;
+    }
+    @keyframes grid-drift {
+      from { background-position: 0 0, 0 0, 0 0; }
+      to { background-position: 88px 44px, 44px 88px, 120px 60px; }
+    }
+    @keyframes slice-drift {
+      from { transform: translateX(0); }
+      to { transform: translateX(-34px); }
+    }
+    @keyframes scan-line {
+      from { transform: rotate(-3deg) translateX(0); }
+      to { transform: rotate(-3deg) translateX(-24px); }
+    }
+    @keyframes pulse-dot {
+      0%, 100% { background: var(--acid); }
+      50% { background: #fff; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .motion-grid,
+      .motion-grid::after,
+      .topbar::before,
+      .pulse-dot { animation: none; }
+    }
+    @media (max-width: 980px) {
+      .admin-shell { grid-template-columns: 1fr; }
+      .ops-rail {
+        position: relative;
+        top: 0;
+        min-height: auto;
+        transform: none;
+      }
+      .ops-rail > * { transform: none; }
+      .rail-nav { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .rail-nav a { transform: none !important; }
+      .topbar { grid-template-columns: 1fr; }
+      .metric-wall { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .control-grid { grid-template-columns: 1fr; }
+      .ops-panel,
+      .ops-panel:nth-child(2),
+      .ops-panel.wide {
+        transform: none;
+        width: 100%;
+      }
+    }
+    @media (max-width: 640px) {
+      .admin-shell { padding: 10px; gap: 14px; }
+      .rail-nav { grid-template-columns: 1fr; }
+      .topbar { padding: 14px; }
+      .auth-panel { grid-template-columns: 1fr; }
+      .incident-strip { grid-template-columns: 1fr; }
+      .metric-wall,
+      .detail-grid { grid-template-columns: 1fr; }
+      .metric:nth-child(n) { transform: none; }
+    }
   </style>
 </head>
 <body>
-  <header>
-    <h1>Tabbit Pool Admin</h1>
-    <form class="toolbar" id="admin-auth">
-      <input id="admin-key" name="key" type="password" autocomplete="current-password" placeholder="Gateway API key" aria-label="Gateway API key">
-      <button type="submit">刷新</button>
-    </form>
-  </header>
-  <main id="admin-root">
-    <section>
-      <h2>状态</h2>
-      <dl id="summary"></dl>
-    </section>
-    <div class="grid">
-      <section>
-        <h2>账号池</h2>
-        <dl id="accounts"></dl>
+  <div class="motion-grid" aria-hidden="true"></div>
+  <div class="admin-shell">
+    <aside class="ops-rail">
+      <div class="brand-lockup">
+        <div class="brand-mark">TP</div>
+        <div>
+          <p class="eyebrow">Gateway Ops</p>
+          <h1>Tabbit Pool Admin</h1>
+        </div>
+      </div>
+      <nav class="rail-nav" aria-label="Admin sections">
+        <a class="active" href="#admin-root">Overview</a>
+        <a href="#accounts-panel">Accounts</a>
+        <a href="#raw-panel">Telemetry</a>
+      </nav>
+      <div class="rail-status">
+        <span class="pulse-dot" aria-hidden="true"></span>
+        <span id="rail-state">LOCKED</span>
+      </div>
+    </aside>
+    <main id="admin-root" class="console-stage">
+      <header class="topbar">
+        <div class="title-block">
+          <div class="kicker-row">
+            <span>Protocol Pool</span>
+            <span id="key-source">Key source: unknown</span>
+          </div>
+          <h2>Gateway Control Surface</h2>
+          <p class="subline" id="state-path">StateDir: waiting for status</p>
+        </div>
+        <form class="auth-panel" id="admin-auth">
+          <input id="admin-key" name="key" type="password" autocomplete="current-password" placeholder="Gateway API key" aria-label="Gateway API key">
+          <button type="submit">刷新状态</button>
+        </form>
+      </header>
+      <section class="incident-strip">
+        <span>Gateway state</span>
+        <strong id="status-word">等待认证</strong>
+        <span id="observed-at">Observed: --</span>
       </section>
-      <section>
-        <h2>协议</h2>
-        <dl id="protocol"></dl>
+      <section class="metric-wall" id="summary"></section>
+      <div class="control-grid">
+        <section class="ops-panel" id="accounts-panel">
+          <div class="panel-head">
+            <h2>账号池</h2>
+            <span class="panel-tag">POOL</span>
+          </div>
+          <div class="detail-grid" id="accounts"></div>
+        </section>
+        <section class="ops-panel">
+          <div class="panel-head">
+            <h2>协议</h2>
+            <span class="panel-tag">PROTO</span>
+          </div>
+          <div class="detail-grid" id="protocol"></div>
+        </section>
+        <section class="ops-panel wide">
+          <div class="panel-head">
+            <h2>安全态势</h2>
+            <span class="panel-tag">SAFE</span>
+          </div>
+          <div class="detail-grid" id="security"></div>
+        </section>
+      </div>
+      <section class="raw-drawer" id="raw-panel">
+        <div class="panel-head">
+          <h2>原始摘要</h2>
+          <span class="panel-tag">JSON</span>
+        </div>
+        <pre id="raw">等待认证</pre>
       </section>
-    </div>
-    <section>
-      <h2>原始摘要</h2>
-      <pre id="raw">等待加载</pre>
-    </section>
-  </main>
+    </main>
+  </div>
   <script>
     const form = document.getElementById("admin-auth");
     const keyInput = document.getElementById("admin-key");
@@ -192,6 +663,12 @@ function adminDashboardHtml() {
     const summary = document.getElementById("summary");
     const accounts = document.getElementById("accounts");
     const protocol = document.getElementById("protocol");
+    const security = document.getElementById("security");
+    const railState = document.getElementById("rail-state");
+    const statusWord = document.getElementById("status-word");
+    const observedAt = document.getElementById("observed-at");
+    const keySource = document.getElementById("key-source");
+    const statePath = document.getElementById("state-path");
     keyInput.value = sessionStorage.getItem("tabbit-admin-key") || "";
     function escapeHtml(value) {
       return String(value ?? "").replace(/[&<>"']/g, (char) => {
@@ -208,28 +685,48 @@ function adminDashboardHtml() {
     }
     function item(label, value, className = "") {
       const cssClass = safeClassName(className);
-      return "<div><dt>" + escapeHtml(label) + "</dt><dd" + (cssClass ? " class=\\"" + cssClass + "\\"" : "") + ">" + escapeHtml(value) + "</dd></div>";
+      return "<article class=\\"metric " + cssClass + "\\"><span class=\\"metric-label\\">" + escapeHtml(label) + "</span><p class=\\"metric-value\\">" + escapeHtml(value) + "</p></article>";
+    }
+    function detail(label, value, className = "") {
+      const cssClass = safeClassName(className);
+      return "<div class=\\"detail-item " + cssClass + "\\"><div class=\\"detail-label\\">" + escapeHtml(label) + "</div><div class=\\"detail-value\\">" + escapeHtml(value) + "</div></div>";
+    }
+    function boolLabel(value) {
+      return value === true ? "ON" : "OFF";
     }
     function render(data) {
-      const statusClass = "status-" + String(data.status || "unknown");
+      const statusText = String(data.status || "unknown");
+      const statusToken = safeClassName(statusText) || "unknown";
+      const statusClass = "tone-" + statusToken + " status-" + statusToken;
+      railState.textContent = statusText.toUpperCase();
+      statusWord.textContent = statusText;
+      observedAt.textContent = "Observed: " + (data.observedAt || "--");
+      keySource.textContent = "Key source: " + (data.gatewayApiKey?.source || "unknown");
+      statePath.textContent = "StateDir: " + (data.stateDir || "unknown");
       summary.innerHTML = [
         item("Gateway", data.status || "unknown", statusClass),
-        item("StateDir", data.stateDir || ""),
+        item("Accounts", data.health?.accounts?.total ?? 0),
+        item("Active", data.health?.accounts?.active ?? 0),
         item("API Key", data.gatewayApiKey?.status || "unknown"),
-        item("Key Source", data.gatewayApiKey?.source || ""),
       ].join("");
       const accountSummary = data.health?.accounts || {};
       accounts.innerHTML = [
-        item("Total", accountSummary.total ?? 0),
-        item("Active", accountSummary.active ?? 0),
-        item("Login Expired", accountSummary.byStatus?.login_expired ?? 0),
-        item("Suspect", accountSummary.byStatus?.suspect ?? 0),
+        detail("Total", accountSummary.total ?? 0),
+        detail("Active", accountSummary.active ?? 0, "status-ok"),
+        detail("Login Expired", accountSummary.byStatus?.login_expired ?? 0, "status-degraded"),
+        detail("Suspect", accountSummary.byStatus?.suspect ?? 0, "status-error"),
       ].join("");
       protocol.innerHTML = [
-        item("Enabled", data.protocol?.enabled === true),
-        item("Send Path", data.protocol?.sendPathConfigured === true),
-        item("Session Verify", data.protocol?.sessionVerifyPathConfigured === true),
-        item("Model Catalog", data.protocol?.modelCatalogPathConfigured === true),
+        detail("Enabled", boolLabel(data.protocol?.enabled === true)),
+        detail("Send Path", boolLabel(data.protocol?.sendPathConfigured === true)),
+        detail("Session Verify", boolLabel(data.protocol?.sessionVerifyPathConfigured === true)),
+        detail("Model Catalog", boolLabel(data.protocol?.modelCatalogPathConfigured === true)),
+      ].join("");
+      security.innerHTML = [
+        detail("Key", data.gatewayApiKey?.status || "unknown"),
+        detail("Source", data.gatewayApiKey?.source || "unknown"),
+        detail("Base URL", boolLabel(data.protocol?.baseUrlConfigured === true)),
+        detail("Sign Key", boolLabel(data.protocol?.signKeyPathConfigured === true)),
       ].join("");
       raw.textContent = JSON.stringify(data, null, 2);
     }
@@ -241,6 +738,9 @@ function adminDashboardHtml() {
       const response = await fetch("/admin/api/status", { headers: key ? { "x-api-key": key } : {} });
       const body = await response.json();
       if (!response.ok) {
+        railState.textContent = "LOCKED";
+        statusWord.textContent = "认证失败";
+        observedAt.textContent = "Observed: --";
         raw.textContent = JSON.stringify(body, null, 2);
         return;
       }
