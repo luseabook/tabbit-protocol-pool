@@ -171,6 +171,40 @@ test("normalizeAnthropicMessagesRequest ignores auto tool choice when no tools a
   assert.equal(Object.hasOwn(normalized, "toolChoice"), false);
 });
 
+test("normalizeAnthropicMessagesRequest strips Claude Code client tools when configured", () => {
+  const normalized = normalizeAnthropicMessagesRequest({
+    model: "Claude-Haiku-4.5",
+    messages: [{ role: "user", content: "hello" }],
+    tools: [
+      { name: "Bash", description: "Run shell commands", input_schema: { type: "object" } },
+      { name: "Read", description: "Read files", input_schema: { type: "object" } },
+      { name: "mcp__browser__click", description: "Click in browser", input_schema: { type: "object" } },
+    ],
+    tool_choice: { type: "auto" },
+  }, { stripClientTools: true });
+
+  assert.equal(Object.hasOwn(normalized, "tools"), false);
+  assert.equal(Object.hasOwn(normalized, "toolChoice"), false);
+});
+
+test("normalizeAnthropicMessagesRequest strips Claude Code beta management tools and matching tool choice", () => {
+  const normalized = normalizeAnthropicMessagesRequest({
+    model: "Claude-Haiku-4.5",
+    messages: [{ role: "user", content: "hello" }],
+    tools: [
+      { name: "TodoRead", description: "Read todo state", input_schema: { type: "object" } },
+      { name: "ListMcpResourcesTool", description: "List MCP resources", input_schema: { type: "object" } },
+      { name: "ReadMcpResourceTool", description: "Read MCP resource", input_schema: { type: "object" } },
+      { name: "list_mcp_resource_templates", description: "List MCP templates", input_schema: { type: "object" } },
+      { name: "web_search", description: "Search web", input_schema: { type: "object" } },
+    ],
+    tool_choice: { type: "tool", name: "TodoRead" },
+  }, { stripClientTools: true });
+
+  assert.equal(Object.hasOwn(normalized, "tools"), false);
+  assert.equal(Object.hasOwn(normalized, "toolChoice"), false);
+});
+
 test("normalizeAnthropicMessagesRequest preserves tool_use and tool_result content blocks", () => {
   const assistantContent = [{
     type: "tool_use",
@@ -298,6 +332,8 @@ test("handleMessages maps pooled errors to Anthropic error envelope", async () =
   const cases = [
     { category: "no_available_account", code: "NO_AVAILABLE_ACCOUNT", status: 503, type: "api_error" },
     { category: "login_required", code: "LOGIN_REQUIRED", status: 401, type: "authentication_error" },
+    { category: "upstream_error", code: "UPSTREAM_UNAVAILABLE", status: 503, type: "api_error" },
+    { category: "model_entitlement", code: "MODEL_ENTITLEMENT_REQUIRED", status: 403, type: "invalid_request_error" },
   ];
 
   for (const item of cases) {

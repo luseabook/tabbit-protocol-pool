@@ -194,7 +194,7 @@ function isInsidePath(childPath, rootPath) {
 }
 
 function shouldRedactProbeText(key = "", parentKey = "") {
-  if (/^(content|prompt|text|output|html_content|delta|payload)$/i.test(key)) return true;
+  if (/^(content|prompt|text|output|html_content|delta|payload|query|queries|arguments|arguments_delta)$/i.test(key)) return true;
   if (/^(streamDeltas|deltas)$/i.test(key)) return true;
   if (key === "data" && /^(attachments?|events?|frames?|messages?)$/i.test(parentKey)) return true;
   return false;
@@ -202,20 +202,30 @@ function shouldRedactProbeText(key = "", parentKey = "") {
 
 function shouldRedactProbePrimitive(key = "", parentKey = "") {
   if (shouldRedactProbeText(key, parentKey)) return true;
+  if (/^(chatSessionId|chat_session_id|messageId|message_id|parentId|parent_id|requestMessageId|request_message_id|toolCallId|tool_call_id|parallelGroupId|parallel_group_id)$/i.test(key)) return true;
   if (/^(couponCode|coupon_code|couponNo|coupon_no|couponId|coupon_id)$/i.test(key)) return true;
+  if (/^id$/i.test(key) && /^(contentBlocks|toolCalls|tool_calls)$/i.test(parentKey)) return true;
   if (/^(userId|user_id|uid|openId|open_id|unionId|union_id|nickname|displayName|display_name|avatar|avatar_url|phone|mobile|uuid|captcha|captchaToken|captcha_token|challenge|challenge_id|requestCode|request_code|verifyUrl|verify_url|ticket|randstr|validate|seccode|risk_token)$/i.test(key)) return true;
   if (/^(id|name)$/i.test(key) && /^(user|users|user_info|profile|member)$/i.test(parentKey)) return true;
   return false;
 }
 
+function isErrorCodeField(key = "", parentKey = "") {
+  return /^code$/i.test(key) && /^error$/i.test(parentKey);
+}
+
 function deeplySanitize(value, key = "", parentKey = "") {
   if (Array.isArray(value)) return value.map((item) => deeplySanitize(item, key, parentKey));
   if (value && typeof value === "object") {
+    if (shouldRedactProbeText(key, parentKey)) return "***";
     const output = {};
     for (const [childKey, childValue] of Object.entries(value)) {
       output[childKey] = deeplySanitize(childValue, childKey, key);
     }
     return output;
+  }
+  if ((typeof value === "string" || typeof value === "number") && isErrorCodeField(key, parentKey)) {
+    return sanitizeText(value);
   }
   if ((typeof value === "string" || typeof value === "number") && shouldRedactProbePrimitive(key, parentKey)) {
     return "***";

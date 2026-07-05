@@ -77,11 +77,26 @@ test("summarizeAccounts counts statuses and raises actionable alerts", () => {
   assert.ok(allQuota.alerts.some((alert) => alert.code === "all_accounts_quota_exhausted"));
 });
 
+test("summarizeAccounts treats expired cooldown accounts as serviceable when now is provided", () => {
+  const summary = summarizeAccounts([
+    { id: "cooldown_a", status: "cooldown", cooldownUntil: "2026-07-02T02:59:59.000Z" },
+    { id: "cooldown_b", status: "cooldown", cooldownUntil: "2026-07-02T03:00:00.000Z" },
+  ], { now: NOW });
+
+  assert.equal(summary.total, 2);
+  assert.equal(summary.active, 2);
+  assert.equal(summary.unavailable, 0);
+  assert.equal(summary.byStatus.cooldown, 2);
+  assert.equal(summary.health, "ok");
+  assert.deepEqual(summary.alerts.map((alert) => alert.code), []);
+});
+
 test("redactAccountForDisplay keeps useful metadata and removes raw secrets", () => {
   const display = redactAccountForDisplay(accounts[1]);
 
   assert.deepEqual(Object.keys(display).sort(), [
     "accessTier",
+    "chatSessionConfigured",
     "cooldownUntil",
     "email",
     "failureStreak",
@@ -94,6 +109,7 @@ test("redactAccountForDisplay keeps useful metadata and removes raw secrets", ()
   assert.equal(display.id, "acct_cooldown");
   assert.equal(display.email, "co***@example.test");
   assert.equal(display.status, "cooldown");
+  assert.equal(display.chatSessionConfigured, false);
   assert.equal(display.lastError.category, "protocol_changed");
   assert.equal(display.lastError.code, "PARSE_FAILED");
   assert.doesNotMatch(display.lastError.message, /cooldown-user@example\.test/);
@@ -106,6 +122,19 @@ test("redactAccountForDisplay keeps useful metadata and removes raw secrets", ()
   const list = redactAccountsForDisplay(accounts);
   assert.equal(list.length, 3);
   assert.equal(list[0].email, "al***@example.test");
+});
+
+test("redactAccountForDisplay reports browser chat session configuration without leaking the id", () => {
+  const display = redactAccountForDisplay({
+    id: "acct_chat_session",
+    status: "active",
+    accessTier: "pro",
+    chatSessionId: "browser-chat-session-uuid",
+  });
+
+  assert.equal(display.chatSessionConfigured, true);
+  assert.equal(display.chatSessionId, undefined);
+  assert.equal(JSON.stringify(display).includes("browser-chat-session-uuid"), false);
 });
 
 test("buildHealthSnapshot combines account summary and model cache without leaking accounts", () => {
@@ -1383,6 +1412,80 @@ test("buildCalibrationReadinessSnapshot blocks protocol calibration without path
   assert.deepEqual(snapshot.checks.forbidden403.missing, ["forbidden_403_fixture"]);
 });
 
+test("buildCalibrationReadinessSnapshot requires chat session context for restored chat completion", () => {
+  const snapshot = buildCalibrationReadinessSnapshot({
+    accounts: [
+      { id: "acct_active", status: "active", accessTier: "pro" },
+    ],
+    config: {
+      protocol: {
+        enabled: true,
+        sendPath: "/api/v1/chat/completion",
+        sessionVerifyPath: "/api/v0/user/base-info",
+      },
+    },
+    fixtures: [
+      { operation: "verifySession", status: "success", result: { ok: true, userId: "user_123" } },
+      { operation: "sendMessage", status: "success", result: { contentBlocks: [{ type: "text", text: "ok" }] } },
+      { operation: "sendMessage", status: "failed", adviceCategory: "forbidden", error: { status: 403, message: "risk control" } },
+    ],
+    codexVerified: true,
+    claudeVerified: true,
+    now: () => NOW,
+  });
+
+  assert.equal(snapshot.status, "blocked");
+  assert.equal(snapshot.checks.protocolCalibration.status, "blocked");
+  assert.deepEqual(snapshot.checks.protocolCalibration.missing, ["chat_session_context"]);
+  assert.deepEqual(snapshot.checks.protocolCalibration.evidence.chatSessionContext, {
+    required: true,
+    configured: false,
+    defaultConfigured: false,
+    activeAccountsWithChatSession: 0,
+    autoCreateConfigured: false,
+  });
+  assert.ok(snapshot.nextActions.some((action) => action.includes("chat session")));
+  assert.equal(JSON.stringify(snapshot).includes("browser-chat-session-uuid"), false);
+});
+
+test("buildCalibrationReadinessSnapshot accepts auto-created chat session context for restored chat completion", () => {
+  const snapshot = buildCalibrationReadinessSnapshot({
+    accounts: [
+      { id: "acct_active", status: "active", accessTier: "pro" },
+    ],
+    config: {
+      protocol: {
+        enabled: true,
+        sendPath: "/api/v1/chat/completion",
+        sessionVerifyPath: "/api/v0/user/base-info",
+        chatSessionCreatePath: "/newtab",
+        chatSessionCreateActionId: "action-create-session",
+        chatSessionAutoCreate: true,
+      },
+    },
+    fixtures: [
+      { operation: "verifySession", status: "success", result: { ok: true, userId: "user_123" } },
+      { operation: "sendMessage", status: "success", result: { contentBlocks: [{ type: "text", text: "ok" }] } },
+      { operation: "sendMessage", status: "failed", adviceCategory: "forbidden", error: { status: 403, message: "risk control" } },
+    ],
+    codexVerified: true,
+    claudeVerified: true,
+    now: () => NOW,
+  });
+
+  assert.equal(snapshot.status, "ready");
+  assert.equal(snapshot.checks.protocolCalibration.status, "ready");
+  assert.deepEqual(snapshot.checks.protocolCalibration.missing, []);
+  assert.deepEqual(snapshot.checks.protocolCalibration.evidence.chatSessionContext, {
+    required: true,
+    configured: true,
+    defaultConfigured: false,
+    activeAccountsWithChatSession: 0,
+    autoCreateConfigured: true,
+  });
+  assert.equal(snapshot.nextActions.some((action) => action.includes("chat session")), false);
+});
+
 test("buildReadinessDoctorReport combines readiness and fixture audit without leaking secrets", () => {
   const report = buildReadinessDoctorReport({
     accounts,
@@ -1401,6 +1504,7 @@ test("buildReadinessDoctorReport combines readiness and fixture audit without le
         authSendCodePath: "/api/auth/send-code",
         authSubmitCodePath: "/api/auth/submit-code",
         reqCtx: "browser-context-secret",
+        defaultChatSessionId: "browser-chat-session-secret",
       },
     },
     fixtures: [
@@ -1435,7 +1539,7 @@ test("buildReadinessDoctorReport combines readiness and fixture audit without le
 
   const text = JSON.stringify(report);
   assert.doesNotMatch(text, /alpha-user@example\.test|cooldown-user@example\.test|quota-user@example\.test/);
-  assert.doesNotMatch(text, /tabbit_session|secret-local-key|browser-context-secret|secrets\/acct_active\.cookie|secret-token|secret-session/);
+  assert.doesNotMatch(text, /tabbit_session|secret-local-key|browser-context-secret|browser-chat-session-secret|secrets\/acct_active\.cookie|secret-token|secret-session/);
 });
 
 test("buildReadinessDoctorReport exposes auth and benefits calibration backlog separately from core readiness", () => {
@@ -1454,6 +1558,7 @@ test("buildReadinessDoctorReport exposes auth and benefits calibration backlog s
         sendPath: "/api/v1/chat/completion",
         sessionVerifyPath: "/api/v0/user/base-info",
         reqCtx: "browser-context-secret",
+        defaultChatSessionId: "browser-chat-session-secret",
       },
     },
     fixtures: [
@@ -1509,7 +1614,7 @@ test("buildReadinessDoctorReport exposes auth and benefits calibration backlog s
 
   const text = JSON.stringify(report);
   assert.doesNotMatch(text, /alpha-user@example\.test|cooldown-user@example\.test|quota-user@example\.test/);
-  assert.doesNotMatch(text, /tabbit_session|secret-local-key|browser-context-secret|secrets\/acct_active\.cookie|secret-token|secret-session/);
+  assert.doesNotMatch(text, /tabbit_session|secret-local-key|browser-context-secret|browser-chat-session-secret|secrets\/acct_active\.cookie|secret-token|secret-session/);
   assert.doesNotMatch(text, /lookup_private_data/);
 });
 
@@ -1529,6 +1634,7 @@ test("buildReadinessDoctorReport marks manual cookie mode ready without automate
         sendPath: "/api/v1/chat/completion",
         sessionVerifyPath: "/api/v0/user/base-info",
         reqCtx: "browser-context-secret",
+        defaultChatSessionId: "browser-chat-session-secret",
       },
     },
     fixtures: [
@@ -1570,7 +1676,7 @@ test("buildReadinessDoctorReport marks manual cookie mode ready without automate
 
   const text = JSON.stringify(report);
   assert.doesNotMatch(text, /alpha-user@example\.test|beta-user@example\.test|cooldown-user@example\.test|quota-user@example\.test/);
-  assert.doesNotMatch(text, /tabbit_session|secret-local-key|browser-context-secret|secrets\/acct_active\.cookie|secret-token|token=secret|secret-session/);
+  assert.doesNotMatch(text, /tabbit_session|secret-local-key|browser-context-secret|browser-chat-session-secret|secrets\/acct_active\.cookie|secret-token|token=secret|secret-session/);
   assert.doesNotMatch(text, /lookup_private_data/);
 });
 
@@ -1590,6 +1696,7 @@ test("buildReadinessDoctorReport includes safe calibration capture commands", ()
         sendPath: "/api/v1/chat/completion",
         sessionVerifyPath: "/api/v0/user/base-info",
         reqCtx: "browser-context-secret",
+        defaultChatSessionId: "browser-chat-session-secret",
       },
     },
     fixtures: [

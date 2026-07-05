@@ -60,6 +60,38 @@ function statusOf(account = {}) {
   return String(account.status || "unknown");
 }
 
+function timestampMs(value) {
+  if (!value) return null;
+  if (typeof value === "number") return value;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function serviceableStatusOf(account = {}, observedAt = null) {
+  const status = statusOf(account);
+  if (status === "active") return "active";
+  if (observedAt !== null && status === "cooldown") {
+    const until = timestampMs(account.cooldownUntil);
+    if (!until || until <= observedAt) return "active";
+  }
+  return status;
+}
+
+function hasConfiguredChatSession(account = {}) {
+  return [account.chatSessionId, account.chat_session_id, account.defaultChatSessionId]
+    .some((value) => typeof value === "string" && value.trim());
+}
+
+function normalizeProtocolPath(value) {
+  const clean = typeof value === "string" ? value.trim() : "";
+  if (!clean) return "";
+  return clean.startsWith("/") ? clean : `/${clean}`;
+}
+
+function usesRestoredChatCompletionProtocol(protocol = {}) {
+  return normalizeProtocolPath(protocol.sendPath) === "/api/v1/chat/completion";
+}
+
 function alert(code, severity, message) {
   return { code, severity, message };
 }
@@ -148,8 +180,9 @@ export function classifyForbiddenSignal(input = {}) {
   };
 }
 
-export function summarizeAccounts(accounts = [], { protocolChangedThreshold = 1 } = {}) {
+export function summarizeAccounts(accounts = [], { protocolChangedThreshold = 1, now = null } = {}) {
   const list = Array.isArray(accounts) ? accounts : [];
+  const observedAt = now === null || now === undefined ? null : nowMs(now);
   const byStatus = Object.fromEntries(KNOWN_STATUSES.map((status) => [status, 0]));
   for (const account of list) {
     const status = KNOWN_STATUSES.includes(statusOf(account)) ? statusOf(account) : "unknown";
@@ -157,7 +190,7 @@ export function summarizeAccounts(accounts = [], { protocolChangedThreshold = 1 
   }
 
   const total = list.length;
-  const active = byStatus.active;
+  const active = list.filter((account) => serviceableStatusOf(account, observedAt) === "active").length;
   const unavailable = Math.max(0, total - active);
   const alerts = [];
 
@@ -200,6 +233,7 @@ export function redactAccountForDisplay(account = {}) {
   if (!Array.isArray(display.quotaState)) display.quotaState = [];
   if (!Number.isFinite(display.resetCouponCount)) display.resetCouponCount = 0;
   if (!Number.isFinite(display.failureStreak)) display.failureStreak = 0;
+  display.chatSessionConfigured = hasConfiguredChatSession(account);
   if (display.email) display.email = sanitizeText(display.email);
   const lastError = compactError(account.lastError);
   if (lastError) display.lastError = lastError;
@@ -218,7 +252,7 @@ export function buildHealthSnapshot({
   mode = "protocol-pool",
 } = {}) {
   const observedAt = nowMs(now);
-  const accountSummary = summarizeAccounts(accounts);
+  const accountSummary = summarizeAccounts(accounts, { now: observedAt });
   return {
     status: accountSummary.health,
     mode,
@@ -1506,6 +1540,20 @@ export function buildCalibrationReadinessSnapshot({
   const protocol = config?.protocol || {};
   const toolLoopMode = toolLoopModeFromConfig(config);
   const activeAccounts = accountList.filter((account) => statusOf(account) === "active").length;
+  const restoredChatCompletion = usesRestoredChatCompletionProtocol(protocol);
+  const defaultChatSessionConfigured = typeof protocol.defaultChatSessionId === "string" && Boolean(protocol.defaultChatSessionId.trim());
+  const chatSessionAutoCreateConfigured = Boolean(
+    protocol.chatSessionAutoCreate
+    && protocol.chatSessionCreatePath
+    && protocol.chatSessionCreateActionId
+  );
+  const activeAccountsWithChatSession = accountList
+    .filter((account) => statusOf(account) === "active" && hasConfiguredChatSession(account))
+    .length;
+  const chatSessionContextConfigured = !restoredChatCompletion
+    || defaultChatSessionConfigured
+    || activeAccountsWithChatSession > 0
+    || chatSessionAutoCreateConfigured;
   const successfulVerifySessionFixtures = fixtureList.filter(fixtureMatchesSessionVerifySuccess).length;
   const successfulSendFixtures = fixtureList.filter(fixtureMatchesSendSuccess).length;
   const forbiddenFixtures = fixtureList.filter(fixtureMatchesForbidden).length;
@@ -1515,6 +1563,7 @@ export function buildCalibrationReadinessSnapshot({
     ...(protocol.sendPath ? [] : ["protocol_send_path"]),
     ...(protocol.sessionVerifyPath ? [] : ["protocol_session_verify_path"]),
     ...(activeAccounts > 0 ? [] : ["active_account"]),
+    ...(chatSessionContextConfigured ? [] : ["chat_session_context"]),
     ...(successfulVerifySessionFixtures > 0 ? [] : ["successful_verifySession_fixture"]),
     ...(successfulSendFixtures > 0 ? [] : ["successful_sendMessage_fixture"]),
   ];
@@ -1535,6 +1584,13 @@ export function buildCalibrationReadinessSnapshot({
         sendPathConfigured: Boolean(protocol.sendPath),
         sessionVerifyPathConfigured: Boolean(protocol.sessionVerifyPath),
         activeAccounts,
+        chatSessionContext: {
+          required: restoredChatCompletion,
+          configured: chatSessionContextConfigured,
+          defaultConfigured: defaultChatSessionConfigured,
+          activeAccountsWithChatSession,
+          autoCreateConfigured: chatSessionAutoCreateConfigured,
+        },
         successfulVerifySessionFixtures,
         successfulSendFixtures,
       },
@@ -1569,6 +1625,7 @@ export function buildCalibrationReadinessSnapshot({
   if (protocolMissing.includes("protocol_send_path")) nextActions.push("Set TABBIT_POOL_PROTOCOL_SEND_PATH from a verified Tabbit Web capture.");
   if (protocolMissing.includes("protocol_session_verify_path")) nextActions.push("Set TABBIT_POOL_PROTOCOL_SESSION_VERIFY_PATH from a verified Tabbit Web account/session capture.");
   if (protocolMissing.includes("active_account")) nextActions.push("Import or refresh at least one active Tabbit account session.");
+  if (protocolMissing.includes("chat_session_context")) nextActions.push("Import a browser-derived chat session id with the account, set TABBIT_POOL_PROTOCOL_CHAT_SESSION_ID, or configure TABBIT_POOL_PROTOCOL_CHAT_SESSION_AUTO_CREATE with the verified Next server action before running restored chat completion traffic.");
   if (protocolMissing.includes("successful_verifySession_fixture")) nextActions.push("Run probe protocol --operation verifySession --write-fixture and keep the sanitized success fixture.");
   if (protocolMissing.includes("successful_sendMessage_fixture")) nextActions.push("Run probe protocol --operation sendMessage --write-fixture and keep the sanitized success fixture.");
   if (e2eMissing.includes("codex_e2e_verified")) nextActions.push("Run the Codex base_url/key/model validation task and record the result.");

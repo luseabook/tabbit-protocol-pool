@@ -600,6 +600,7 @@ test("handlers map empty prompts and pooled errors to OpenAI error shapes", asyn
 test("invalid request and timeout categories map to expected statuses", async () => {
   const invalid = new OpenAICompat({ runner: { async run() { return { ok: false, error: { category: "invalid_request", code: "BAD_REQUEST", message: "bad" } }; } } });
   const timeout = new OpenAICompat({ runner: { async run() { return { ok: false, error: { category: "timeout", code: "TIMEOUT", message: "slow" } }; } } });
+  const upstream = new OpenAICompat({ runner: { async run() { return { ok: false, error: { category: "upstream_error", code: "UPSTREAM_UNAVAILABLE", message: "temporarily unavailable" } }; } } });
 
   assert.deepEqual(await invalid.handleChatCompletions({ messages: [{ role: "user", content: "x" }] }), {
     status: 400,
@@ -608,5 +609,9 @@ test("invalid request and timeout categories map to expected statuses", async ()
   assert.deepEqual(await timeout.handleChatCompletions({ messages: [{ role: "user", content: "x" }] }), {
     status: 504,
     body: { error: { message: "slow", type: "api_error", code: "TIMEOUT" } },
+  });
+  assert.deepEqual(await upstream.handleChatCompletions({ messages: [{ role: "user", content: "x" }] }), {
+    status: 503,
+    body: { error: { message: "temporarily unavailable", type: "api_error", code: "UPSTREAM_UNAVAILABLE" } },
   });
 });

@@ -108,6 +108,153 @@ test("run records retryable failure and falls back to the next account", async (
   assert.deepEqual(calls.map((call) => call.accountId), ["acct_a", "acct_b"]);
 });
 
+test("run uses premium-only catalog metadata to route paid models to Pro accounts", async () => {
+  const pool = new AccountPool({
+    now: () => NOW,
+    accounts: [
+      { id: "acct_free", status: "active", accessTier: "free" },
+      { id: "acct_pro", status: "active", accessTier: "pro" },
+    ],
+  });
+  const calls = [];
+  const runner = new PooledRequestRunner({
+    accountPool: pool,
+    modelCatalogProvider: {
+      async listModels() {
+        return [
+          { id: "tabbit/priority", selectedModel: null, requires_premium: false },
+          { id: "tabbit/GPT-5.5", selectedModel: "GPT-5.5", model_access_type: "premium_only" },
+        ];
+      },
+    },
+    protocolClientFactory: (account) => ({
+      async sendMessage(input) {
+        calls.push({ accountId: account.id, input });
+        return { ok: true, contentBlocks: [{ type: "text", text: "pro ok" }], selectedModel: input.model };
+      },
+    }),
+  });
+
+  const result = await runner.run({ model: "tabbit/GPT-5.5", messages: [{ role: "user", content: "hi" }] });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.accountId, "acct_pro");
+  assert.deepEqual(calls.map((call) => call.accountId), ["acct_pro"]);
+});
+
+test("run honors explicit catalog metadata before Opus name fallback", async () => {
+  const pool = new AccountPool({
+    now: () => NOW,
+    accounts: [
+      { id: "acct_free", status: "active", accessTier: "free" },
+      { id: "acct_pro", status: "active", accessTier: "pro" },
+    ],
+  });
+  const calls = [];
+  const runner = new PooledRequestRunner({
+    accountPool: pool,
+    modelCatalogProvider: {
+      async listModels() {
+        return [
+          { id: "tabbit/Claude-Opus-4.8", selectedModel: "Claude-Opus-4.8", model_access_type: "free_metered" },
+        ];
+      },
+    },
+    protocolClientFactory: (account) => ({
+      async sendMessage(input) {
+        calls.push({ accountId: account.id, input });
+        return { ok: true, contentBlocks: [{ type: "text", text: "catalog ok" }], selectedModel: input.model };
+      },
+    }),
+  });
+
+  const result = await runner.run({ model: "Claude-Opus-4.8", messages: [{ role: "user", content: "hi" }] });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.accountId, "acct_free");
+  assert.deepEqual(calls.map((call) => call.accountId), ["acct_free"]);
+});
+
+test("run treats available Claude Opus model names as Pro-tier when catalog metadata is unavailable", async () => {
+  const pool = new AccountPool({
+    now: () => NOW,
+    accounts: [
+      { id: "acct_free", status: "active", accessTier: "free" },
+      { id: "acct_pro", status: "active", accessTier: "pro" },
+    ],
+  });
+  const calls = [];
+  const runner = new PooledRequestRunner({
+    accountPool: pool,
+    protocolClientFactory: (account) => ({
+      async sendMessage(input) {
+        calls.push({ accountId: account.id, input });
+        return { ok: true, contentBlocks: [{ type: "text", text: "opus ok" }], selectedModel: input.model };
+      },
+    }),
+  });
+
+  const result = await runner.run({ model: "Claude-Opus-4.8", messages: [{ role: "user", content: "hi" }] });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.accountId, "acct_pro");
+  assert.deepEqual(calls.map((call) => call.accountId), ["acct_pro"]);
+});
+
+test("run rejects Claude Opus locally when no Pro account is available", async () => {
+  const pool = new AccountPool({
+    now: () => NOW,
+    accounts: [
+      { id: "acct_free", status: "active", accessTier: "free" },
+    ],
+  });
+  let dispatched = false;
+  const runner = new PooledRequestRunner({
+    accountPool: pool,
+    protocolClientFactory: () => ({
+      async sendMessage() {
+        dispatched = true;
+        return { ok: true, contentBlocks: [{ type: "text", text: "should not send" }] };
+      },
+    }),
+  });
+
+  const result = await runner.run({ model: "Claude-Opus-4.8", messages: [{ role: "user", content: "hi" }] });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.category, "no_available_account");
+  assert.equal(result.error.code, "NO_AVAILABLE_ACCOUNT");
+  assert.deepEqual(result.attemptedAccounts, []);
+  assert.equal(dispatched, false);
+});
+
+test("run rejects unavailable Claude Opus 4.7 before selecting an account", async () => {
+  const pool = new AccountPool({
+    now: () => NOW,
+    accounts: [
+      { id: "acct_pro", status: "active", accessTier: "pro" },
+    ],
+  });
+  let dispatched = false;
+  const runner = new PooledRequestRunner({
+    accountPool: pool,
+    protocolClientFactory: () => ({
+      async sendMessage() {
+        dispatched = true;
+        return { ok: true, contentBlocks: [{ type: "text", text: "should not send" }] };
+      },
+    }),
+  });
+
+  const result = await runner.run({ model: "Claude-Opus-4.7", messages: [{ role: "user", content: "hi" }] });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.category, "invalid_request");
+  assert.equal(result.error.code, "UNSUPPORTED_MODEL");
+  assert.deepEqual(result.attemptedAccounts, []);
+  assert.equal(dispatched, false);
+});
+
 test("run stops on non-retryable protocol_changed and records only one attempt", async () => {
   const pool = new AccountPool({
     now: () => NOW,

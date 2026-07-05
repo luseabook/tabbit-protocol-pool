@@ -1,16 +1,144 @@
+import { randomBytes } from "node:crypto";
 import { loadConfig } from "./config.js";
 import { JsonAccountStore, StoredAccountPool } from "./account-store.js";
+import { isAccountSelectable } from "./account-pool.js";
 import { PooledRequestRunner } from "./pooled-request-runner.js";
 import { LocalToolLoopRunner } from "./local-tool-loop-runner.js";
 import { OpenAICompat } from "./openai-compat.js";
 import { AnthropicCompat } from "./anthropic-compat.js";
 import { ProtocolTabbitClient, ProtocolTabbitError } from "./protocol-tabbit-client.js";
+import { createPowerShellFetch } from "./powershell-fetch.js";
 import { createProtocolPoolServer } from "./http-server.js";
 import { FileSecretStore } from "./secret-store.js";
 import { createGatewayHealthProvider } from "./observability.js";
 import { redactSensitiveValue } from "./redact.js";
+import { modelMetadataRequiredTier } from "./model-access.js";
 
 const DEFAULT_GATEWAY_API_KEY = "sk-tabbit-local";
+const GATEWAY_API_KEY_SECRET_REF = "secrets/gateway-api-key.txt";
+const ADMIN_ACCOUNT_STATUSES = new Set(["active", "disabled", "cooldown", "quota_exhausted", "login_expired", "suspect"]);
+const ADMIN_ACCOUNT_ID_PATTERN = /^[A-Za-z0-9_.-]{1,128}$/;
+
+function requireAdminAccountId(accountId) {
+  const value = String(accountId || "").trim();
+  if (!ADMIN_ACCOUNT_ID_PATTERN.test(value)) {
+    throw new Error("accountId must contain only letters, numbers, dot, underscore, or dash.");
+  }
+  return value;
+}
+
+function resolveAdminImportAccountId(accountId) {
+  const value = String(accountId || "").trim();
+  if (value) return requireAdminAccountId(value);
+  return `acct_${randomBytes(8).toString("hex")}`;
+}
+
+function normalizeAdminAccessTier(accessTier) {
+  const value = String(accessTier || "").trim().toLowerCase();
+  return ["unknown", "free", "pro"].includes(value) ? value : "";
+}
+
+function generatedGatewayApiKey() {
+  return `sk-tabbit-pool-${randomBytes(32).toString("base64url")}`;
+}
+
+function auditEntries(account = {}) {
+  return Array.isArray(account.audit) ? account.audit : [];
+}
+
+async function saveGatewayAccounts({ store, accountPool }, accounts) {
+  const saved = await store.saveAccounts(accounts);
+  accountPool.accounts = saved;
+  return saved;
+}
+
+function createGatewayAdminControls({ config, health, now, store, secretStore, accountPool }) {
+  return {
+    username: config.admin?.username || null,
+    password: config.admin?.password || null,
+    apiKeyProvider: () => config.apiKey,
+    statusProvider: createAdminStatusProvider({ config, health, now }),
+    async keyProvider() {
+      return {
+        apiKey: config.apiKey,
+        secretRef: config.productionState?.apiKeySource === "env" ? "env:TABBIT_POOL_API_KEY" : GATEWAY_API_KEY_SECRET_REF,
+        apiKeySource: config.productionState?.apiKeySource || "unknown",
+        restartRequired: false,
+      };
+    },
+    async accountsProvider() {
+      return accountPool.listAccounts();
+    },
+    async importSession({ accountId, email = "", session = "", accessTier = "", chatSessionId = "" } = {}) {
+      const id = resolveAdminImportAccountId(accountId);
+      const normalizedAccessTier = normalizeAdminAccessTier(accessTier);
+      const normalizedChatSessionId = String(chatSessionId || "").trim();
+      const secretRef = `secrets/${id}.cookie`;
+      await secretStore.writeSecret(secretRef, session);
+      const observedAt = new Date(now()).toISOString();
+      const current = accountPool.listAccounts();
+      const existingIndex = current.findIndex((account) => account.id === id);
+      const existing = existingIndex >= 0 ? current[existingIndex] : {};
+      const nextAccount = {
+        ...existing,
+        id,
+        email: email || existing.email || "",
+        status: "active",
+        accessTier: normalizedAccessTier || existing.accessTier || "unknown",
+        ...(normalizedChatSessionId ? { chatSessionId: normalizedChatSessionId } : {}),
+        cookieJarRef: secretRef,
+        failureStreak: 0,
+        cooldownUntil: null,
+        lastError: null,
+        audit: [
+          ...auditEntries(existing),
+          { type: "admin_import_session", observedAt, fromStatus: existing.status || null, toStatus: "active" },
+        ],
+      };
+      const nextAccounts = existingIndex >= 0
+        ? current.map((account, index) => index === existingIndex ? nextAccount : account)
+        : [...current, nextAccount];
+      const saved = await saveGatewayAccounts({ store, accountPool }, nextAccounts);
+      return saved.find((account) => account.id === id) || nextAccount;
+    },
+    async updateAccountStatus({ accountId, status } = {}) {
+      const id = requireAdminAccountId(accountId);
+      if (!ADMIN_ACCOUNT_STATUSES.has(status)) throw new Error("Unsupported account status.");
+      const observedAt = new Date(now()).toISOString();
+      const current = accountPool.listAccounts();
+      const existingIndex = current.findIndex((account) => account.id === id);
+      if (existingIndex < 0) throw new Error(`Account not found: ${id}`);
+      const existing = current[existingIndex];
+      const updated = {
+        ...existing,
+        status,
+        ...(status === "active" ? { failureStreak: 0, cooldownUntil: null, lastError: null } : {}),
+        audit: [
+          ...auditEntries(existing),
+          { type: "admin_status_update", observedAt, fromStatus: existing.status || null, toStatus: status },
+        ],
+      };
+      const saved = await saveGatewayAccounts({
+        store,
+        accountPool,
+      }, current.map((account, index) => index === existingIndex ? updated : account));
+      return saved.find((account) => account.id === id) || updated;
+    },
+    async rotateGatewayKey() {
+      const nextApiKey = generatedGatewayApiKey();
+      await secretStore.writeSecret(GATEWAY_API_KEY_SECRET_REF, `${nextApiKey}\n`);
+      config.apiKey = nextApiKey;
+      if (config.productionState) config.productionState.apiKeySource = "state_secret";
+      return {
+        changed: true,
+        secretRef: GATEWAY_API_KEY_SECRET_REF,
+        apiKeySource: "state_secret",
+        apiKey: nextApiKey,
+        restartRequired: false,
+      };
+    },
+  };
+}
 
 export async function hydrateAccountSecrets(account = {}, secretStore = null) {
   const hydrated = { ...account, audit: Array.isArray(account.audit) ? [...account.audit] : account.audit };
@@ -207,18 +335,32 @@ export function createSecretHydratingProtocolClientFactory(baseFactory, secretSt
   });
 }
 
-export function createDefaultProtocolClientFactory({ protocolClientOptions = {}, fetch: fetchImpl = globalThis.fetch, now = () => Date.now() } = {}) {
+function selectProtocolFetch({ fetch: fetchImpl = null, fetchTransport = "node", protocolFetchTransports = {} } = {}) {
+  if (fetchImpl) return fetchImpl;
+  if (fetchTransport === "powershell") {
+    return protocolFetchTransports.powershell || createPowerShellFetch();
+  }
+  return globalThis.fetch;
+}
+
+export function createDefaultProtocolClientFactory({ protocolClientOptions = {}, fetch: fetchImpl = null, now = () => Date.now(), protocolFetchTransports = {} } = {}) {
+  const { fetchTransport = "node", fetch: optionFetch = null, ...clientOptions } = protocolClientOptions;
+  const selectedFetch = selectProtocolFetch({
+    fetch: optionFetch || fetchImpl,
+    fetchTransport,
+    protocolFetchTransports,
+  });
   return () => new ProtocolTabbitClient({
-    ...protocolClientOptions,
-    fetch: protocolClientOptions.fetch || fetchImpl,
-    now: protocolClientOptions.now || now,
+    ...clientOptions,
+    fetch: selectedFetch,
+    now: clientOptions.now || now,
   });
 }
 
 function configuredProtocolClientOptions(config = {}) {
   if (!config.protocol?.enabled) return {};
   const options = {};
-  for (const key of ["baseUrl", "signKeyPath", "modelCatalogPath", "modelCatalogScene", "sendPath", "authSendCodePath", "authSendCodeMethod", "authSubmitCodePath", "authSubmitCodeMethod", "attachmentUploadPath", "attachmentCompleteUploadPath", "quotaUsagePath", "activityLotteryPath", "newbieExplorationPath", "placementResourcesPath", "rewardCardRecordsPath", "lotteryHitRecordsPath", "signInStatusPath", "signInPath", "benefitCouponListPath", "benefitCouponUsePath", "activityParticipatePath", "usageResetCouponSkuPath", "lotteryAvailableChancesPath", "lotteryActiveMainPoolsPath", "lotteryChanceRecordsPath", "lotteryDrawPath", "sessionVerifyPath", "sessionVerifyMethod", "reqCtx", "defaultChatSessionId"]) {
+  for (const key of ["baseUrl", "fetchTransport", "signKeyPath", "modelCatalogPath", "modelCatalogScene", "sendPath", "authSendCodePath", "authSendCodeMethod", "authSubmitCodePath", "authSubmitCodeMethod", "attachmentUploadPath", "attachmentCompleteUploadPath", "quotaUsagePath", "activityLotteryPath", "newbieExplorationPath", "placementResourcesPath", "rewardCardRecordsPath", "lotteryHitRecordsPath", "signInStatusPath", "signInPath", "benefitCouponListPath", "benefitCouponUsePath", "activityParticipatePath", "usageResetCouponSkuPath", "lotteryAvailableChancesPath", "lotteryActiveMainPoolsPath", "lotteryChanceRecordsPath", "lotteryDrawPath", "sessionVerifyPath", "sessionVerifyMethod", "reqCtx", "defaultChatSessionId", "chatSessionCreatePath", "chatSessionCreateActionId", "chatSessionAutoCreate"]) {
     if (config.protocol[key]) options[key] = config.protocol[key];
   }
   return options;
@@ -230,6 +372,36 @@ function createProtocolModelsProvider(baseProtocolClientFactory, config = {}) {
     async listModels(input = {}) {
       const client = baseProtocolClientFactory({});
       return await client.listModels(input);
+    },
+  };
+}
+
+async function listModelsFromProvider(provider, input = {}) {
+  if (!provider) return [];
+  if (Array.isArray(provider)) return provider;
+  if (typeof provider === "function") return await provider(input);
+  if (typeof provider.listModels === "function") return await provider.listModels(input);
+  return [];
+}
+
+function accountPoolCanServeModel(accountPool, model = {}) {
+  const requiredAccessTier = modelMetadataRequiredTier(model);
+  if (!requiredAccessTier) return true;
+  if (!accountPool || typeof accountPool.listAccounts !== "function") return false;
+  const now = typeof accountPool.now === "function" ? accountPool.now() : Date.now();
+  return accountPool.listAccounts().some((account) => (
+    isAccountSelectable(account, { now, requiredAccessTier }).selectable
+  ));
+}
+
+function createPublicModelsProvider(modelsProvider, accountPool) {
+  if (!modelsProvider) return null;
+  return {
+    async listModels(input = {}) {
+      const models = await listModelsFromProvider(modelsProvider, input);
+      return Array.isArray(models)
+        ? models.filter((model) => accountPoolCanServeModel(accountPool, model))
+        : [];
     },
   };
 }
@@ -368,14 +540,20 @@ export async function createProtocolPoolGateway(options = {}) {
     protocolClientOptions: { ...configuredClientOptions, ...(options.protocolClientOptions || {}) },
     fetch: options.fetch,
     now: options.protocolNow || accountNow,
+    protocolFetchTransports: options.protocolFetchTransports || {},
   });
   const protocolClientFactory = options.hydrateSecrets === false
     ? baseProtocolClientFactory
     : createSecretHydratingProtocolClientFactory(baseProtocolClientFactory, secretStore);
+  const rawModelsProvider = Object.prototype.hasOwnProperty.call(options, "modelsProvider")
+    ? options.modelsProvider
+    : createProtocolModelsProvider(baseProtocolClientFactory, config);
+  const publicModelsProvider = createPublicModelsProvider(rawModelsProvider, accountPool);
   const baseRunner = options.runner || new PooledRequestRunner({
     accountPool,
     protocolClientFactory,
     retryLimit: config.retryLimit,
+    modelCatalogProvider: rawModelsProvider,
   });
   const localToolLoopConfig = {
     ...(config.compat?.localToolLoop || {}),
@@ -412,18 +590,15 @@ export async function createProtocolPoolGateway(options = {}) {
       startedAt,
       now: accountNow,
     });
-  const modelsProvider = Object.prototype.hasOwnProperty.call(options, "modelsProvider")
-    ? options.modelsProvider
-    : createProtocolModelsProvider(baseProtocolClientFactory, config);
   const admin = options.admin === false
     ? null
     : (Object.prototype.hasOwnProperty.call(options, "admin")
       ? options.admin
-      : { statusProvider: createAdminStatusProvider({ config, health, now: accountNow }) });
+      : createGatewayAdminControls({ config, health, now: accountNow, store, secretStore, accountPool }));
   const server = options.server || createProtocolPoolServer({
     apiKey: config.apiKey,
     compat,
-    modelsProvider,
+    modelsProvider: publicModelsProvider,
     health,
     admin,
   });
@@ -434,6 +609,7 @@ export async function createProtocolPoolGateway(options = {}) {
     secretStore,
     accountPool,
     protocolClientFactory,
+    modelsProvider: publicModelsProvider,
     runner,
     openAiCompat,
     anthropicCompat,

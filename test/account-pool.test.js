@@ -28,6 +28,7 @@ test("isAccountSelectable explains status, cooldown, excluded, quota, and tier f
   assert.equal(isAccountSelectable(normalizeAccount({ id: "a", status: "cooldown", cooldownUntil: "2026-07-02T00:01:00.000Z" }), { now: NOW }).reason, "cooldown_until_2026-07-02T00:01:00.000Z");
   assert.equal(isAccountSelectable(normalizeAccount({ id: "a", status: "quota_exhausted" }), { now: NOW }).reason, "quota_exhausted");
   assert.equal(isAccountSelectable(normalizeAccount({ id: "a", accessTier: "free" }), { now: NOW, requiresPremium: true }).reason, "requires_premium");
+  assert.equal(isAccountSelectable(normalizeAccount({ id: "a", accessTier: "pro" }), { now: NOW, requiredAccessTier: "premium" }).selectable, true);
   assert.equal(isAccountSelectable(normalizeAccount({ id: "a" }), { now: NOW, excludeAccountIds: ["a"] }).reason, "excluded_by_request");
 });
 
@@ -62,6 +63,21 @@ test("pickAccount filters unavailable states and premium requirements", () => {
   const result = pool.pickAccount({ model: "tabbit/priority", requiresPremium: true });
   assert.equal(result.account.id, "pro");
   assert.equal(result.candidates.find((item) => item.accountId === "disabled").excludedReason, "status_disabled");
+  assert.equal(result.candidates.find((item) => item.accountId === "free").excludedReason, "requires_premium");
+});
+
+test("pickAccount treats legacy premium requirements as the highest visible Pro tier", () => {
+  const pool = new AccountPool({
+    now: () => NOW,
+    accounts: [
+      { id: "free", status: "active", accessTier: "free" },
+      { id: "pro", status: "active", accessTier: "pro" },
+    ],
+  });
+
+  const result = pool.pickAccount({ model: "tabbit/enterprise-only", requiredAccessTier: "premium" });
+
+  assert.equal(result.account.id, "pro");
   assert.equal(result.candidates.find((item) => item.accountId === "free").excludedReason, "requires_premium");
 });
 

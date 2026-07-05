@@ -173,6 +173,7 @@ test("normalizeModelCatalog maps upstream models and injects tabbit priority ali
       supports_tools: true,
       supports_images: true,
       model_access_type: "pro",
+      requires_premium: true,
       available_in_tabbit_catalog: true,
     },
     {
@@ -183,6 +184,7 @@ test("normalizeModelCatalog maps upstream models and injects tabbit priority ali
       supports_tools: false,
       supports_images: false,
       model_access_type: "free",
+      requires_premium: false,
       available_in_tabbit_catalog: true,
     },
   ]);
@@ -194,6 +196,8 @@ test("normalizeModelCatalog maps real Tabbit display_name model catalog entries"
     models: [
       { display_name: "Default", supports_tools: true, supports_images: true, model_access_type: "free_unlimited" },
       { display_name: "Kimi-K2.7-Code", supports_tools: true, supports_images: true, model_access_type: "free_metered" },
+      { display_name: "Claude-Opus-4.7", supports_tools: true, supports_images: true, model_access_type: "premium_only" },
+      { display_name: "Claude-Opus-4.8", supports_tools: true, supports_images: true, model_access_type: "premium_only" },
       { display_name: "GPT-5.5", supports_tools: true, supports_images: true, model_access_type: "premium_only" },
     ],
   });
@@ -202,7 +206,15 @@ test("normalizeModelCatalog maps real Tabbit display_name model catalog entries"
     ["tabbit/priority", null, "priority"],
     ["tabbit/Default", "Default", "free_unlimited"],
     ["tabbit/Kimi-K2.7-Code", "Kimi-K2.7-Code", "free_metered"],
+    ["tabbit/Claude-Opus-4.8", "Claude-Opus-4.8", "premium_only"],
     ["tabbit/GPT-5.5", "GPT-5.5", "premium_only"],
+  ]);
+  assert.deepEqual(models.map((model) => [model.id, model.requires_premium]), [
+    ["tabbit/priority", false],
+    ["tabbit/Default", false],
+    ["tabbit/Kimi-K2.7-Code", false],
+    ["tabbit/Claude-Opus-4.8", true],
+    ["tabbit/GPT-5.5", true],
   ]);
 });
 
@@ -309,6 +321,94 @@ test("sendMessage builds the restored Tabbit chat completion request body and he
   assert.equal(calls[1].options.headers["x-nonce"], "0af599161688fe97359a52018d0fba9582f6b16aaeb384965a7fffadb3aea416");
   assert.deepEqual(JSON.parse(calls[1].options.body), {
     chat_session_id: "session_live",
+    message_id: null,
+    content: "hello",
+    selected_model: "Default",
+    parallel_group_id: null,
+    task_name: "chat",
+    agent_mode: false,
+    metadatas: { html_content: "<p>hello</p>" },
+    references: [],
+    entity: {
+      key: "d41d8cd98f00b204e9800998ecf8427e",
+      extras: { type: "tab", url: "" },
+    },
+  });
+});
+
+test("createChatSession posts the Tabbit Next server action and parses the action result", async () => {
+  const calls = [];
+  const client = new ProtocolTabbitClient({
+    chatSessionCreatePath: "/newtab",
+    chatSessionCreateActionId: "action-create-session",
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse([
+        "0:{\"a\":\"$@1\",\"f\":[]}",
+        "1:\"created-session-id\"",
+        "",
+      ].join("\n"), { headers: { "content-type": "text/x-component" } });
+    },
+  });
+
+  const result = await client.createChatSession({
+    account: { cookie: "placeholder-cookie-valuebc" },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.chatSessionId, "created-session-id");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://web.tabbit.ai/newtab");
+  assert.equal(calls[0].options.method, "POST");
+  assert.equal(calls[0].options.body, "[]");
+  assert.equal(calls[0].options.headers.Cookie, "placeholder-cookie-valuebc");
+  assert.equal(calls[0].options.headers.Accept, "text/x-component");
+  assert.equal(calls[0].options.headers["Content-Type"], "text/plain;charset=UTF-8");
+  assert.equal(calls[0].options.headers["Next-Action"], "action-create-session");
+  assert.equal(
+    decodeURIComponent(calls[0].options.headers["Next-Router-State-Tree"]),
+    JSON.stringify(["", { children: ["newtab", { children: ["__PAGE__", {}] }] }, null, null, true]),
+  );
+});
+
+test("sendMessage auto creates a chat session before restored Tabbit chat completion", async () => {
+  const calls = [];
+  const client = new ProtocolTabbitClient({
+    baseUrl: "https://web.tabbit.ai",
+    sendPath: "/api/v1/chat/completion",
+    chatSessionAutoCreate: true,
+    chatSessionCreatePath: "/newtab",
+    chatSessionCreateActionId: "action-create-session",
+    signature: () => "00000000-0000-4000-8000-000000000000",
+    uniqueUuid: () => "660001aa-2222-3333-4444-555555555555",
+    now: () => 1783034819752,
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      if (url.endsWith("/newtab")) {
+        return jsonResponse("0:{\"a\":\"$@1\",\"f\":[]}\n1:\"created-session-id\"\n", { headers: { "content-type": "text/x-component" } });
+      }
+      if (url.endsWith("/chat/sign-key")) {
+        return jsonResponse("f8d0e6a73f8d4b1a9c3d2e1f9a4b7c6d");
+      }
+      return jsonResponse("event: message_chunk\ndata: {\"content\":\"ok\"}\n\n", { headers: { "content-type": "text/event-stream" } });
+    },
+  });
+
+  const result = await client.sendMessage({
+    account: { cookie: "placeholder-cookie-valuebc" },
+    model: "tabbit/priority",
+    messages: [{ role: "user", content: "hello" }],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.chatSessionId, "created-session-id");
+  assert.deepEqual(calls.map((call) => new URL(call.url).pathname), [
+    "/newtab",
+    "/chat/sign-key",
+    "/api/v1/chat/completion",
+  ]);
+  assert.deepEqual(JSON.parse(calls[2].options.body), {
+    chat_session_id: "created-session-id",
     message_id: null,
     content: "hello",
     selected_model: "Default",
@@ -813,6 +913,33 @@ test("sendMessage classifies buffered stream error frames", async () => {
   assert.equal(result.error.code, "QUOTA_EXHAUSTED");
   assert.match(result.error.message, /quota exhausted/i);
   assert.equal(result.error.retryable, true);
+});
+
+test("sendMessage classifies premium-only stream errors as model entitlement failures", async () => {
+  const streamBody = [
+    "event: error",
+    'data: {"code":492,"message":"Model Claude-Opus-4.8 is available to premium users only. Please upgrade and try again."}',
+    "",
+  ].join("\n");
+  const client = new ProtocolTabbitClient({
+    sendPath: "/api/v1/chat/completion",
+    defaultChatSessionId: "session_test",
+    fetch: async (url) => url.endsWith("/chat/sign-key")
+      ? jsonResponse("sign-key-premium-only")
+      : jsonResponse(streamBody, { headers: { "content-type": "text/event-stream" } }),
+  });
+
+  const result = await client.sendMessage({
+    account: { cookie: "placeholder-cookie-valuebc" },
+    model: "Claude-Opus-4.8",
+    messages: [{ role: "user", content: "hello" }],
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error.category, "model_entitlement");
+  assert.equal(result.error.code, "MODEL_ENTITLEMENT_REQUIRED");
+  assert.equal(result.error.retryable, true);
+  assert.match(result.error.message, /premium users only/i);
 });
 
 test("sendMessage returns async streamDeltas before the upstream stream completes", async () => {
@@ -2342,6 +2469,34 @@ test("classifyProtocolError maps quota exhaustion signals to account-local fallb
     message: "Current account quota exhausted",
     retryable: true,
     cooldownMs: 0,
+  });
+});
+
+test("classifyProtocolError treats temporary AI unavailability as retryable upstream failure", () => {
+  assert.deepEqual(classifyProtocolError({
+    status: 200,
+    body: { message: "AI service temporarily unavailable, please try again later" },
+  }), {
+    category: "upstream_error",
+    status: 200,
+    code: null,
+    message: "AI service temporarily unavailable, please try again later",
+    retryable: true,
+    cooldownMs: 10000,
+  });
+});
+
+test("classifyProtocolError treats Chinese temporary AI unavailability as retryable upstream failure", () => {
+  assert.deepEqual(classifyProtocolError({
+    status: 200,
+    body: { message: "AI 服务暂时不可用，请稍后重试" },
+  }), {
+    category: "upstream_error",
+    status: 200,
+    code: null,
+    message: "AI 服务暂时不可用，请稍后重试",
+    retryable: true,
+    cooldownMs: 10000,
   });
 });
 

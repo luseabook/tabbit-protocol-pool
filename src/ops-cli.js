@@ -9,6 +9,7 @@ import { BenefitsMaintainer } from "./benefits-maintainer.js";
 import { FileSecretStore } from "./secret-store.js";
 import { FileProtocolFixtureStore, ProtocolProbeRunner, sanitizeProtocolProbeFixture } from "./protocol-probe.js";
 import { ProtocolTabbitClient } from "./protocol-tabbit-client.js";
+import { createPowerShellFetch } from "./powershell-fetch.js";
 import { createProtocolPoolGateway } from "./protocol-pool-gateway.js";
 import {
   BENEFITS_AUDIT_OPERATIONS,
@@ -24,7 +25,7 @@ import {
 
 const HELP = `Usage:
   tabbit-pool accounts list [--json]
-  tabbit-pool accounts import-session [--id <id>] [--email <email>] [--cookie-header <text> | --session <text> | --cookie-file <path> | --session-file <path>] [--json]
+  tabbit-pool accounts import-session [--id <id>] [--email <email>] [--access-tier <unknown|free|pro>] [--chat-session-id <id>] [--cookie-header <text> | --session <text> | --cookie-file <path> | --session-file <path>] [--json]
   tabbit-pool accounts probe <id> [--read-only] [--json]
   tabbit-pool health [--json]
   tabbit-pool readiness [--json]
@@ -47,6 +48,7 @@ const HELP = `Usage:
 
 const DEFAULT_GATEWAY_API_KEY = "sk-tabbit-local";
 const GATEWAY_API_KEY_SECRET_REF = "secrets/gateway-api-key.txt";
+const ACCOUNT_IMPORT_ACCESS_TIERS = new Set(["unknown", "free", "pro"]);
 
 function writeLine(writer, value) {
   writer(String(value));
@@ -1220,18 +1222,27 @@ function protocolNow(now) {
 
 function configuredProtocolClientOptions(protocol = {}) {
   const options = {};
-  for (const key of ["baseUrl", "signKeyPath", "modelCatalogPath", "modelCatalogScene", "sendPath", "authSendCodePath", "authSendCodeMethod", "authSubmitCodePath", "authSubmitCodeMethod", "attachmentUploadPath", "attachmentCompleteUploadPath", "quotaUsagePath", "activityLotteryPath", "newbieExplorationPath", "placementResourcesPath", "rewardCardRecordsPath", "lotteryHitRecordsPath", "signInStatusPath", "signInPath", "benefitCouponListPath", "benefitCouponUsePath", "activityParticipatePath", "usageResetCouponSkuPath", "lotteryAvailableChancesPath", "lotteryActiveMainPoolsPath", "lotteryChanceRecordsPath", "lotteryDrawPath", "sessionVerifyPath", "sessionVerifyMethod", "reqCtx", "defaultChatSessionId"]) {
+  for (const key of ["baseUrl", "fetchTransport", "signKeyPath", "modelCatalogPath", "modelCatalogScene", "sendPath", "authSendCodePath", "authSendCodeMethod", "authSubmitCodePath", "authSubmitCodeMethod", "attachmentUploadPath", "attachmentCompleteUploadPath", "quotaUsagePath", "activityLotteryPath", "newbieExplorationPath", "placementResourcesPath", "rewardCardRecordsPath", "lotteryHitRecordsPath", "signInStatusPath", "signInPath", "benefitCouponListPath", "benefitCouponUsePath", "activityParticipatePath", "usageResetCouponSkuPath", "lotteryAvailableChancesPath", "lotteryActiveMainPoolsPath", "lotteryChanceRecordsPath", "lotteryDrawPath", "sessionVerifyPath", "sessionVerifyMethod", "reqCtx", "defaultChatSessionId", "chatSessionCreatePath", "chatSessionCreateActionId", "chatSessionAutoCreate"]) {
     if (protocol[key]) options[key] = protocol[key];
   }
   return options;
 }
 
-function createConfiguredProtocolClientFactory(config, { fetch: fetchImpl, now } = {}) {
+function selectProtocolFetch({ fetch: fetchImpl = null, fetchTransport = "node", protocolFetchTransports = {} } = {}) {
+  if (fetchImpl) return fetchImpl;
+  if (fetchTransport === "powershell") {
+    return protocolFetchTransports.powershell || createPowerShellFetch();
+  }
+  return globalThis.fetch;
+}
+
+function createConfiguredProtocolClientFactory(config, { fetch: fetchImpl, now, protocolFetchTransports = {} } = {}) {
   if (!config.protocol?.enabled) return null;
-  const protocolClientOptions = configuredProtocolClientOptions(config.protocol);
+  const { fetchTransport = "node", ...protocolClientOptions } = configuredProtocolClientOptions(config.protocol);
+  const selectedFetch = selectProtocolFetch({ fetch: fetchImpl, fetchTransport, protocolFetchTransports });
   return () => new ProtocolTabbitClient({
     ...protocolClientOptions,
-    ...(fetchImpl ? { fetch: fetchImpl } : {}),
+    fetch: selectedFetch,
     now: () => protocolNow(now),
   });
 }
@@ -1346,11 +1357,19 @@ async function readImportSessionInput(args) {
   const userId = requiredValueAfter(args, "--user-id");
   const accessTier = requiredValueAfter(args, "--access-tier");
   const cookieJarRef = requiredValueAfter(args, "--cookie-jar-ref");
+  const chatSessionId = requiredValueAfter(args, "--chat-session-id");
   if (id) input.id = id;
   if (email) input.email = email;
   if (userId) input.userId = userId;
-  if (accessTier) input.accessTier = accessTier;
+  if (accessTier) {
+    const normalizedAccessTier = String(accessTier).trim().toLowerCase();
+    if (!ACCOUNT_IMPORT_ACCESS_TIERS.has(normalizedAccessTier)) {
+      throw new CliUsageError("--access-tier must be unknown, free, or pro.", { code: "INVALID_ACCESS_TIER" });
+    }
+    input.accessTier = normalizedAccessTier;
+  }
   if (cookieJarRef) input.cookieJarRef = cookieJarRef;
+  if (chatSessionId) input.chatSessionId = String(chatSessionId).trim();
   return input;
 }
 
@@ -1413,7 +1432,11 @@ export function createProtocolPoolCliDependencies(options = {}) {
     fixtureDir: config.protocolFixtureDir,
     now,
   });
-  const configuredProtocolClientFactory = createConfiguredProtocolClientFactory(config, { fetch: options.fetch, now });
+  const configuredProtocolClientFactory = createConfiguredProtocolClientFactory(config, {
+    fetch: options.fetch,
+    now,
+    protocolFetchTransports: options.protocolFetchTransports || {},
+  });
   const protocolProbeClientFactory = hasOwn(options, "protocolProbeClientFactory")
     ? options.protocolProbeClientFactory
     : configuredProtocolClientFactory;

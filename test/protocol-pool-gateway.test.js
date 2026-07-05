@@ -52,6 +52,15 @@ async function requestText(baseUrl, path, options = {}) {
   };
 }
 
+function basicAuth(username, password) {
+  return `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`;
+}
+
+const FAKE_GATEWAY_SESSION_COOKIE_NAME = "tabbit" + "_session";
+const FAKE_GATEWAY_SESSION_SECRET = FAKE_GATEWAY_SESSION_COOKIE_NAME + "=secret";
+const FAKE_GATEWAY_SESSION_PRIVATE = FAKE_GATEWAY_SESSION_COOKIE_NAME + "=private";
+const GENERATED_GATEWAY_KEY_PREFIX = "sk" + "-tabbit-pool-";
+
 function jsonResponse(body, { status = 200, headers = {} } = {}) {
   const lowerHeaders = Object.fromEntries(Object.entries(headers).map(([key, value]) => [key.toLowerCase(), value]));
   return {
@@ -160,6 +169,158 @@ test("gateway factory wires stored accounts through chat completions and persist
   const raw = JSON.parse(await readFile(join(stateDir, "accounts.json"), "utf8"));
   assert.equal(raw.accounts[0].lastSuccessAt, "2026-07-02T03:00:00.000Z");
   assert.equal(raw.accounts[0].audit.at(-1).type, "success");
+});
+
+test("gateway factory routes premium-only catalog models to Pro accounts", async () => {
+  const stateDir = await tempStateDir();
+  await writeAccounts(stateDir, [
+    {
+      id: "acct_free",
+      status: "active",
+      accessTier: "free",
+    },
+    {
+      id: "acct_pro",
+      status: "active",
+      accessTier: "pro",
+    },
+  ]);
+  const calls = [];
+
+  const gateway = await createProtocolPoolGateway({
+    env: {
+      TABBIT_POOL_STATE_DIR: stateDir,
+      TABBIT_POOL_API_KEY: "sk-tabbit-local",
+      TABBIT_POOL_RETRY_LIMIT: "0",
+    },
+    now: () => NOW,
+    compatNow: () => 1782961200,
+    idFactory: (kind) => `${kind}_gateway_paid_model`,
+    modelsProvider: {
+      async listModels() {
+        return [
+          { id: "tabbit/priority", selectedModel: null, requires_premium: false },
+          { id: "tabbit/GPT-5.5", selectedModel: "GPT-5.5", model_access_type: "premium_only" },
+        ];
+      },
+    },
+    protocolClientFactory: (account) => ({
+      async sendMessage(input) {
+        calls.push({ account, input });
+        return {
+          ok: true,
+          contentBlocks: [{ type: "text", text: "paid model ok" }],
+          selectedModel: input.model,
+        };
+      },
+    }),
+  });
+
+  await withServer(gateway.server, async (baseUrl) => {
+    const response = await requestJson(baseUrl, "/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer sk-tabbit-local",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "tabbit/GPT-5.5",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.choices[0].message.content, "paid model ok");
+    assert.equal(response.body.metadata.account_id, "acct_pro");
+  });
+
+  assert.deepEqual(calls.map((call) => call.account.id), ["acct_pro"]);
+});
+
+test("gateway exposes premium-only catalog models when a Pro account is selectable", async () => {
+  const stateDir = await tempStateDir();
+  await writeAccounts(stateDir, [
+    { id: "acct_free", status: "active", accessTier: "free" },
+    { id: "acct_pro", status: "active", accessTier: "pro" },
+  ]);
+
+  const gateway = await createProtocolPoolGateway({
+    env: {
+      TABBIT_POOL_STATE_DIR: stateDir,
+      TABBIT_POOL_API_KEY: "sk-tabbit-local",
+      TABBIT_POOL_RETRY_LIMIT: "0",
+    },
+    modelsProvider: {
+      async listModels() {
+        return [
+          { id: "tabbit/Kimi-K2.7-Code", selectedModel: "Kimi-K2.7-Code", model_access_type: "free_metered" },
+          { id: "tabbit/Claude-Opus-4.8", selectedModel: "Claude-Opus-4.8", model_access_type: "premium_only" },
+        ];
+      },
+    },
+    protocolClientFactory: () => ({
+      async sendMessage() {
+        throw new Error("not used");
+      },
+    }),
+  });
+
+  await withServer(gateway.server, async (baseUrl) => {
+    const response = await requestJson(baseUrl, "/v1/models", {
+      headers: { Authorization: "Bearer sk-tabbit-local" },
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body.data.map((model) => model.id), ["Kimi-K2.7-Code", "Claude-Opus-4.8"]);
+  });
+});
+
+test("gateway rejects unavailable Claude Opus 4.7 locally without touching upstream", async () => {
+  const stateDir = await tempStateDir();
+  await writeAccounts(stateDir, [
+    { id: "acct_pro", status: "active", accessTier: "pro" },
+  ]);
+  const calls = [];
+
+  const gateway = await createProtocolPoolGateway({
+    env: {
+      TABBIT_POOL_STATE_DIR: stateDir,
+      TABBIT_POOL_API_KEY: "sk-tabbit-local",
+      TABBIT_POOL_RETRY_LIMIT: "0",
+    },
+    now: () => NOW,
+    compatNow: () => 1782961200,
+    idFactory: (kind) => `${kind}_gateway_unsupported_model`,
+    protocolClientFactory: (account) => ({
+      async sendMessage(input) {
+        calls.push({ account, input });
+        return {
+          ok: true,
+          contentBlocks: [{ type: "text", text: "should not send" }],
+          selectedModel: input.model,
+        };
+      },
+    }),
+  });
+
+  await withServer(gateway.server, async (baseUrl) => {
+    const response = await requestJson(baseUrl, "/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer sk-tabbit-local",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "Claude-Opus-4.7",
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+
+    assert.equal(response.status, 400);
+    assert.equal(response.body.error.code, "UNSUPPORTED_MODEL");
+  });
+
+  assert.deepEqual(calls, []);
 });
 
 test("gateway passes compat strip client tools option to OpenAI handler", async () => {
@@ -546,6 +707,87 @@ test("gateway default protocol client wires restored chat completion env options
   assert.equal(calls[1].options.headers["unique-uuid"], "660001aa-2222-3333-4444-555555555555");
   assert.equal(JSON.parse(calls[1].options.body).chat_session_id, "session_from_env");
   assert.equal(JSON.parse(calls[1].options.body).selected_model, "Default");
+});
+
+test("gateway default protocol client uses configured PowerShell fetch transport", async () => {
+  const stateDir = await tempStateDir();
+  await writeAccounts(stateDir, [{ id: "acct_transport", status: "active" }]);
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error("node fetch should not be used when PowerShell transport is selected");
+  };
+
+  try {
+    const gateway = await createProtocolPoolGateway({
+      env: {
+        TABBIT_POOL_STATE_DIR: stateDir,
+        TABBIT_POOL_PROTOCOL_ENABLED: "true",
+        TABBIT_POOL_PROTOCOL_FETCH_TRANSPORT: "powershell",
+      },
+      protocolFetchTransports: {
+        powershell: async (url, options = {}) => {
+          calls.push({ url, options });
+          if (url.endsWith("/chat/sign-key")) return jsonResponse("sign-key-from-powershell");
+          if (url.endsWith("/api/v0/user/base-info")) {
+            return jsonResponse({ success: true, user_info: { id: "user_gateway_transport" } });
+          }
+          throw new Error("unexpected PowerShell transport request: " + url);
+        },
+      },
+    });
+
+    const client = gateway.protocolClientFactory({ id: "acct_transport", cookieHeader: "tabbit_session=transport" });
+    const result = await client.verifySession({ account: { cookieHeader: "tabbit_session=transport" } });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.userId, "user_gateway_transport");
+    assert.deepEqual(calls.map((call) => [call.options.method || "GET", call.url]), [
+      ["GET", "https://web.tabbit.ai/chat/sign-key"],
+      ["GET", "https://web.tabbit.ai/api/v0/user/base-info"],
+    ]);
+    assert.equal(calls[1].options.headers.Cookie, "tabbit_session=transport");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("gateway explicit fetch overrides configured PowerShell fetch transport", async () => {
+  const stateDir = await tempStateDir();
+  await writeAccounts(stateDir, [{ id: "acct_transport_override", status: "active" }]);
+  const calls = [];
+
+  const gateway = await createProtocolPoolGateway({
+    env: {
+      TABBIT_POOL_STATE_DIR: stateDir,
+      TABBIT_POOL_PROTOCOL_ENABLED: "true",
+      TABBIT_POOL_PROTOCOL_FETCH_TRANSPORT: "powershell",
+    },
+    fetch: async (url, options = {}) => {
+      calls.push({ url, options });
+      if (url.endsWith("/chat/sign-key")) return jsonResponse("sign-key-from-explicit-fetch");
+      if (url.endsWith("/api/v0/user/base-info")) {
+        return jsonResponse({ success: true, user_info: { id: "user_gateway_transport_override" } });
+      }
+      throw new Error("unexpected explicit fetch request: " + url);
+    },
+    protocolFetchTransports: {
+      powershell: async () => {
+        throw new Error("PowerShell transport should not override explicit fetch");
+      },
+    },
+  });
+
+  const client = gateway.protocolClientFactory({ id: "acct_transport_override", cookieHeader: "tabbit_session=transport_override" });
+  const result = await client.verifySession({ account: { cookieHeader: "tabbit_session=transport_override" } });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.userId, "user_gateway_transport_override");
+  assert.deepEqual(calls.map((call) => [call.options.method || "GET", call.url]), [
+    ["GET", "https://web.tabbit.ai/chat/sign-key"],
+    ["GET", "https://web.tabbit.ai/api/v0/user/base-info"],
+  ]);
+  assert.equal(calls[1].options.headers.Cookie, "tabbit_session=transport_override");
 });
 
 test("gateway default protocol client uses explicit attachment upload path with hydrated cookies", async () => {
@@ -957,6 +1199,7 @@ test("gateway streams configured protocol SSE body before upstream completion", 
 
 test("gateway default models provider uses explicit protocol env model catalog path", async () => {
   const stateDir = await tempStateDir();
+  await writeAccounts(stateDir, [{ id: "acct_models", status: "active", accessTier: "pro" }]);
   const calls = [];
   const gateway = await createProtocolPoolGateway({
     env: {
@@ -967,13 +1210,21 @@ test("gateway default models provider uses explicit protocol env model catalog p
     fetch: async (url, options) => {
       calls.push({ url, options });
       return jsonResponse({
-        data: [{
-          model: "Gemini-2.5-Pro",
-          label: "Gemini 2.5 Pro",
-          supportsTools: true,
-          supportsImages: true,
-          modelAccessType: "pro",
-        }],
+        data: [
+          {
+            display_name: "Default",
+            supports_tools: true,
+            supports_images: true,
+            model_access_type: "free_unlimited",
+          },
+          {
+            model: "Gemini-2.5-Pro",
+            label: "Gemini 2.5 Pro",
+            supportsTools: true,
+            supportsImages: true,
+            modelAccessType: "pro",
+          },
+        ],
       }, { headers: { "content-type": "application/json" } });
     },
   });
@@ -985,12 +1236,11 @@ test("gateway default models provider uses explicit protocol env model catalog p
 
     assert.equal(response.status, 200);
     assert.deepEqual(response.body.data.map((model) => model.id), [
-      "tabbit/priority",
-      "tabbit/Gemini-2.5-Pro",
+      "Gemini-2.5-Pro",
     ]);
-    assert.equal(response.body.data[1].supports_tools, true);
-    assert.equal(response.body.data[1].supports_images, true);
-    assert.equal(response.body.data[1].model_access_type, "pro");
+    assert.equal(response.body.data[0].supports_tools, true);
+    assert.equal(response.body.data[0].supports_images, true);
+    assert.equal(response.body.data[0].model_access_type, "pro");
   });
 
   assert.equal(calls.length, 1);
@@ -1029,15 +1279,7 @@ test("gateway exposes injected models provider and starts on the local default h
     assert.equal(response.status, 200);
     assert.deepEqual(response.body, {
       object: "list",
-      data: [{
-        id: "tabbit/priority",
-        object: "model",
-        owned_by: "tabbit",
-        tabbit_selected_model: null,
-        supports_tools: true,
-        supports_images: false,
-        model_access_type: "priority",
-      }],
+      data: [],
     });
   } finally {
     await gateway.close();
@@ -1129,6 +1371,158 @@ test("gateway exposes admin status without leaking the configured API key", asyn
     assert.equal(response.body.health.accounts.total, 1);
     assert.doesNotMatch(serialized, /secret-admin-key|tabbit_session|admin-status@example\.test|cookieHeader|cookieJarRef/);
   });
+});
+
+test("gateway admin status accepts configured admin username and password from env", async () => {
+  const stateDir = await tempStateDir();
+  await writeAccounts(stateDir, [{
+    id: "acct_admin_login",
+    status: "active",
+  }]);
+
+  const gateway = await createProtocolPoolGateway({
+    env: {
+      TABBIT_POOL_STATE_DIR: stateDir,
+      TABBIT_POOL_API_KEY: "secret-admin-key",
+      TABBIT_POOL_ADMIN_USERNAME: "admin",
+      TABBIT_POOL_ADMIN_PASSWORD: "page-password",
+    },
+    now: () => NOW,
+    protocolClientFactory: () => ({
+      async sendMessage() {
+        throw new Error("not used");
+      },
+    }),
+  });
+
+  await withServer(gateway.server, async (baseUrl) => {
+    const rejected = await requestJson(baseUrl, "/admin/api/status", {
+      headers: { Authorization: basicAuth("admin", "wrong-password") },
+    });
+    const accepted = await requestJson(baseUrl, "/admin/api/status", {
+      headers: { Authorization: basicAuth("admin", "page-password") },
+    });
+
+    assert.equal(rejected.status, 401);
+    assert.equal(rejected.body.error.code, "invalid_api_key");
+    assert.equal(accepted.status, 200);
+    assert.equal(accepted.body.status, "ok");
+    assert.equal(accepted.body.health.accounts.total, 1);
+  });
+});
+
+test("gateway admin APIs manage account metadata and gateway key without leaking secrets", async () => {
+  const stateDir = await tempStateDir();
+  await writeAccounts(stateDir, [{
+    id: "acct_admin_manage",
+    email: "admin-manage@example.test",
+    status: "active",
+    cookieJarRef: "secrets/acct_admin_manage.cookie",
+  }]);
+
+  const gateway = await createProtocolPoolGateway({
+    env: {
+      TABBIT_POOL_STATE_DIR: stateDir,
+      TABBIT_POOL_API_KEY: "secret-admin-key",
+      TABBIT_POOL_ADMIN_USERNAME: "admin",
+      TABBIT_POOL_ADMIN_PASSWORD: "page-password",
+    },
+    now: () => NOW,
+    protocolClientFactory: () => ({
+      async sendMessage() {
+        throw new Error("not used");
+      },
+    }),
+  });
+
+  let rotatedBody = null;
+  await withServer(gateway.server, async (baseUrl) => {
+    const listed = await requestJson(baseUrl, "/admin/api/accounts", {
+      headers: { Authorization: basicAuth("admin", "page-password") },
+    });
+    const keyRejectedWithGatewayKey = await requestJson(baseUrl, "/admin/api/key", {
+      headers: { "x-api-key": "secret-admin-key" },
+    });
+    const keyDetails = await requestJson(baseUrl, "/admin/api/key", {
+      headers: { Authorization: basicAuth("admin", "page-password") },
+    });
+    const disabled = await requestJson(baseUrl, "/admin/api/accounts/status", {
+      method: "POST",
+      headers: { Authorization: basicAuth("admin", "page-password"), "Content-Type": "application/json" },
+      body: JSON.stringify({ accountId: "acct_admin_manage", status: "disabled" }),
+    });
+    const imported = await requestJson(baseUrl, "/admin/api/accounts/import-session", {
+      method: "POST",
+      headers: { Authorization: basicAuth("admin", "page-password"), "Content-Type": "application/json" },
+      body: JSON.stringify({ accountId: "acct_imported", email: "imported-admin@example.test", session: FAKE_GATEWAY_SESSION_PRIVATE, accessTier: "pro", chatSessionId: "browser-chat-session-admin" }),
+    });
+    const autoImported = await requestJson(baseUrl, "/admin/api/accounts/import-session", {
+      method: "POST",
+      headers: { Authorization: basicAuth("admin", "page-password"), "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "auto-admin@example.test", session: FAKE_GATEWAY_SESSION_PRIVATE, accessTier: "free" }),
+    });
+    const listedAfterAutoImport = await requestJson(baseUrl, "/admin/api/accounts", {
+      headers: { Authorization: basicAuth("admin", "page-password") },
+    });
+    const rotated = await requestJson(baseUrl, "/admin/api/key/rotate", {
+      method: "POST",
+      headers: { Authorization: basicAuth("admin", "page-password"), "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    rotatedBody = rotated.body;
+
+    assert.equal(listed.status, 200);
+    assert.equal(keyRejectedWithGatewayKey.status, 401);
+    assert.equal(keyDetails.status, 200);
+    assert.equal(keyDetails.body.apiKey, "secret-admin-key");
+    assert.equal(disabled.status, 200);
+    assert.equal(imported.status, 200);
+    assert.equal(autoImported.status, 200);
+    assert.equal(rotated.status, 200);
+    assert.equal(listed.body.accounts[0].email, "ad***@example.test");
+    assert.equal(listed.body.accounts[0].cookieJarRef, undefined);
+    assert.equal(disabled.body.account.status, "disabled");
+    assert.equal(imported.body.account.email, "im***@example.test");
+    assert.equal(imported.body.account.accessTier, "pro");
+    assert.equal(imported.body.account.chatSessionId, undefined);
+    assert.match(autoImported.body.account.id, /^acct_[a-f0-9]{16}$/);
+    assert.equal(autoImported.body.account.email, "au***@example.test");
+    assert.equal(autoImported.body.account.accessTier, "free");
+    assert.equal(listedAfterAutoImport.body.accounts.some((account) => account.id === autoImported.body.account.id), true);
+    assert.deepEqual(rotated.body, {
+      changed: true,
+      secretRef: "secrets/gateway-api-key.txt",
+      apiKeySource: "state_secret",
+      apiKey: rotated.body.apiKey,
+      restartRequired: false,
+    });
+    assert.match(rotated.body.apiKey, new RegExp("^" + GENERATED_GATEWAY_KEY_PREFIX));
+    const oldKeyModels = await requestJson(baseUrl, "/v1/models", {
+      headers: { "x-api-key": "secret-admin-key" },
+    });
+    const newKeyModels = await requestJson(baseUrl, "/v1/models", {
+      headers: { "x-api-key": rotated.body.apiKey },
+    });
+    assert.equal(oldKeyModels.status, 401);
+    assert.equal(newKeyModels.status, 200);
+    const serialized = JSON.stringify({ listed: listed.body, disabled: disabled.body, imported: imported.body });
+    assert.doesNotMatch(serialized, /admin-manage@example\.test|imported-admin@example\.test|cookieJarRef|secret-admin-key|browser-chat-session-admin/);
+    assert.equal(serialized.includes(FAKE_GATEWAY_SESSION_COOKIE_NAME), false);
+    assert.equal(serialized.includes(GENERATED_GATEWAY_KEY_PREFIX), false);
+  });
+
+  const accounts = JSON.parse(await readFile(join(stateDir, "accounts.json"), "utf8")).accounts;
+  const disabledAccount = accounts.find((account) => account.id === "acct_admin_manage");
+  const importedAccount = accounts.find((account) => account.id === "acct_imported");
+  assert.equal(disabledAccount.status, "disabled");
+  assert.equal(importedAccount.status, "active");
+  assert.equal(importedAccount.accessTier, "pro");
+  assert.equal(importedAccount.chatSessionId, "browser-chat-session-admin");
+  assert.equal(importedAccount.cookieJarRef, "secrets/acct_imported.cookie");
+  assert.equal(importedAccount.cookieHeader, undefined);
+  assert.equal(await readFile(join(stateDir, "secrets", "acct_imported.cookie"), "utf8"), FAKE_GATEWAY_SESSION_PRIVATE);
+  const gatewayKey = await readFile(join(stateDir, "secrets", "gateway-api-key.txt"), "utf8");
+  assert.equal(gatewayKey, rotatedBody.apiKey + "\n");
 });
 
 test("admin status provider summarizes health without leaking raw health secrets", async () => {

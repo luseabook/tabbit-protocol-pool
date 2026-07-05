@@ -181,7 +181,7 @@ type ListLotteryHitRecordsInput = {
 - 从 [M07-配置密钥](../M07-配置密钥/_M07-配置密钥.md) 读取账号 cookie/session 引用。
 - 把协议错误交给 [M02-账号池调度](../M02-账号池调度/_M02-账号池调度.md) 处理。
 - 模型目录输出给 [M06-兼容网关](../M06-兼容网关/_M06-兼容网关.md)。
-- 当 gateway 显式启用协议 env 时，`/v1/models` 会复用 `listModels()` 的归一化结果；未启用时仍只返回安全 `tabbit/priority` fallback。
+- 当 gateway 显式启用协议 env 时，runner 会复用 `listModels()` 的归一化结果做模型权限路由；公开 `/v1/models` 会在此基础上按账号池可选 tier 过滤。未启用时返回空模型列表。`tabbit/priority` 仍作为请求路由兼容保留，但不在公开模型列表中展示。
 
 ## 设计约束
 

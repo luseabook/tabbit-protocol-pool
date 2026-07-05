@@ -34,7 +34,7 @@ HTTP JSON response / SSE adapter
 | `attachments` | array | [] | 透传给 runner；真实 send 分支支持已上传附件引用，完整配置 COS 上传链时支持 raw/base64 自动上传。 |
 | `tools` | array | undefined | Anthropic 工具定义数组，原样传给 runner；不在 compat 层执行。 |
 | `tool_choice` | object/string | `{ type:"auto" }`（仅当 tools 存在时） | 有非空 tools 时映射为内部 `toolChoice`；没有 tools 时忽略 `{ type:"auto" }` 这类 no-op 选择。 |
-| `requiresPremium` / `requires_premium` | boolean | false | 传给账号池筛选 Pro/Premium 账号。 |
+| `requiresPremium` / `requires_premium` | boolean | false | 显式传给账号池筛选 Pro 账号；未传时 runner 仍可根据模型目录或 `Claude-Opus-*` 这类模型名自动推断所需 tier，其中 `premium_only` / Opus 会要求 Pro。 |
 
 空 messages 且空 attachments 会返回 400 Anthropic error envelope，不调用 runner。工具字段只参与协议请求透传，不会绕过该最小输入校验。
 

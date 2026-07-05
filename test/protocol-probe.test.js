@@ -8,6 +8,7 @@ import {
   FileProtocolFixtureStore,
   ProtocolProbeRunner,
   buildProtocolProbeFixture,
+  sanitizeProtocolProbeFixture,
 } from "../src/protocol-probe.js";
 import { buildProtocolFixtureAudit } from "../src/observability.js";
 
@@ -84,6 +85,25 @@ test("buildProtocolProbeFixture redacts sensitive request, response, and error f
   assert.doesNotMatch(serialized, /123456/);
 });
 
+test("sanitizeProtocolProbeFixture keeps safe error codes while redacting input codes", () => {
+  const fixture = sanitizeProtocolProbeFixture(buildProtocolProbeFixture({
+    observedAt: NOW,
+    accountId: "acct_chat",
+    operation: "sendMessage",
+    status: "failed",
+    input: { code: "123456", messages: [{ role: "user", content: "secret prompt" }] },
+    result: { ok: false, error: { category: "invalid_request", code: "MISSING_CHAT_SESSION_ID" } },
+    error: { category: "invalid_request", code: "MISSING_CHAT_SESSION_ID", message: "missing chat session id" },
+  }));
+
+  const serialized = JSON.stringify(fixture);
+  assert.equal(fixture.error.code, "MISSING_CHAT_SESSION_ID");
+  assert.equal(fixture.result.error.code, "MISSING_CHAT_SESSION_ID");
+  assert.equal(fixture.input.code, "***");
+  assert.equal(fixture.input.messages[0].content, "***");
+  assert.doesNotMatch(serialized, /123456|secret prompt/);
+});
+
 test("buildProtocolProbeFixture redacts sendMessage prompt and stream text", () => {
   const fixture = buildProtocolProbeFixture({
     observedAt: NOW,
@@ -113,6 +133,62 @@ test("buildProtocolProbeFixture redacts sendMessage prompt and stream text", () 
   assert.equal(fixture.result.contentBlocks[0].text, "***");
   assert.deepEqual(fixture.result.streamDeltas, ["***", "***", "***"]);
   assert.doesNotMatch(serialized, /private prompt|private stream|private assistant/);
+});
+
+test("buildProtocolProbeFixture redacts auto-created chat session and raw tool event details", () => {
+  const fixture = buildProtocolProbeFixture({
+    observedAt: NOW,
+    accountId: "acct_chat",
+    operation: "sendMessage",
+    status: "success",
+    result: {
+      ok: true,
+      chatSessionId: "12c4903b-f540-4fcd-84bd-02b5c5d56907",
+      contentBlocks: [
+        { type: "text", text: "private assistant response" },
+        {
+          type: "tool_use",
+          id: "call_private_tool_id",
+          name: "parallel_web_search",
+          input: {
+            query: [
+              "private prompt search term",
+              "private diagnostic query",
+            ],
+          },
+        },
+      ],
+      raw: {
+        kind: "stream",
+        format: "sse",
+        events: [
+          {
+            event: "ready",
+            data: {
+              chat_session_id: "12c4903b-f540-4fcd-84bd-02b5c5d56907",
+              request_message_id: "request-message-private",
+            },
+          },
+          {
+            event: "message_tool_call_delta",
+            data: {
+              tool_call_id: "call_private_tool_id",
+              arguments: "{\"query\":[\"private prompt search term\"]}",
+            },
+          },
+        ],
+        text: "private upstream text",
+      },
+      streamDeltas: ["private upstream text"],
+    },
+  });
+
+  const serialized = JSON.stringify(fixture);
+  assert.equal(fixture.result.chatSessionId, "***");
+  assert.equal(fixture.result.contentBlocks[1].input.query[0], "***");
+  assert.equal(fixture.result.raw.events[0].data, "***");
+  assert.equal(fixture.result.raw.events[1].data, "***");
+  assert.doesNotMatch(serialized, /12c4903b|private prompt search term|private diagnostic query|request-message-private|call_private_tool_id|private upstream text/);
 });
 
 test("buildProtocolProbeFixture redacts real user identifiers from payloads", () => {

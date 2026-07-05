@@ -150,6 +150,7 @@ test("accounts import-session --json stores session in secret store and saves ac
     "--id", "acct_logged_in",
     "--email", "user@example.test",
     "--access-tier", "pro",
+    "--chat-session-id", "browser-chat-session-uuid",
     "--cookie-file", cookieFile,
     "--json",
   ], {
@@ -162,8 +163,8 @@ test("accounts import-session --json stores session in secret store and saves ac
 
   assert.equal(result.exitCode, 0);
   assert.equal(secretStore.getSecret("secrets/acct_logged_in.cookie"), "tabbit_session=secret-cookie; tabbit_user=user@example.test");
-  assert.deepEqual(store.accounts.map((account) => ({ id: account.id, status: account.status, email: account.email, accessTier: account.accessTier, cookieJarRef: account.cookieJarRef })), [
-    { id: "acct_logged_in", status: "active", email: "user@example.test", accessTier: "pro", cookieJarRef: "secrets/acct_logged_in.cookie" },
+  assert.deepEqual(store.accounts.map((account) => ({ id: account.id, status: account.status, email: account.email, accessTier: account.accessTier, cookieJarRef: account.cookieJarRef, chatSessionId: account.chatSessionId })), [
+    { id: "acct_logged_in", status: "active", email: "user@example.test", accessTier: "pro", cookieJarRef: "secrets/acct_logged_in.cookie", chatSessionId: "browser-chat-session-uuid" },
   ]);
   const text = stream.stdout.join("");
   const body = JSON.parse(text);
@@ -171,7 +172,8 @@ test("accounts import-session --json stores session in secret store and saves ac
   assert.equal(body.account.id, "acct_logged_in");
   assert.equal(body.account.email, "us***@example.test");
   assert.equal(body.account.cookieJarRef, undefined);
-  assert.doesNotMatch(text, /secret-cookie|tabbit_session|user@example.test/);
+  assert.equal(body.account.chatSessionId, undefined);
+  assert.doesNotMatch(text, /secret-cookie|tabbit_session|user@example.test|browser-chat-session-uuid/);
   assert.equal(stream.stderr.join(""), "");
 });
 
@@ -193,6 +195,26 @@ test("accounts import-session requires exactly one session source without leakin
   assert.equal(result.exitCode, 2);
   assert.match(stream.stderr.join(""), /one session source/i);
   assert.doesNotMatch(stream.stderr.join(""), /secret-cookie|another-secret|tabbit_session/);
+});
+
+test("accounts import-session rejects unsupported premium access tier", async () => {
+  const stream = io();
+  const result = await runProtocolPoolCli([
+    "accounts", "import-session",
+    "--id", "acct_bad_tier",
+    "--access-tier", "premium",
+    "--cookie-header", "tabbit_session=secret-cookie",
+    "--json",
+  ], {
+    accountStore: memoryStore([]),
+    secretStore: memorySecretStore(),
+    stdout: (line) => stream.stdout.push(line),
+    stderr: (line) => stream.stderr.push(line),
+  });
+
+  assert.equal(result.exitCode, 2);
+  assert.match(stream.stderr.join(""), /unknown, free, or pro/i);
+  assert.doesNotMatch(stream.stderr.join(""), /secret-cookie|tabbit_session/);
 });
 
 test("accounts list --json prints redacted account metadata", async () => {
@@ -379,6 +401,7 @@ test("readiness doctor --json explains state, protocol env, and remaining work w
         activityParticipatePath: "/api/commerce/activity/v1/participate",
         lotteryDrawPath: "/api/commerce/lottery/v1/draw",
         reqCtx: "browser-context-secret",
+        defaultChatSessionId: "browser-chat-session-secret",
       },
     },
     accountStore: memoryStore(baseAccounts(), calls),
@@ -427,7 +450,7 @@ test("readiness doctor --json explains state, protocol env, and remaining work w
   assert.match(body.commands.setStateDir, /\$env:TABBIT_POOL_STATE_DIR/);
   assert.match(body.commands.fixturesAudit, /fixtures audit --json/);
   assert.doesNotMatch(text, /alpha-user@example\.test|beta-user@example\.test/);
-  assert.doesNotMatch(text, /tabbit_session|secret-token|secret-local-key|browser-context-secret|cookieJarRef/);
+  assert.doesNotMatch(text, /tabbit_session|secret-token|secret-local-key|browser-context-secret|browser-chat-session-secret|cookieJarRef/);
 });
 
 test("readiness doctor --json includes auth and benefits backlog without running probes", async () => {
@@ -454,6 +477,7 @@ test("readiness doctor --json includes auth and benefits backlog without running
         activityParticipatePath: "/api/commerce/activity/v1/participate",
         lotteryDrawPath: "/api/commerce/lottery/v1/draw",
         reqCtx: "browser-context-secret",
+        defaultChatSessionId: "browser-chat-session-secret",
       },
     },
     accountStore: memoryStore(baseAccounts(), calls),
@@ -612,7 +636,7 @@ test("readiness doctor --json includes auth and benefits backlog without running
   assert.match(body.commands.sessionFixturesAudit, /fixtures audit --scope session --json/);
   assert.match(body.commands.upstreamFixturesAudit, /fixtures audit --scope upstream --json/);
   assert.doesNotMatch(text, /alpha-user@example\.test|beta-user@example\.test/);
-  assert.doesNotMatch(text, /tabbit_session|secret-token|secret-local-key|browser-context-secret|cookieJarRef/);
+  assert.doesNotMatch(text, /tabbit_session|secret-token|secret-local-key|browser-context-secret|browser-chat-session-secret|cookieJarRef/);
   assert.doesNotMatch(text, /lookup_private_data/);
 });
 
@@ -629,6 +653,7 @@ test("production preflight --json blocks the default API key without leaking it"
         baseUrl: "https://web.tabbit.ai",
         sendPath: "/api/v1/chat/completion",
         sessionVerifyPath: "/api/v0/user/base-info",
+        defaultChatSessionId: "browser-chat-session-secret",
       },
     },
     accountStore: memoryStore(baseAccounts(), calls),
@@ -662,7 +687,7 @@ test("production preflight --json blocks the default API key without leaking it"
     initGatewayKey: "node bin\\tabbit-pool.js production init-key --json",
   });
   assert.ok(body.nextActions.some((item) => item.includes("secrets/gateway-api-key.txt")));
-  assert.doesNotMatch(text, /sk-tabbit-local|tabbit_session|secret-token|alpha-user@example\.test|lookup_private_data/);
+  assert.doesNotMatch(text, /sk-tabbit-local|tabbit_session|secret-token|browser-chat-session-secret|alpha-user@example\.test|lookup_private_data/);
 });
 
 test("production preflight --json blocks incomplete manual cookie evidence", async () => {
@@ -678,6 +703,7 @@ test("production preflight --json blocks incomplete manual cookie evidence", asy
         baseUrl: "https://web.tabbit.ai",
         sendPath: "/api/v1/chat/completion",
         sessionVerifyPath: "/api/v0/user/base-info",
+        defaultChatSessionId: "browser-chat-session-secret",
       },
     },
     accountStore: memoryStore(baseAccounts(), calls),
@@ -707,7 +733,7 @@ test("production preflight --json blocks incomplete manual cookie evidence", asy
   assert.equal(body.checks.manualCookieMode.status, "blocked");
   assert.deepEqual(body.checks.manualCookieMode.missing, ["expired_verifySession_fixture"]);
   assert.deepEqual(body.missing, ["expired_verifySession_fixture"]);
-  assert.doesNotMatch(text, /prod-local-key|tabbit_session|secret-token|beta-user@example\.test|lookup_private_data/);
+  assert.doesNotMatch(text, /prod-local-key|tabbit_session|secret-token|browser-chat-session-secret|beta-user@example\.test|lookup_private_data/);
 });
 
 test("production preflight --json passes only ready doctor and manual cookie state", async () => {
@@ -723,6 +749,7 @@ test("production preflight --json passes only ready doctor and manual cookie sta
         baseUrl: "https://web.tabbit.ai",
         sendPath: "/api/v1/chat/completion",
         sessionVerifyPath: "/api/v0/user/base-info",
+        defaultChatSessionId: "browser-chat-session-secret",
       },
     },
     accountStore: memoryStore(baseAccounts(), calls),
@@ -751,7 +778,7 @@ test("production preflight --json passes only ready doctor and manual cookie sta
   assert.equal(body.checks.readinessDoctor.status, "ready");
   assert.equal(body.checks.manualCookieMode.status, "ready");
   assert.deepEqual(body.missing, []);
-  assert.doesNotMatch(text, /prod-local-key|tabbit_session|secret-token|user_123|lookup_private_data/);
+  assert.doesNotMatch(text, /prod-local-key|tabbit_session|secret-token|browser-chat-session-secret|user_123|lookup_private_data/);
 });
 
 test("production init-key --json writes a gateway API key secret without printing it", async () => {
@@ -830,6 +857,7 @@ test("readiness doctor prints calibration backlog in plain output", async () => 
         activityParticipatePath: "/api/commerce/activity/v1/participate",
         lotteryDrawPath: "/api/commerce/lottery/v1/draw",
         reqCtx: "browser-context-secret",
+        defaultChatSessionId: "browser-chat-session-secret",
       },
     },
     accountStore: memoryStore(baseAccounts(), calls),
@@ -897,7 +925,7 @@ test("readiness doctor prints calibration backlog in plain output", async () => 
   assert.match(text, /^capture_command\tsuccessful_reset_coupon_consumption_fixture\tbenefits\tside_effect=true\ttemplate=node bin\\tabbit-pool\.js probe template --operation useResetCoupon --json\tvalidate=node bin\\tabbit-pool\.js probe validate --operation useResetCoupon --input-file <redacted-input\.json> --json\tconfirm_validate=node bin\\tabbit-pool\.js probe validate --operation useResetCoupon --input-file <redacted-input\.json> --require-confirmed-side-effect --json\tprobe=node bin\\tabbit-pool\.js probe protocol --account <account-id> --operation useResetCoupon --input-file <redacted-input\.json> --write-fixture --json\twrite_fixture=\tprereq=TABBIT_POOL_PROTOCOL_BENEFIT_COUPON_USE_PATH:configured\treason=/m);
   assert.match(text, /^capture_command\tautomated_session_refresh_strategy\tsession\tside_effect=false\ttemplate=node bin\\tabbit-pool\.js probe template --operation recoverSession --json\tvalidate=node bin\\tabbit-pool\.js probe validate --operation recoverSession --input-file <redacted-input\.json> --json\tconfirm_validate=\tprobe=\twrite_fixture=node bin\\tabbit-pool\.js probe validate --operation recoverSession --input-file <redacted-input\.json> --write-fixture --json\tprereq=\treason=/m);
   assert.doesNotMatch(text, /alpha-user@example\.test|beta-user@example\.test/);
-  assert.doesNotMatch(text, /tabbit_session|secret-token|secret-local-key|browser-context-secret|cookieJarRef/);
+  assert.doesNotMatch(text, /tabbit_session|secret-token|secret-local-key|browser-context-secret|browser-chat-session-secret|cookieJarRef/);
   assert.doesNotMatch(text, /lookup_private_data/);
 });
 
@@ -2337,6 +2365,53 @@ test("createProtocolPoolCliDependencies wires configured auth operations for Acc
   const serializedResult = JSON.stringify(result);
   assert.equal(serializedResult.includes("tabbit_session=auth-wired-secret"), false);
   assert.equal(serializedResult.includes("654321"), false);
+});
+
+test("createProtocolPoolCliDependencies uses configured PowerShell fetch transport for account probes", async () => {
+  const stateDir = await mkdtemp(path.join(tmpdir(), "tabbit-pool-fetch-transport-"));
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error("node fetch should not be used when PowerShell transport is selected");
+  };
+
+  try {
+    const deps = createProtocolPoolCliDependencies({
+      env: {
+        TABBIT_POOL_STATE_DIR: stateDir,
+        TABBIT_POOL_PROTOCOL_ENABLED: "true",
+        TABBIT_POOL_PROTOCOL_FETCH_TRANSPORT: "powershell",
+      },
+      protocolFetchTransports: {
+        powershell: async (url, options = {}) => {
+          calls.push({ url, options });
+          if (url.endsWith("/chat/sign-key")) return jsonResponse("sign-key-cli-transport");
+          if (url.endsWith("/api/v0/user/base-info")) {
+            return jsonResponse({
+              success: true,
+              user_info: { id: "user_cli_transport" },
+            });
+          }
+          throw new Error("unexpected CLI transport request: " + url);
+        },
+      },
+      now: () => Date.parse("2026-07-05T10:00:00.000Z"),
+    });
+
+    const result = await deps.accountProtocolClient.verifySession({
+      account: { cookieHeader: "tabbit_session=cli_transport" },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.userId, "user_cli_transport");
+    assert.deepEqual(calls.map((call) => [call.options.method || "GET", call.url]), [
+      ["GET", "https://web.tabbit.ai/chat/sign-key"],
+      ["GET", "https://web.tabbit.ai/api/v0/user/base-info"],
+    ]);
+    assert.equal(calls[1].options.headers.Cookie, "tabbit_session=cli_transport");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("configured quota usage env wires maintain refreshQuota with hydrated local session", async () => {

@@ -1,11 +1,15 @@
 import { Buffer } from "node:buffer";
 import { createHash, createHmac, randomUUID } from "node:crypto";
+import { isUnsupportedModel, modelAccessRequiresPremium } from "./model-access.js";
 
 const DEFAULT_BASE_URL = "https://web.tabbit.ai";
 const DEFAULT_SIGN_KEY_PATH = "/chat/sign-key";
 const DEFAULT_MODEL_CATALOG_PATH = "/proxy/v1/model_config/models";
 const DEFAULT_MODEL_CATALOG_SCENE = "chat";
 const DEFAULT_REQ_CTX = "MS4zLjI2KDEwMTAzMDI2KQ==";
+const DEFAULT_CHAT_SESSION_CREATE_PATH = "/newtab";
+const DEFAULT_CHAT_SESSION_CREATE_ACTION_ID = "00b19386a3892f62370bef2ffacfbd5b58580fcb2a";
+const DEFAULT_CHAT_SESSION_CREATE_ROUTER_TREE = ["", { children: ["newtab", { children: ["__PAGE__", {}] }] }, null, null, true];
 const EMPTY_TAB_ENTITY_KEY = "d41d8cd98f00b204e9800998ecf8427e";
 const NEWBIE_EXPLORATION_VIEW_MODES = new Set(["event_gate", "float_collapsed", "float_expanded", "activity_page"]);
 const DEFAULT_DAILY_SIGN_IN_SCENE = "desktop_pet";
@@ -28,6 +32,10 @@ export class ProtocolTabbitError extends Error {
 function trimTrailingSlash(value) { return String(value || "").replace(/\/+$/, ""); }
 function normalizePath(path) { const clean = String(path || "/"); return clean.startsWith("/") ? clean : `/${clean}`; }
 function isPlainObject(value) { return value && typeof value === "object" && !Array.isArray(value); }
+
+function cloneJson(value) {
+  return JSON.parse(JSON.stringify(value));
+}
 
 export function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
@@ -218,6 +226,54 @@ function chatSessionIdFromInput({ chatSessionId, account = {}, defaultChatSessio
     account.defaultChatSessionId,
     defaultChatSessionId,
   );
+}
+
+function stripFlightRouterStateForRequest(tree) {
+  if (!Array.isArray(tree)) return cloneJson(DEFAULT_CHAT_SESSION_CREATE_ROUTER_TREE);
+  const output = [...tree];
+  const [segment, parallelRoutes] = output;
+  const cleanSegment = typeof segment === "string" && segment.startsWith("__PAGE__?")
+    ? "__PAGE__"
+    : segment;
+  const cleanRoutes = {};
+  for (const [key, value] of Object.entries(isPlainObject(parallelRoutes) ? parallelRoutes : {})) {
+    cleanRoutes[key] = stripFlightRouterStateForRequest(value);
+  }
+  output[0] = cleanSegment;
+  output[1] = cleanRoutes;
+  if (output.length > 2) output[2] = null;
+  if (output.length > 3 && (!output[3] || output[3] === "refresh")) output[3] = null;
+  return output;
+}
+
+function nextRouterStateTreeHeader(tree) {
+  return encodeURIComponent(JSON.stringify(stripFlightRouterStateForRequest(tree)));
+}
+
+function parseFlightPayload(payload = "") {
+  const text = String(payload || "");
+  const body = /^[A-Z]$/.test(text[0]) ? text.slice(1) : text;
+  if (!/^[\[{"]/.test(body)) return null;
+  try {
+    return JSON.parse(body);
+  } catch {
+    return null;
+  }
+}
+
+function parseNextServerActionResult(text) {
+  const chunks = new Map();
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const match = /^([0-9a-f]+):(.*)$/i.exec(line);
+    if (!match) continue;
+    chunks.set(match[1], parseFlightPayload(match[2]));
+  }
+  const root = chunks.get("0");
+  const actionRef = typeof root?.a === "string" ? root.a : null;
+  if (actionRef && /^\$@[0-9a-f]+$/i.test(actionRef)) {
+    return chunks.get(actionRef.slice(2));
+  }
+  return root?.a;
 }
 
 function buildRealChatCompletionBody({ account, defaultChatSessionId, chatSessionId, model, messages, content = null, references = [], metadatas = null, entity = null, messageId = null, parallelGroupId = null, taskName = "chat", agentMode = false } = {}) {
@@ -788,12 +844,15 @@ export function normalizeModelCatalog(body) {
   const normalized = extractModelArray(body).map((item) => {
     const selectedModel = normalizeModelId(firstDefined(item.selectedModel, item.display_name, item.model, item.name, item.id, item.value));
     if (!selectedModel || selectedModel === "priority") return null;
+    if (isUnsupportedModel(selectedModel)) return null;
     const displayName = String(firstDefined(item.displayName, item.display_name, item.title, item.label, item.name, item.model, selectedModel));
+    const modelAccessType = String(firstDefined(item.model_access_type, item.modelAccessType, item.access, item.accessType, "unknown"));
     return {
       id: `tabbit/${selectedModel}`, selectedModel, displayName, tabbit_display_name: displayName,
       supports_tools: normalizeBoolean(firstDefined(item.supports_tools, item.supportsTools, item.supportTool, false)),
       supports_images: normalizeBoolean(firstDefined(item.supports_images, item.supportsImages, item.supportImage, false)),
-      model_access_type: String(firstDefined(item.model_access_type, item.modelAccessType, item.access, item.accessType, "unknown")),
+      model_access_type: modelAccessType,
+      requires_premium: modelAccessRequiresPremium(modelAccessType),
       available_in_tabbit_catalog: true,
     };
   }).filter(Boolean);
@@ -801,7 +860,7 @@ export function normalizeModelCatalog(body) {
     id: "tabbit/priority", selectedModel: null, displayName: "priority", tabbit_display_name: "priority",
     supports_tools: normalized.some((model) => model.supports_tools),
     supports_images: normalized.some((model) => model.supports_images),
-    model_access_type: "priority", available_in_tabbit_catalog: true,
+    model_access_type: "priority", requires_premium: false, available_in_tabbit_catalog: true,
   }, ...normalized];
 }
 
@@ -1315,13 +1374,38 @@ export function classifyProtocolError(input = {}) {
   const body = input.body ?? input.detail ?? null;
   const message = body?.error_message || body?.invalid_reason || body?.detail?.error_message || body?.detail?.message || body?.error || body?.message || (status ? `Tabbit protocol request failed with status ${status}.` : "Tabbit protocol request failed.");
   const code = body?.error_code || body?.invalid_code || body?.detail?.error_code || body?.code || body?.errorCode || null;
+  if (isModelEntitlementSignal({ code, message, body })) {
+    return {
+      category: "model_entitlement",
+      status,
+      code: "MODEL_ENTITLEMENT_REQUIRED",
+      message,
+      retryable: true,
+      cooldownMs: 0,
+    };
+  }
   if (status === 401) return { category: "login_required", status, code, message, retryable: false, cooldownMs: 0 };
   if (isQuotaExhaustedSignal({ code, message, body })) return { category: "quota_exhausted", status, code, message, retryable: true, cooldownMs: 0 };
+  if (isTemporaryUnavailableSignal({ code, message, body })) return { category: "upstream_error", status, code, message, retryable: true, cooldownMs: 10_000 };
   if (status === 403) return { category: "forbidden", status, code, message, retryable: false, cooldownMs: 30 * 60_000 };
   if (status === 429) return { category: "rate_limited", status, code, message, retryable: true, cooldownMs: parseRetryAfter(input.headers) || 60_000 };
   if (status >= 500) return { category: "upstream_error", status, code, message, retryable: true, cooldownMs: 10_000 };
   if (status >= 400) return { category: "invalid_request", status, code, message, retryable: false, cooldownMs: 0 };
   return { category: "unknown", status, code, message, retryable: false, cooldownMs: 0 };
+}
+
+function isModelEntitlementSignal({ code, message, body } = {}) {
+  const text = [
+    code,
+    message,
+    body?.reason,
+    body?.type,
+    body?.data?.code,
+    body?.data?.message,
+  ].filter(Boolean).join(" ").toLowerCase();
+  if (!text) return false;
+  if (/\b(premium users only|available to premium|premium-only|premium only|premium required|required premium|upgrade and try again|subscription required)\b/.test(text)) return true;
+  return /\b(model|模型)\b/.test(text) && /(\bpremium\b|\bupgrade\b|会员|权益|升级)/.test(text);
 }
 
 function isQuotaExhaustedSignal({ code, message, body } = {}) {
@@ -1336,6 +1420,22 @@ function isQuotaExhaustedSignal({ code, message, body } = {}) {
   if (!text) return false;
   if (/(^|[^a-z])(quota_exhausted|insufficient_quota|usage_limit_exceeded|credit_exhausted)([^a-z]|$)/i.test(text)) return true;
   return /\b(quota|credit|usage)\b/.test(text) && /\b(exhausted|insufficient|depleted|limit|used up)\b/.test(text);
+}
+
+function isTemporaryUnavailableSignal({ code, message, body } = {}) {
+  const text = [
+    code,
+    message,
+    body?.reason,
+    body?.type,
+    body?.title,
+    body?.detail,
+    body?.data?.code,
+    body?.data?.message,
+  ].filter(Boolean).join(" ").toLowerCase();
+  if (!text) return false;
+  return /\b(temporarily unavailable|try again later|service unavailable|upstream unavailable|bad gateway|origin_bad_gateway)\b/.test(text)
+    || /(暂时不可用|稍后重试|稍后再试|服务不可用|上游不可用|网关错误|系统繁忙)/.test(text);
 }
 
 function accountStatusForCategory(category) {
@@ -1428,7 +1528,7 @@ function resultFromError(error) {
 export class ProtocolTabbitClient {
   constructor({
     baseUrl = DEFAULT_BASE_URL, signKeyPath = DEFAULT_SIGN_KEY_PATH, modelCatalogPath = DEFAULT_MODEL_CATALOG_PATH, modelCatalogScene = DEFAULT_MODEL_CATALOG_SCENE, sendPath = null, authSendCodePath = null, authSendCodeMethod = "POST", authSubmitCodePath = null, authSubmitCodeMethod = "POST", attachmentUploadPath = null, attachmentCompleteUploadPath = null, quotaUsagePath = null, activityLotteryPath = null, newbieExplorationPath = null, placementResourcesPath = null, rewardCardRecordsPath = null, lotteryHitRecordsPath = null, signInStatusPath = null, signInPath = null, benefitCouponListPath = null, benefitCouponUsePath = null, activityParticipatePath = null, usageResetCouponSkuPath = null, lotteryAvailableChancesPath = null, lotteryActiveMainPoolsPath = null, lotteryChanceRecordsPath = null, lotteryDrawPath = null, sessionVerifyPath = null, sessionVerifyMethod = "GET",
-    reqCtx = DEFAULT_REQ_CTX, defaultChatSessionId = null,
+    reqCtx = DEFAULT_REQ_CTX, defaultChatSessionId = null, chatSessionCreatePath = null, chatSessionCreateActionId = null, chatSessionAutoCreate = false, chatSessionCreateRouterTree = DEFAULT_CHAT_SESSION_CREATE_ROUTER_TREE,
     fetch: fetchImpl = globalThis.fetch, now = () => Date.now(), nonce = () => randomUUID(), signature = null, uniqueUuid = null, authClientUuid = null, signKeyTtlMs = 5 * 60_000, modelCatalogTtlMs = 5 * 60_000,
   } = {}) {
     if (typeof fetchImpl !== "function") throw new ProtocolTabbitError("fetch implementation is required", { category: "invalid_request", code: "MISSING_FETCH" });
@@ -1463,6 +1563,10 @@ export class ProtocolTabbitClient {
     this.sessionVerifyMethod = String(sessionVerifyMethod || "GET").toUpperCase();
     this.reqCtx = reqCtx;
     this.defaultChatSessionId = defaultChatSessionId;
+    this.chatSessionCreatePath = chatSessionCreatePath ? normalizePath(chatSessionCreatePath) : null;
+    this.chatSessionCreateActionId = chatSessionCreateActionId || null;
+    this.chatSessionAutoCreate = Boolean(chatSessionAutoCreate);
+    this.chatSessionCreateRouterTree = cloneJson(chatSessionCreateRouterTree || DEFAULT_CHAT_SESSION_CREATE_ROUTER_TREE);
     this.fetch = fetchImpl; this.now = now; this.nonce = nonce; this.signature = signature || nonce; this.uniqueUuid = uniqueUuid || (() => createUniqueUuid({ now: this.now })); this.authClientUuid = typeof authClientUuid === "function" ? authClientUuid : (() => authClientUuid || createAuthClientUuid()); this.signKeyTtlMs = signKeyTtlMs; this.modelCatalogTtlMs = modelCatalogTtlMs;
     this.signKeyCache = null; this.modelCatalogCache = null; this.cachedAuthClientUuid = null;
   }
@@ -1544,6 +1648,61 @@ export class ProtocolTabbitClient {
       return normalizeVerificationResponse(body);
     } catch (error) {
       return verificationFailure(error);
+    }
+  }
+
+  async createChatSession({ account = {}, session = null } = {}) {
+    if (!this.chatSessionCreatePath || !this.chatSessionCreateActionId) {
+      return resultFromError(new ProtocolTabbitError("Tabbit chat session create action is not configured.", {
+        category: "invalid_request",
+        code: "MISSING_CHAT_SESSION_CREATE_ACTION",
+        retryable: false,
+      }));
+    }
+    const cookie = session || account.cookie || account.cookieHeader;
+    if (!cookie) {
+      return resultFromError(new ProtocolTabbitError("Session material is required for Tabbit chat session creation.", {
+        category: "session_missing",
+        code: "SESSION_MISSING",
+        retryable: false,
+      }));
+    }
+
+    try {
+      const response = await this.fetch(this.buildUrl(this.chatSessionCreatePath), {
+        method: "POST",
+        headers: {
+          Cookie: cookie,
+          Accept: "text/x-component",
+          "Content-Type": "text/plain;charset=UTF-8",
+          "Next-Action": this.chatSessionCreateActionId,
+          "Next-Router-State-Tree": nextRouterStateTreeHeader(this.chatSessionCreateRouterTree),
+        },
+        body: "[]",
+      });
+      const text = await response.text();
+      if (!response.ok) return resultFromError(protocolResponseError(response, text));
+      const chatSessionId = parseNextServerActionResult(text);
+      if (typeof chatSessionId !== "string" || !chatSessionId.trim()) {
+        throw new ProtocolTabbitError("Tabbit chat session create action did not return a chat session id.", {
+          category: "protocol_changed",
+          code: "CHAT_SESSION_CREATE_RESULT_MISSING",
+          detail: {
+            status: response.status,
+            contentType: response.headers?.get?.("content-type") || "",
+          },
+        });
+      }
+      return {
+        ok: true,
+        chatSessionId: chatSessionId.trim(),
+        raw: {
+          kind: "next_server_action",
+          action: "createNewSession",
+        },
+      };
+    } catch (error) {
+      return resultFromError(error);
     }
   }
 
@@ -2266,6 +2425,12 @@ export class ProtocolTabbitClient {
           retryable: false,
         }));
       }
+      let finalChatSessionId = chatSessionIdFromInput({ chatSessionId, account, defaultChatSessionId: this.defaultChatSessionId });
+      if (restoredChatCompletion && !finalChatSessionId && this.chatSessionAutoCreate) {
+        const createdSession = await this.createChatSession({ account });
+        if (!createdSession.ok) return createdSession;
+        finalChatSessionId = createdSession.chatSessionId;
+      }
       const attachmentReferenceResult = restoredChatCompletion
         ? await this.resolveRestoredAttachmentReferences({ account, attachments })
         : normalizeAttachmentReferences(attachments);
@@ -2274,7 +2439,7 @@ export class ProtocolTabbitClient {
         ? buildRealChatCompletionBody({
           account,
           defaultChatSessionId: this.defaultChatSessionId,
-          chatSessionId,
+          chatSessionId: finalChatSessionId,
           model,
           messages,
           content,
@@ -2332,7 +2497,9 @@ export class ProtocolTabbitClient {
       }
       const responseBody = await parseBody(response);
       if (!response.ok) return resultFromError(protocolResponseError(response, responseBody));
-      return normalizeMessageResponse(responseBody, restoredChatCompletion ? body.selected_model : model);
+      const result = normalizeMessageResponse(responseBody, restoredChatCompletion ? body.selected_model : model);
+      if (restoredChatCompletion) result.chatSessionId = body.chat_session_id;
+      return result;
     } catch (error) {
       return resultFromError(error);
     }

@@ -64,6 +64,7 @@ $env:TABBIT_POOL_PORT = "50124"
 $env:TABBIT_POOL_API_KEY = "<local-api-key>"
 $env:TABBIT_POOL_STATE_DIR = "E:\tabbit-live-state"
 $env:TABBIT_POOL_PROTOCOL_ENABLED = "true"
+$env:TABBIT_POOL_PROTOCOL_FETCH_TRANSPORT = "powershell"
 $env:TABBIT_POOL_COMPAT_STRIP_CLIENT_TOOLS = "true"
 ```
 
@@ -71,7 +72,20 @@ $env:TABBIT_POOL_COMPAT_STRIP_CLIENT_TOOLS = "true"
 
 未显式设置 `TABBIT_POOL_STATE_DIR` 时，配置会尝试自动发现仓库外生产 stateDir，优先查找仓库相邻的 `..\tabbit-live-state`，例如 `E:\tabbit-live-state`。当前支持的安全 marker 是候选目录同时包含 `accounts.json`、`readiness.json`、`fixtures/protocol-probes` 和 `secrets`；发现成功后会自动启用已校准的公共 Tabbit 协议默认值。若 `<stateDir>\secrets\gateway-api-key.txt` 存在且不是默认 key，网关会把它作为 `TABBIT_POOL_API_KEY` 的仓库外来源；环境变量仍然优先。旧的 `E:\tabbit2api\output\tabbit-live-state` 不再作为默认自动发现路径；如确需使用 legacy 状态目录，必须显式设置 `TABBIT_POOL_STATE_DIR`。
 
-`TABBIT_POOL_PROTOCOL_ENABLED=true` 会启用已校准的公共 Tabbit Web 默认值：`https://web.tabbit.ai`、`/chat/sign-key`、`/proxy/v1/model_config/models`、`/api/v1/chat/completion`、`/api/v0/user/base-info` 和当前浏览器 `REQ_CTX` 默认值。私密账号状态、cookie/session、脱敏 fixture 与 E2E 标记仍必须来自服务器上的 `stateDir`。
+`TABBIT_POOL_PROTOCOL_ENABLED=true` 会启用已校准的公共 Tabbit Web 默认值：`https://web.tabbit.ai`、`/chat/sign-key`、`/proxy/v1/model_config/models`、`/api/v1/chat/completion`、`/api/v0/user/base-info` 和当前浏览器 `REQ_CTX` 默认值。当前 Windows 本地环境中 Tabbit edge 会拒绝 Node/curl 出站栈，`TABBIT_POOL_PROTOCOL_FETCH_TRANSPORT=powershell` 会让协议客户端改用 PowerShell/.NET 出站请求；该设置解决 sign-key/model/session verifier 的 edge 403，不代表 send 阶段上游 `upstream_error` 已消失。私密账号状态、cookie/session、脱敏 fixture 与 E2E 标记仍必须来自服务器上的 `stateDir`。
+
+当前机器上，已验证可用的 legacy stateDir 是 `E:\tabbit2api\output\tabbit-live-state`。该路径不会被默认自动发现；如果要在不写 state secret 的情况下临时启动或审计，必须显式设置：
+
+```powershell
+$env:TABBIT_POOL_STATE_DIR = "E:\tabbit2api\output\tabbit-live-state"
+$env:TABBIT_POOL_PROTOCOL_ENABLED = "true"
+$env:TABBIT_POOL_PROTOCOL_FETCH_TRANSPORT = "powershell"
+$env:TABBIT_POOL_API_KEY = "<strong-api-key>"
+node bin\tabbit-pool.js production preflight --json
+node bin\tabbit-pool.js readiness doctor --json
+```
+
+如果要把该 stateDir 变成持久生产配置，不再依赖进程级 `TABBIT_POOL_API_KEY`，需要在明确允许写入仓库外 stateDir 后运行 `node bin\tabbit-pool.js production init-key --json`，它会写入 `E:\tabbit2api\output\tabbit-live-state\secrets\gateway-api-key.txt` 且不会打印 key 明文。
 
 ## 手动 Cookie 运维流程
 
@@ -80,6 +94,8 @@ $env:TABBIT_POOL_COMPAT_STRIP_CLIENT_TOOLS = "true"
 ```powershell
 node bin\tabbit-pool.js accounts import-session --id acct_default --email user@example.test --cookie-file <redacted-cookie-file> --json
 ```
+
+默认协议配置会在发送真实 `/api/v1/chat/completion` 前通过已校准的 Tabbit Next Server Action 自动创建聊天会话，并把返回的 `chat_session_id` 只用于本次运行时请求。`--chat-session-id` 仍可把已登录 Tabbit 页面中的真实聊天会话 ID 保存到账号元数据，作为显式覆盖；`TABBIT_POOL_PROTOCOL_CHAT_SESSION_ID` 也可作为进程级覆盖。真实 ID 不会写入 stdout/stderr。不要随机生成，不要把真实值提交到仓库或文档。`verifySession` 成功只证明登录 cookie 有效；当前发送能力还取决于账号/env 是否提供会话 ID，或 `TABBIT_POOL_PROTOCOL_CHAT_SESSION_AUTO_CREATE` 是否启用且 action 配置可用。
 
 只读检查当前账号状态：
 
@@ -113,7 +129,7 @@ node bin\tabbit-pool.js start --host 127.0.0.1 --port 50124 --json
 - `POST /v1/responses`
 - `POST /v1/messages`
 
-`/admin` 是内置 Web 运维后台。页面本身不包含密钥；浏览器调用 `/admin/api/status` 时需要输入同一个 gateway API key。后台第一版只显示聚合状态、stateDir、API key 来源、协议开关和账号池摘要，不展示或返回真实 API key、cookie、session、token、`cookieJarRef`、prompt 或 raw fixture payload。生产环境建议仍只监听 `127.0.0.1`，通过内网/VPN/HTTPS 反向代理访问 `/admin`。
+`/admin` 是内置 Web 运维后台。页面本身不包含密钥或账号明细；未登录时只显示用户名/密码登录区，登录后可查看总览、账号池、请求 Key 和运行摘要。后台用户名/密码来自 `TABBIT_POOL_ADMIN_USERNAME` / `TABBIT_POOL_ADMIN_PASSWORD`；`/admin/api/status` 仍兼容 gateway API key 供旧脚本使用，但请求 Key 明文只在专用 Key 管理接口和视图中按需显示。后台不会在状态、账号、日志或 smoke 输出中返回真实 cookie、session、token、`cookieJarRef`、prompt 或 raw fixture payload。生产环境建议仍只监听 `127.0.0.1`，通过内网/VPN/HTTPS 反向代理访问 `/admin`。
 
 本地冒烟检查：
 
@@ -149,9 +165,9 @@ node bin\tabbit-pool.js production init-key --json
 - 使用 PM2、NSSM、Windows Task Scheduler、systemd 或容器平台托管 Node 进程。
 - 只在内网或本机监听；需要公网访问时放在 HTTPS 反向代理后面。
 - 必须设置强 `TABBIT_POOL_API_KEY`，不要使用默认 `sk-tabbit-local` 暴露服务。
-- Web 后台共用 gateway API key；反向代理应限制 `/admin` 只给可信网络或已登录用户访问。
+- Web 后台使用独立的后台用户名/密码；反向代理应限制 `/admin` 只给可信网络或已登录用户访问，`/v1/*` 兼容路由仍使用 gateway API key。
 - `stateDir`、cookie 文件、fixture store、日志和浏览器 profile 不要放进仓库。
-- 部署后先运行 `production preflight`、`readiness doctor` 和 `smoke gateway`，确认聚合状态再接入客户端。
+- 部署后先运行 `production preflight`、`readiness doctor` 和 `smoke gateway`，确认聚合状态再接入客户端；真实 `/api/v1/chat/completion` 分支的 chat session context 可由账号/env 显式 ID 提供，也可由默认启用的 `TABBIT_POOL_PROTOCOL_CHAT_SESSION_AUTO_CREATE` 自动创建。
 
 ## 运维与审计命令
 
@@ -165,7 +181,7 @@ node bin\tabbit-pool.js fixtures audit --scope session --json
 node bin\tabbit-pool.js fixtures audit --scope upstream --json
 ```
 
-`manualCookieMode.status:"ready"` 且 `manualCookieMode.blockingMissing:[]` 表示当前手动 cookie 运维目标满足。`calibrationBacklog.status:"blocked"` 可以同时存在，表示后续自动刷新、注册/登录、副作用或真实上游 stream boundary 仍需校准。
+`manualCookieMode.status:"ready"` 且 `manualCookieMode.blockingMissing:[]` 表示当前手动 cookie 运维目标满足。若 `readiness doctor` 报 `chat_session_context`，说明账号 cookie/`verifySession` 可用但真实发送仍缺聊天会话上下文；检查 `chatSessionContext.autoCreateConfigured`，若为 false，则重新导入带 `--chat-session-id` 的账号、设置 `TABBIT_POOL_PROTOCOL_CHAT_SESSION_ID`，或配置 `TABBIT_POOL_PROTOCOL_CHAT_SESSION_AUTO_CREATE` 与已验证的 Next action。`calibrationBacklog.status:"blocked"` 可以同时存在，表示后续自动刷新、注册/登录、副作用或真实上游 stream boundary 仍需校准。
 
 生成安全探针模板：
 

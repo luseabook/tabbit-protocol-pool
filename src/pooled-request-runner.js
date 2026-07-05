@@ -1,4 +1,5 @@
 import { AccountPoolError } from "./account-pool.js";
+import { findModelMetadata, isDefaultRoutedModel, isUnsupportedModel, modelMetadataHasAccessSignal, modelMetadataRequiredTier, modelNameRequiredTier } from "./model-access.js";
 
 export class PooledRequestError extends Error {
   constructor(message, { category = "pooled_request_error", code = null, retryable = false, cooldownMs = 0, detail = null } = {}) {
@@ -39,23 +40,55 @@ function normalizeRetryLimit(value) {
 }
 
 export class PooledRequestRunner {
-  constructor({ accountPool, protocolClientFactory, retryLimit = 1 } = {}) {
+  constructor({ accountPool, protocolClientFactory, retryLimit = 1, modelCatalogProvider = null, modelsProvider = null } = {}) {
     if (!accountPool) throw new PooledRequestError("accountPool is required", { category: "invalid_request", code: "MISSING_ACCOUNT_POOL" });
     if (typeof protocolClientFactory !== "function") throw new PooledRequestError("protocolClientFactory is required", { category: "invalid_request", code: "MISSING_PROTOCOL_CLIENT_FACTORY" });
     this.accountPool = accountPool;
     this.protocolClientFactory = protocolClientFactory;
     this.retryLimit = normalizeRetryLimit(retryLimit);
+    this.modelCatalogProvider = modelCatalogProvider || modelsProvider || null;
+    this.modelCatalogCache = null;
   }
 
-  pickInitial({ model, requiresPremium }) {
+  pickInitial({ model, requiresPremium, requiredAccessTier }) {
     try {
-      return this.accountPool.pickAccount({ model, requiresPremium }).account;
+      return this.accountPool.pickAccount({ model, requiresPremium, requiredAccessTier }).account;
     } catch (error) {
       if (error instanceof AccountPoolError) {
         return { __poolError: error };
       }
       throw error;
     }
+  }
+
+  async loadModelCatalog() {
+    if (this.modelCatalogCache) return this.modelCatalogCache;
+    const provider = this.modelCatalogProvider;
+    if (!provider) return [];
+    try {
+      const models = Array.isArray(provider)
+        ? provider
+        : (typeof provider === "function"
+          ? await provider({ force: false })
+          : await provider.listModels?.({ force: false }));
+      this.modelCatalogCache = Array.isArray(models) ? models : [];
+      return this.modelCatalogCache;
+    } catch {
+      return [];
+    }
+  }
+
+  async resolveAccessRequirement({ model, requiresPremium = false } = {}) {
+    if (requiresPremium) return { requiresPremium: true, requiredAccessTier: "pro" };
+    if (isDefaultRoutedModel(model)) return { requiresPremium: false, requiredAccessTier: null };
+    const catalog = await this.loadModelCatalog();
+    const metadata = findModelMetadata(catalog, model);
+    if (modelMetadataHasAccessSignal(metadata)) {
+      const metadataTier = modelMetadataRequiredTier(metadata);
+      return { requiresPremium: Boolean(metadataTier), requiredAccessTier: metadataTier };
+    }
+    const nameTier = modelNameRequiredTier(model);
+    return { requiresPremium: Boolean(nameTier), requiredAccessTier: nameTier };
   }
 
   async run({
@@ -69,7 +102,15 @@ export class PooledRequestRunner {
     requiresPremium = false,
     requestId = null,
   } = {}) {
-    const first = this.pickInitial({ model, requiresPremium });
+    if (isUnsupportedModel(model)) {
+      const displayModel = String(model || "").replace(/^tabbit\//i, "").trim() || "requested model";
+      return errorResult(new PooledRequestError(`Model ${displayModel} is not available.`, {
+        category: "invalid_request",
+        code: "UNSUPPORTED_MODEL",
+      }), []);
+    }
+    const accessRequirement = await this.resolveAccessRequirement({ model, requiresPremium });
+    const first = this.pickInitial({ model, ...accessRequirement });
     if (first?.__poolError) {
       return errorResult(new PooledRequestError(first.__poolError.message, { category: first.__poolError.category, code: first.__poolError.code, detail: first.__poolError.candidates }), []);
     }
@@ -125,7 +166,7 @@ export class PooledRequestRunner {
         model,
         retryCount,
         retryLimit: this.retryLimit,
-        requiresPremium,
+        ...accessRequirement,
       });
       if (!decision.fallback) {
         return errorResult(lastError, attemptedAccounts, fallbackHappened);

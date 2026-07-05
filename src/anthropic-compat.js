@@ -71,19 +71,90 @@ function isNoopToolChoice(value) {
   return isAutoToolChoice(value) || value === "none" || value?.type === "none";
 }
 
+const ANTHROPIC_CLIENT_TOOL_NAMES = new Set([
+  "applypatch",
+  "bash",
+  "bashoutput",
+  "edit",
+  "execcommand",
+  "exitplanmode",
+  "fetch",
+  "getgoal",
+  "glob",
+  "grep",
+  "killbash",
+  "listmcpresources",
+  "listmcpresourcestemplates",
+  "listmcpresourcetemplates",
+  "listmcpresourcetemplatestool",
+  "listmcpresourcestool",
+  "loadworkspacedependencies",
+  "ls",
+  "multiedit",
+  "navigatetocodexpage",
+  "notebookedit",
+  "notebookread",
+  "read",
+  "readfile",
+  "readmcpresource",
+  "readmcpresourcetool",
+  "readthreadterminal",
+  "requestuserinput",
+  "task",
+  "todoread",
+  "todowrite",
+  "toolsearchtool",
+  "updategoal",
+  "updateplan",
+  "viewimage",
+  "webfetch",
+  "websearch",
+  "write",
+  "writestdin",
+]);
+
+function normalizedToolNames(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) return [];
+  return [
+    text.replace(/[^a-z0-9_]+/g, ""),
+    text.replace(/[^a-z0-9]+/g, ""),
+  ].filter(Boolean);
+}
+
+function isAnthropicClientTool(tool = {}) {
+  const names = normalizedToolNames(tool?.name);
+  if (!names.length) return false;
+  return names.some((name) => name.startsWith("mcp__") || name.startsWith("mcp_") || ANTHROPIC_CLIENT_TOOL_NAMES.has(name));
+}
+
+function toolChoiceName(toolChoice) {
+  if (!toolChoice || typeof toolChoice !== "object") return "";
+  return toolChoice.name || toolChoice.tool_name || toolChoice.tool?.name || "";
+}
+
+function toolChoiceTargetsClientTool(toolChoice) {
+  const name = toolChoiceName(toolChoice);
+  return Boolean(name && isAnthropicClientTool({ name }));
+}
+
 function normalizeToolOptions(body = {}, { stripClientTools = false } = {}) {
   const options = {};
   if (Array.isArray(body.tools)) {
     const tools = stripClientTools
-      ? body.tools.filter((tool) => !["update_plan", "request_user_input", "view_image"].includes(tool?.name))
+      ? body.tools.filter((tool) => !isAnthropicClientTool(tool))
       : body.tools;
+    const allToolsStripped = stripClientTools && body.tools.length > 0 && tools.length === 0;
+    const strippedToolChoice = stripClientTools && toolChoiceTargetsClientTool(body.tool_choice);
     if (tools.length > 0) {
       options.tools = tools;
-      options.toolChoice = Object.hasOwn(body, "tool_choice") ? body.tool_choice : { type: "auto" };
-    } else if (Object.hasOwn(body, "tool_choice") && !isNoopToolChoice(body.tool_choice)) {
+      options.toolChoice = Object.hasOwn(body, "tool_choice") && !strippedToolChoice
+        ? body.tool_choice
+        : { type: "auto" };
+    } else if (Object.hasOwn(body, "tool_choice") && !isNoopToolChoice(body.tool_choice) && !allToolsStripped && !strippedToolChoice) {
       options.toolChoice = body.tool_choice;
     }
-  } else if (Object.hasOwn(body, "tool_choice") && !isNoopToolChoice(body.tool_choice)) {
+  } else if (Object.hasOwn(body, "tool_choice") && !isNoopToolChoice(body.tool_choice) && !(stripClientTools && toolChoiceTargetsClientTool(body.tool_choice))) {
     options.toolChoice = body.tool_choice;
   }
   return options;
@@ -152,7 +223,9 @@ export function anthropicErrorForCategory(error = {}) {
   if (category === "invalid_request") return { status: 400, body: anthropicError(message, "invalid_request_error", code) };
   if (category === "login_required") return { status: 401, body: anthropicError(message, "authentication_error", code) };
   if (category === "timeout") return { status: 504, body: anthropicError(message, "api_error", code) };
+  if (category === "upstream_error") return { status: 503, body: anthropicError(message, "api_error", code) };
   if (category === "no_available_account") return { status: 503, body: anthropicError(message, "api_error", code) };
+  if (category === "model_entitlement") return { status: 403, body: anthropicError(message, "invalid_request_error", code) };
   return { status: 502, body: anthropicError(message, "api_error", code) };
 }
 

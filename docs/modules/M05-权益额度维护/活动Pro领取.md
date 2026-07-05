@@ -38,14 +38,14 @@ POST /api/commerce/activity/v1/participate
 ## 流程
 
 1. 查询当前 accessTier。
-2. 若已是 pro/premium，跳过。
+2. 若已是 pro，跳过。
 3. 查询活动可领取状态。
 4. 调用领取接口。
 5. 刷新 accessTier 和模型目录。
 
 ## 测试
 
-- [x] 已是 pro/premium 或 `proClaimed:true` 时跳过。
+- [x] 已是 pro 或 `proClaimed:true` 时跳过。
 - [x] 领取成功后更新 `accessTier` 与 `proClaimed`。
 - [x] 真实活动/新人探索只读状态接口已校准为 probe operation。
 - [x] 通用 activity participate POST path/header 已校准为显式 probe。

@@ -220,8 +220,14 @@ export function openAiErrorForCategory(error = {}) {
   if (category === "timeout") {
     return { status: 504, body: openAiError(message, "api_error", code) };
   }
+  if (category === "upstream_error") {
+    return { status: 503, body: openAiError(message, "api_error", code) };
+  }
   if (category === "no_available_account") {
     return { status: 503, body: openAiError(message, "api_error", code) };
+  }
+  if (category === "model_entitlement") {
+    return { status: 403, body: openAiError(message, "invalid_request_error", code) };
   }
   return { status: 502, body: openAiError(message, "api_error", code) };
 }

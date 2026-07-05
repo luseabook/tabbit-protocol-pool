@@ -16,6 +16,10 @@ const DEFAULT_PROTOCOL_MODEL_CATALOG_PATH = "/proxy/v1/model_config/models";
 const DEFAULT_PROTOCOL_SEND_PATH = "/api/v1/chat/completion";
 const DEFAULT_PROTOCOL_SESSION_VERIFY_PATH = "/api/v0/user/base-info";
 const DEFAULT_PROTOCOL_REQ_CTX = "MS4zLjI2KDEwMTAzMDI2KQ==";
+const DEFAULT_PROTOCOL_CHAT_SESSION_CREATE_PATH = "/newtab";
+const DEFAULT_PROTOCOL_CHAT_SESSION_CREATE_ACTION_ID = "00b19386a3892f62370bef2ffacfbd5b58580fcb2a";
+const DEFAULT_PROTOCOL_FETCH_TRANSPORT = "node";
+const PROTOCOL_FETCH_TRANSPORTS = new Set(["node", "powershell"]);
 const TOOL_LOOP_MODES = new Set([
   DEFAULT_TOOL_LOOP_MODE,
   "disabled",
@@ -97,6 +101,15 @@ function normalizeToolLoopMode(value) {
   if (!raw) return DEFAULT_TOOL_LOOP_MODE;
   if (!TOOL_LOOP_MODES.has(raw)) {
     throw new Error(`Invalid tool loop mode: ${value}`);
+  }
+  return raw;
+}
+
+function normalizeProtocolFetchTransport(value) {
+  const raw = cleanString(value).toLowerCase();
+  if (!raw) return DEFAULT_PROTOCOL_FETCH_TRANSPORT;
+  if (!PROTOCOL_FETCH_TRANSPORTS.has(raw)) {
+    throw new Error(`Invalid protocol fetch transport: ${value}`);
   }
   return raw;
 }
@@ -261,6 +274,14 @@ function loadProtocolConfig(env, options = {}) {
   const sessionVerifyMethod = cleanString(env.TABBIT_POOL_PROTOCOL_SESSION_VERIFY_METHOD).toUpperCase() || "GET";
   const reqCtx = protocolDefault(optionalString(env.TABBIT_POOL_PROTOCOL_REQ_CTX), DEFAULT_PROTOCOL_REQ_CTX);
   const defaultChatSessionId = optionalString(env.TABBIT_POOL_PROTOCOL_CHAT_SESSION_ID);
+  const chatSessionCreatePath = protocolDefault(optionalString(env.TABBIT_POOL_PROTOCOL_CHAT_SESSION_CREATE_PATH), DEFAULT_PROTOCOL_CHAT_SESSION_CREATE_PATH);
+  const chatSessionCreateActionId = protocolDefault(optionalString(env.TABBIT_POOL_PROTOCOL_CHAT_SESSION_CREATE_ACTION_ID), DEFAULT_PROTOCOL_CHAT_SESSION_CREATE_ACTION_ID);
+  const chatSessionAutoCreate = normalizeBooleanFlag(
+    env.TABBIT_POOL_PROTOCOL_CHAT_SESSION_AUTO_CREATE,
+    Boolean(usePublicDefaults),
+    "chat session auto-create",
+  );
+  const fetchTransport = normalizeProtocolFetchTransport(env.TABBIT_POOL_PROTOCOL_FETCH_TRANSPORT);
   const enabledByEndpoint = Boolean(
     signKeyPath
     || modelCatalogPath
@@ -290,6 +311,7 @@ function loadProtocolConfig(env, options = {}) {
 
   return {
     enabled: enabledByFlag || enabledByEndpoint || Boolean(options.usePublicDefaults),
+    fetchTransport,
     baseUrl,
     signKeyPath,
     modelCatalogPath,
@@ -321,6 +343,9 @@ function loadProtocolConfig(env, options = {}) {
     sessionVerifyMethod,
     reqCtx,
     defaultChatSessionId,
+    chatSessionCreatePath,
+    chatSessionCreateActionId,
+    chatSessionAutoCreate,
   };
 }
 
@@ -349,6 +374,10 @@ export function loadConfig(env = globalThis.process?.env ?? {}, options = {}) {
     ),
     logLevel: cleanString(env.TABBIT_POOL_LOG_LEVEL) || "info",
     yydsMailApiKey,
+    admin: {
+      username: optionalString(env.TABBIT_POOL_ADMIN_USERNAME),
+      password: optionalString(env.TABBIT_POOL_ADMIN_PASSWORD),
+    },
     mail: {
       enabled: Boolean(yydsMailApiKey),
       baseUrl: cleanString(env.YYDS_MAIL_BASE_URL) || "https://maliapi.215.im/v1",

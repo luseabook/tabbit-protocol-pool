@@ -1,5 +1,10 @@
 const BLOCKED_STATUSES = new Set(["disabled", "provisioning", "login_expired", "quota_exhausted", "suspect"]);
-const PREMIUM_TIERS = new Set(["pro", "premium"]);
+const ACCESS_TIER_RANK = new Map([
+  ["free", 0],
+  ["unknown", 0],
+  ["pro", 1],
+  ["premium", 1],
+]);
 
 export class AccountPoolError extends Error {
   constructor(message, { code = "ACCOUNT_POOL_ERROR", category = "account_pool_error", candidates = [] } = {}) {
@@ -33,8 +38,23 @@ export function normalizeAccount(account = {}) {
   };
 }
 
-export function isAccountSelectable(account, { now = Date.now(), requiresPremium = false, excludeAccountIds = [] } = {}) {
+function normalizeRequiredAccessTier({ requiresPremium = false, requiredAccessTier = null } = {}) {
+  const required = String(requiredAccessTier || "").trim().toLowerCase();
+  if (required === "premium") return "pro";
+  if (required === "pro") return "pro";
+  return requiresPremium ? "pro" : null;
+}
+
+function hasRequiredAccessTier(accessTier, requiredAccessTier) {
+  if (!requiredAccessTier) return true;
+  const currentRank = ACCESS_TIER_RANK.get(String(accessTier || "unknown").toLowerCase()) ?? 0;
+  const requiredRank = ACCESS_TIER_RANK.get(requiredAccessTier) ?? 0;
+  return currentRank >= requiredRank;
+}
+
+export function isAccountSelectable(account, { now = Date.now(), requiresPremium = false, requiredAccessTier = null, excludeAccountIds = [] } = {}) {
   const normalized = normalizeAccount(account);
+  const requiredTier = normalizeRequiredAccessTier({ requiresPremium, requiredAccessTier });
   if (excludeAccountIds.includes(normalized.id)) return { selectable: false, reason: "excluded_by_request" };
   if (normalized.status === "cooldown") {
     const until = timestampMs(normalized.cooldownUntil);
@@ -42,7 +62,9 @@ export function isAccountSelectable(account, { now = Date.now(), requiresPremium
   } else if (BLOCKED_STATUSES.has(normalized.status)) {
     return { selectable: false, reason: normalized.status === "quota_exhausted" ? "quota_exhausted" : `status_${normalized.status}` };
   }
-  if (requiresPremium && !PREMIUM_TIERS.has(normalized.accessTier)) return { selectable: false, reason: "requires_premium" };
+  if (requiredTier && !hasRequiredAccessTier(normalized.accessTier, requiredTier)) {
+    return { selectable: false, reason: "requires_premium" };
+  }
   return { selectable: true, reason: "selectable" };
 }
 
@@ -68,6 +90,7 @@ function defaultCooldownMs(category, failureStreak = 0) {
 }
 
 function stateForFailure(category) {
+  if (category === "model_entitlement") return "active";
   if (category === "login_required") return "login_expired";
   if (category === "quota_exhausted") return "quota_exhausted";
   if (category === "protocol_changed" || category === "forbidden") return "suspect";
@@ -109,10 +132,10 @@ export class AccountPool {
     return this.getAccount(this.accounts[index].id);
   }
 
-  pickAccount({ model, requiresPremium = false, excludeAccountIds = [] } = {}) {
+  pickAccount({ model, requiresPremium = false, requiredAccessTier = null, excludeAccountIds = [] } = {}) {
     const now = this.now();
     const candidates = this.accounts.map((account, index) => {
-      const selectable = isAccountSelectable(account, { now, requiresPremium, excludeAccountIds });
+      const selectable = isAccountSelectable(account, { now, requiresPremium, requiredAccessTier, excludeAccountIds });
       if (!selectable.selectable) return { accountId: account.id, score: null, excludedReason: selectable.reason, index };
       return { accountId: account.id, score: scoreAccount(account, { now }), index };
     });
@@ -168,7 +191,7 @@ export class AccountPool {
     return this.replaceAccount(index, updated);
   }
 
-  shouldFallback({ error = {}, attemptedAccountIds = [], model = "tabbit/priority", retryCount = 0, retryLimit = 1, requiresPremium = false } = {}) {
+  shouldFallback({ error = {}, attemptedAccountIds = [], model = "tabbit/priority", retryCount = 0, retryLimit = 1, requiresPremium = false, requiredAccessTier = null } = {}) {
     const category = error.category || "unknown";
     if (!error.retryable || ["protocol_changed", "login_required", "forbidden"].includes(category)) {
       return { fallback: false, reason: `global_or_non_retryable_${category}` };
@@ -178,7 +201,7 @@ export class AccountPool {
     }
     const savedCursor = this.cursor;
     try {
-      const picked = this.pickAccount({ model, requiresPremium, excludeAccountIds: attemptedAccountIds });
+      const picked = this.pickAccount({ model, requiresPremium, requiredAccessTier, excludeAccountIds: attemptedAccountIds });
       return { fallback: true, reason: `retryable_${category}`, nextAccount: picked.account, candidates: picked.candidates };
     } catch (candidateError) {
       if (candidateError instanceof AccountPoolError && candidateError.code === "NO_AVAILABLE_ACCOUNT") {

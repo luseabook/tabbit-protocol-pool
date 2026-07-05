@@ -317,7 +317,7 @@ test("importSession writes session secrets before saving active metadata", async
     email: "imported@example.test",
     cookieHeader: "tabbit_session=imported-secret",
     userId: "user_imported",
-    accessTier: "premium",
+    accessTier: "pro",
   });
 
   assert.equal(result.changed, true);
@@ -327,6 +327,24 @@ test("importSession writes session secrets before saving active metadata", async
   assert.deepEqual(events.map((event) => event[0]), ["writeSecret", "saveAccounts"]);
   assert.deepEqual(secretStore.writes, [{ ref: "secrets/acct_imported.cookie", value: "tabbit_session=imported-secret" }]);
   assert.equal(accountStore.accounts[0].cookieHeader, undefined);
+});
+
+test("importSession can persist browser chat session id without treating it as secret material", async () => {
+  const accountStore = memoryAccountStore();
+  const secretStore = memorySecretStore();
+  const provisioner = new AccountProvisioner(provisionerOptions({ accountStore, secretStore }));
+
+  const result = await provisioner.importSession({
+    accountId: "acct_browser_session",
+    cookieHeader: "tabbit_session=imported-secret",
+    chatSessionId: "browser-chat-session-uuid",
+  });
+
+  assert.equal(result.changed, true);
+  assert.equal(result.account.chatSessionId, "browser-chat-session-uuid");
+  assert.equal(accountStore.accounts[0].chatSessionId, "browser-chat-session-uuid");
+  assert.equal(accountStore.accounts[0].cookieHeader, undefined);
+  assert.deepEqual(secretStore.writes, [{ ref: "secrets/acct_browser_session.cookie", value: "tabbit_session=imported-secret" }]);
 });
 
 test("importSession fails without session material and does not persist active account when secret write fails", async () => {

@@ -11,7 +11,7 @@
 | 方法 | 路径 | 认证 | 状态 |
 |---|---|---:|---|
 | GET | /health | 否 | 已实现 |
-| GET | /v1/models | 是 | 已实现，调用 modelsProvider 或返回默认 priority 模型 |
+| GET | /v1/models | 是 | 已实现，调用 modelsProvider；无 provider 时返回空列表 |
 | POST | /v1/chat/completions | 是 | 已实现，调用 OpenAICompat.handleChatCompletions；支持 SSE adapter |
 | POST | /v1/responses | 是 | 已实现，调用 OpenAICompat.handleResponses；支持 SSE adapter |
 | POST | /v1/messages | 是 | 已实现，调用 AnthropicCompat.handleMessages；支持 SSE adapter |
@@ -93,23 +93,13 @@ function createProtocolPoolServer(input): http.Server;
 ~~~json
 {
   "object": "list",
-  "data": [
-    {
-      "id": "tabbit/priority",
-      "object": "model",
-      "owned_by": "tabbit",
-      "tabbit_selected_model": null,
-      "supports_tools": true,
-      "supports_images": true,
-      "model_access_type": "priority"
-    }
-  ]
+  "data": []
 }
 ~~~
 
-内部模型对象来自 ProtocolTabbitClient.normalizeModelCatalog 时，应映射 selectedModel 到 tabbit_selected_model。
+内部模型对象来自 ProtocolTabbitClient.normalizeModelCatalog 时，应映射 selectedModel 到 tabbit_selected_model，并保留 `requires_premium` 给客户端做付费模型提示或过滤。公开 `id` 去掉内部 `tabbit/` 前缀，只显示模型 ID；`priority` 和 `Default` 作为内部默认路由别名不输出。启动工厂传入的公开 provider 会按账号池可选 tier 过滤；账号池没有 active Pro 账号时，`premium_only` / `Claude-Opus-*` 不应出现在 `/v1/models`。
 
-路由层本身不读取 `TABBIT_POOL_PROTOCOL_*`，也不猜测 Tabbit endpoint。没有 `modelsProvider` 时只返回安全的 `tabbit/priority`；传入 provider 时只负责调用 provider 并做 OpenAI model shape 映射。`createProtocolPoolGateway()` 在显式协议 env opt-in 后会注入默认 provider，让该路由复用 `ProtocolTabbitClient.listModels()`；显式 `options.modelsProvider` 仍覆盖该默认 provider。
+路由层本身不读取 `TABBIT_POOL_PROTOCOL_*`，也不猜测 Tabbit endpoint。没有 `modelsProvider` 时返回空列表；传入 provider 时只负责调用 provider 并做 OpenAI model shape 映射。`createProtocolPoolGateway()` 在显式协议 env opt-in 后会注入默认 provider，让该路由复用 `ProtocolTabbitClient.listModels()`；显式 `options.modelsProvider` 仍覆盖该默认 provider。
 
 ### POST /v1/chat/completions
 

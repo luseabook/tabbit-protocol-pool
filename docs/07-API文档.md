@@ -11,7 +11,7 @@
 - 已实现 Observability foundation，并默认接入 protocol-pool gateway `/health` 账号池摘要。
 - 已实现 M08 本地运维 CLI foundation：`tabbit-pool accounts list`、`tabbit-pool accounts import-session`、`tabbit-pool accounts probe`、`tabbit-pool health`、`tabbit-pool readiness`、`tabbit-pool readiness doctor`、`tabbit-pool readiness mark`、`tabbit-pool production preflight`、`tabbit-pool production init-key`、`tabbit-pool serve/start`、`tabbit-pool smoke gateway`、`tabbit-pool maintain`、`tabbit-pool fixtures list`、`tabbit-pool fixtures audit`、`tabbit-pool fixtures show`、`tabbit-pool probe advice`、`tabbit-pool probe template`、`tabbit-pool probe validate`、`tabbit-pool probe protocol`（含 `--input-json/--input-file`、refreshQuota/uploadAttachment/只读 commerce 查询/M05 side-effect probe 模板、离线 recoverSession evidence 模板/校验/fixture 写入、离线 consumeResetCoupon evidence 模板/校验/fixture 写入、operation-aware schema validation 和 `--require-confirmed-side-effect` 离线副作用确认门禁）。
 - 已实现原生 HTTP server JSON 骨架与 OpenAI/Anthropic SSE adapter：`/health`、`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`。详见 [HTTP 路由层](modules/M06-兼容网关/HTTP路由层.md) 与 [流式 SSE 链路](10-流式SSE链路.md)。
-- 已实现内置 Web 运维后台：`GET /admin` 返回静态管理页面，`GET /admin/api/status` 使用 gateway API key 认证后返回脱敏聚合状态，不输出 API key、cookie、session、token、`cookieJarRef`、prompt 或 raw fixture payload。
+- 已实现内置管理后台：`GET /admin` 返回中文用户名/密码登录页，未登录时隐藏全部运行状态面板，登录成功后隐藏登录表单并以左侧菜单切换 `总览`、`账号池`、`请求 Key`、`运行摘要` 四个真实界面；状态和账号接口不输出 API key、cookie、session、token、`cookieJarRef`、prompt 或 raw fixture payload。请求 Key 明文只允许在专用 Key 管理接口和视图中按需显示。
 - 已实现 protocol-pool gateway 启动工厂和 `tabbit-pool serve/start` CLI，可从 config/stateDir 组合 JSON account store、FileSecretStore、StoredAccountPool、runner、OpenAICompat 与 HTTP server，并输出 OpenAI/Anthropic base URL。详见 [启动工厂](modules/M06-兼容网关/启动工厂.md)。
 - 真实 Tabbit 文本发送 endpoint `/api/v1/chat/completion`、session verify endpoint `/api/v0/user/base-info`、quota usage endpoint `/api/commerce/quota/v1/usage`、已验证只读 commerce 状态/资源 endpoint、M05 显式 side-effect probe endpoint、真实重置券消耗 endpoint/body/result 语义、浏览器校准签名头、真实 `display_name` 模型目录、`Default` 可用模型映射、已上传附件引用结构和完整配置上传链时的 raw/base64 附件自动上传已接入；注册/登录 auth 入口已有显式配置和响应归一化，但真实 send-code delivery/session-material success evidence、活动 Pro 成功领取 body 和抽奖成功响应仍待安全 evidence 后接入。`ProtocolTabbitClient.sendMessage()` 已具备真实 SSE/旧显式 sendPath SSE/NDJSON buffered 响应聚合解析、buffered OpenAI stream `tool_calls` 聚合、buffered Anthropic stream `tool_use` / `input_json_delta` 聚合、数组 `streamDeltas` 保留、可读 response.body 的 async `streamDeltas` producer、async OpenAI/Anthropic 工具 delta producer，以及 stream error frame 基础分类传播。`ProtocolTabbitClient.uploadAttachment()` 已具备显式 `attachmentUploadPath` 的签名上传骨架和真实 COS 三步上传；`sendMessage({ attachments })` 在真实分支支持已上传文件引用并映射为 `references[].metadata.file_id`，完整配置上传链时会自动上传 raw/base64 附件后发送。`ProtocolTabbitClient.refreshQuota()` 只有显式 `quotaUsagePath` 时才会用已登录 Cookie + `user_id` 查询 usage 百分比；只读 activity/newbie/placement/reward/lottery 方法只做 GET 查询。默认 `maintain` 不触网；显式配置 quota usage path 后可自动刷新额度，显式配置 sign-in path 后可自动执行已验证每日签到；活动 Pro、抽奖和真实重置券消耗仍不会自动执行，真实用券当前只通过显式 `useResetCoupon` probe/gateway 方法触发。OpenAI Chat/Responses 与 Anthropic Messages handler 会把这些 deltas 作为非公开 `stream.deltas` 元数据交给 HTTP SSE adapter；没有上游 delta 时仍支持基于完整 JSON 结果的 fallback SSE。
 
@@ -55,11 +55,61 @@
 
 ### GET /admin
 
-返回内置 Web 运维后台 HTML。页面本身不包含密钥或账号明细；浏览器会让操作者输入 gateway API key，并用 `x-api-key` 请求 `/admin/api/status`。生产环境应通过内网、VPN 或 HTTPS 反向代理限制访问。
+返回内置管理后台 HTML。页面本身不包含密钥或账号明细；未登录时只显示登录区，不展示运行状态、账号池、协议、安全态势、Key 或原始摘要。操作者输入后台用户名和密码后，浏览器以 `Authorization: Basic <base64(username:password)>` 请求 `/admin/api/status`，凭据仅保存在当前页面内存中，刷新或退出后需要重新登录。登录后左侧菜单会在 `总览`、`账号池`、`请求 Key`、`运行摘要` 四个界面间切换，一次只显示一个主界面。后台用户名和密码由 `TABBIT_POOL_ADMIN_USERNAME`、`TABBIT_POOL_ADMIN_PASSWORD` 配置；生产环境应通过 HTTPS 反向代理限制访问，避免明文传输凭据。
 
 ### GET /admin/api/status
 
-返回后台状态摘要，需要 gateway API key。输出包含 `status`、`stateDir`、`productionState.source`、`gatewayApiKey.status/source`、协议配置布尔值和 `/health` 同源账号池摘要。该接口不返回真实 API key、cookie、session、token、`cookieJarRef`、账号邮箱、prompt 或 raw fixture payload。
+返回后台状态摘要，需要后台 Basic 凭据或 gateway API key。为兼容脚本和旧运维流程，`Authorization: Bearer <gateway-api-key>` 与 `x-api-key: <gateway-api-key>` 仍可访问该接口，但 `/v1/*` 兼容路由不接受后台用户名密码。输出包含 `status`、`stateDir`、`productionState.source`、`gatewayApiKey.status/source`、协议配置布尔值和 `/health` 同源账号池摘要。该接口不返回真实 API key、cookie、session、token、`cookieJarRef`、账号邮箱、prompt 或 raw fixture payload。
+
+### GET /admin/api/accounts
+
+返回后台账号池列表，需要后台 Basic 凭据或 gateway API key。输出只包含脱敏展示字段，例如 `id`、脱敏邮箱、`status`、`accessTier`、失败计数和聚合配额状态；不会返回 `cookieJarRef`、cookie、session、token 或完整账号邮箱。后台导入会话时可显式提交 `accessTier`（`unknown` / `free` / `pro`），用于让公开模型列表和 paid 模型路由识别当前账号池能力。
+
+### POST /admin/api/accounts/import-session
+
+导入或更新账号会话，需要后台 Basic 凭据或 gateway API key。请求体：
+
+~~~json
+{
+  "accountId": "acct_main",
+  "email": "operator@example.test",
+  "accessTier": "pro",
+  "session": "<tabbit-session-cookie>"
+}
+~~~
+
+`accountId` 可选；填写时只能包含字母、数字、点、下划线和短横线，留空时服务端会生成 `acct_<random>`。`accessTier` 可选值为 `unknown`、`free`、`pro`，用于公开模型列表和 paid 模型路由；省略时保留原账号层级或记为 `unknown`。服务端把 `session` 写入 `stateDir/secrets/<accountId>.cookie`，`accounts.json` 只保存 `cookieJarRef`、脱敏可展示元数据和状态。响应只返回脱敏账号与 `changed:true`，不会回显 session。
+
+### POST /admin/api/accounts/status
+
+更新账号状态，需要后台 Basic 凭据或 gateway API key。请求体：
+
+~~~json
+{
+  "accountId": "acct_main",
+  "status": "disabled"
+}
+~~~
+
+允许状态为 `active`、`disabled`、`cooldown`、`quota_exhausted`、`login_expired`、`suspect`。状态更新会同步 `accounts.json` 与运行中的账号池；切回 `active` 时会清理 cooldown/lastError/failureStreak。响应只返回脱敏账号与 `changed:true`。
+
+### POST /admin/api/key/rotate
+
+生成新的 gateway 请求 Key，需要后台 Basic 凭据。服务端把新 Key 写入 `stateDir/secrets/gateway-api-key.txt`，并立即更新运行中 `/v1/*` 鉴权使用的 key。响应返回新 Key 给当前后台页面用于默认隐藏展示和复制：
+
+~~~json
+{
+  "changed": true,
+  "secretRef": "secrets/gateway-api-key.txt",
+  "apiKeySource": "state_secret",
+  "restartRequired": false,
+  "apiKey": "<new-gateway-api-key>"
+}
+~~~
+
+### GET /admin/api/key
+
+返回当前 gateway 请求 Key，需要后台 Basic 凭据。该接口用于后台 Key 管理界面，响应包含 `apiKey` 明文、`secretRef`、`apiKeySource` 和 `restartRequired:false`。页面必须默认使用 password/masked 控件隐藏明文，只在操作者点击小眼睛后显示，并提供复制按钮。状态接口、账号接口、日志和 smoke 检查不得输出该明文。线上验证时不要随意调用 `POST /admin/api/key/rotate`，除非确认要轮换生产请求 Key。
 
 ### GET /v1/models
 
@@ -68,17 +118,7 @@
 ~~~json
 {
   "object": "list",
-  "data": [
-    {
-      "id": "tabbit/priority",
-      "object": "model",
-      "owned_by": "tabbit",
-      "tabbit_selected_model": null,
-      "supports_tools": true,
-      "supports_images": true,
-      "model_access_type": "priority"
-    }
-  ]
+  "data": []
 }
 ~~~
 
@@ -86,14 +126,15 @@
 
 | 内部字段 | 外部字段 |
 |---|---|
-| id | id |
+| id | id（去掉内部 `tabbit/` 前缀） |
 | selectedModel | tabbit_selected_model |
 | supports_tools | supports_tools |
 | supports_images | supports_images |
 | model_access_type | model_access_type |
+| requires_premium | requires_premium |
 | displayName | 可选 metadata 或保持内部使用 |
 
-默认未启用协议 env 且未注入 `modelsProvider` 时，HTTP server 返回安全的 `tabbit/priority` fallback。通过 `TABBIT_POOL_PROTOCOL_ENABLED=true` 或 `TABBIT_POOL_PROTOCOL_MODEL_CATALOG_PATH` 显式启用协议配置后，`createProtocolPoolGateway()` 会默认用 `ProtocolTabbitClient.listModels()` 支撑 `/v1/models`；`TABBIT_POOL_PROTOCOL_ENABLED=true` 会填充已校准的公共 Tabbit Web 默认 `baseUrl`、sign-key、模型目录、send、session verify 与 `REQ_CTX`。显式传入 `options.modelsProvider` 时仍以注入 provider 为准。
+默认未启用协议 env 且未注入 `modelsProvider` 时，HTTP server 返回空模型列表。通过 `TABBIT_POOL_PROTOCOL_ENABLED=true` 或 `TABBIT_POOL_PROTOCOL_MODEL_CATALOG_PATH` 显式启用协议配置后，`createProtocolPoolGateway()` 会默认用 `ProtocolTabbitClient.listModels()` 支撑 `/v1/models`；`TABBIT_POOL_PROTOCOL_ENABLED=true` 会填充已校准的公共 Tabbit Web 默认 `baseUrl`、sign-key、模型目录、send、session verify 与 `REQ_CTX`。显式传入 `options.modelsProvider` 时仍以注入 provider 为准。内部 catalog 仍可使用 `tabbit/<model>`，但 `/v1/models` 的公开 `id` 会去掉 `tabbit/` 前缀，只显示模型 ID。`priority` 和 `Default` 是内部默认路由别名，不在公开模型列表中显示。公开 `/v1/models` 会按当前账号池可选账号过滤：`model_access_type:"pro"`、`paid_*`、`model_access_type:"premium_only"` 与 `Claude-Opus-*` 都需要 Pro 账号；账号池没有满足层级的 active 账号时，这类模型不会展示给 Cherry Studio。`Claude-Opus-4.7` 会从 `/v1/models` 输出中过滤。
 
 ### POST /v1/chat/completions
 
@@ -105,8 +146,9 @@ OpenAI Chat Completions 兼容入口。
 2. 解析 JSON body。
 3. 调用 OpenAICompat.handleChatCompletions(body)。
 4. OpenAICompat 归一化 model、messages、stream、attachments、requiresPremium，以及 OpenAI 官方工具字段 `tools`、`tool_choice`、`parallel_tool_calls`。
-5. PooledRequestRunner 从账号池选择账号并调用协议客户端。
-6. `stream:true` 且 handler 返回 2xx 时，HTTP 层把成功 JSON 转换为 SSE；如果 handler 提供数组 `stream.deltas`，生成有限 SSE；如果 handler 提供 async iterable `stream.deltas`，不设置 `Content-Length` 并逐 delta flush；否则输出完整文本 fallback；其他情况返回 OpenAI 兼容 JSON。
+5. PooledRequestRunner 根据显式 `requiresPremium`、模型目录 `requires_premium/model_access_type` 和保守模型名规则识别 paid tier；`tabbit/priority`/`Default` 不额外查询模型目录，`model_access_type:"pro"`、`paid_*`、`model_access_type:"premium_only"` 与可用的 `Claude-Opus-*` 都选择 Pro 账号。直接请求 `Claude-Opus-4.7` 时返回本地 `invalid_request/UNSUPPORTED_MODEL`，不会选择账号或把请求打到上游。没有满足 tier 的账号时在本地返回 `NO_AVAILABLE_ACCOUNT`。
+6. PooledRequestRunner 从账号池选择账号并调用协议客户端。
+7. `stream:true` 且 handler 返回 2xx 时，HTTP 层把成功 JSON 转换为 SSE；如果 handler 提供数组 `stream.deltas`，生成有限 SSE；如果 handler 提供 async iterable `stream.deltas`，不设置 `Content-Length` 并逐 delta flush；否则输出完整文本 fallback；其他情况返回 OpenAI 兼容 JSON。
 
 最小请求：
 
@@ -292,7 +334,7 @@ GET  https://web.tabbit.ai/chat/sign-key
 POST https://web.tabbit.ai/api/v1/chat/completion
 ~~~
 
-当前 `sendPath` 必须显式配置。`sendPath === "/api/v1/chat/completion"` 时，协议客户端构造真实 Tabbit body：`chat_session_id`、`message_id:null`、`content`、`selected_model`、`parallel_group_id:null`、`task_name:"chat"`、`agent_mode:false`、`metadatas.html_content`、`references` 和空 tab `entity`。`chat_session_id` 来自 input、账号元数据或 `TABBIT_POOL_PROTOCOL_CHAT_SESSION_ID`；`tabbit/priority` 会映射为 `selected_model:"Default"`。真实分支使用浏览器签名头：`x-signature` 为 UUID/randomUUID 风格字符串，`x-nonce` 为 `HMAC-SHA256(signKey, timestamp.signature.sha256(bodyText))`。
+当前 `sendPath` 必须显式配置。`sendPath === "/api/v1/chat/completion"` 时，协议客户端构造真实 Tabbit body：`chat_session_id`、`message_id:null`、`content`、`selected_model`、`parallel_group_id:null`、`task_name:"chat"`、`agent_mode:false`、`metadatas.html_content`、`references` 和空 tab `entity`。`chat_session_id` 优先来自 input、账号元数据或 `TABBIT_POOL_PROTOCOL_CHAT_SESSION_ID`；缺失且 `chatSessionAutoCreate` 已配置时，客户端会先调用 `/newtab` Next Server Action 创建会话，再发送 completion。`tabbit/priority` 会映射为 `selected_model:"Default"`。真实分支使用浏览器签名头：`x-signature` 为 UUID/randomUUID 风格字符串，`x-nonce` 为 `HMAC-SHA256(signKey, timestamp.signature.sha256(bodyText))`。
 
 真实 `/api/v1/chat/completion` 分支中，`sendMessage({ attachments })` 支持已上传附件引用：`path/file_id/fileId/id/metadata.file_id` 会被归一化为 Tabbit `references[].metadata.file_id`，document 使用 `{ type:"document", title, content:"", metadata:{ file_id } }`，image 使用 `{ type:"image", title, content, metadata:{ file_id, source_url? } }`。如果附件缺少 file id/path 但包含 `data`、`base64`、`raw` 或 `body`，并且已配置 `attachmentUploadPath=/proxy/v0/cos/presigned-upload-url` 与 `attachmentCompleteUploadPath=/api/v0/cos/complete-upload`，客户端会先走 presign -> COS PUT -> complete-upload，再把 file id 放入 `references`；未完整配置上传链时仍返回 `unsupported_feature/ATTACHMENT_REFERENCE_REQUIRED`。旧显式 sendPath 骨架收到附件引用仍返回 `unsupported_feature/ATTACHMENTS_UNSUPPORTED`。旧显式 sendPath 骨架仍会把 `tools`、`toolChoice`、`parallelToolCalls` 分别写入签名 body 的 `tools`、`tool_choice`、`parallel_tool_calls` 字段；真实 `/api/v1/chat/completion` 在官方工具字段协议完成 fixture 校准前返回 `unsupported_feature/TOOL_FIELDS_UNSUPPORTED`，不触发上游发送。响应侧已能把上游 OpenAI `tool_calls` 与 Anthropic `tool_use` JSON 归一化为内部 `tool_use` block。
 
@@ -451,7 +493,7 @@ type VerifySessionInput = {
 GET https://web.tabbit.ai/proxy/v1/model_config/models?a=0&scene=chat
 ~~~
 
-返回 normalizeModelCatalog() 的结果，第一项始终是 tabbit/priority。真实目录使用 `models/status` 包装和 `display_name`、`supports_images`、`supports_tools`、`model_access_type` 字段；`Default` 当前是 `free_unlimited`，`GPT-5.5` 当前是 `premium_only`。
+返回 normalizeModelCatalog() 的结果，第一项始终是 tabbit/priority。真实目录使用 `models/status` 包装和 `display_name`、`supports_images`、`supports_tools`、`model_access_type` 字段；`Default` 当前是 `free_unlimited`，`GPT-5.5` 当前是 `premium_only`。`model_access_type` 为 `pro`、`premium_only`、`paid_*` 等 paid 类型时，归一化结果会包含 `requires_premium:true`；路由层会把 `premium_only` 作为本地最高可见 `pro` tier；`Claude-Opus-4.7` 会被过滤。
 
 ### AccountPool.pickAccount(input)
 
@@ -673,7 +715,7 @@ type BenefitsMaintainerOptions = {
 
 ### BenefitsMaintainer.claimProIfAvailable(account)
 
-账号 `accessTier` 已是 `pro` 或 `premium` 时返回 `skipped`；`proClaimed === true` 时也返回 `skipped`。否则调用 `protocolClient.claimProIfAvailable(account)`；成功后写入返回的 `accessTier`，并把 `proClaimed` 设为返回值或默认 `true`。
+账号 `accessTier` 已是 `pro` 时返回 `skipped`；`proClaimed === true` 时也返回 `skipped`。否则调用 `protocolClient.claimProIfAvailable(account)`；成功后写入返回的 `accessTier`，并把 `proClaimed` 设为返回值或默认 `true`。
 
 ### BenefitsMaintainer.useResetCoupon(account)
 
@@ -723,7 +765,7 @@ type MaintainAccountResult = {
 
 M08 当前实现的是离线可测的 observability helper，并通过 `createProtocolPoolGateway()` 默认接入 `/health`。直接使用 `createProtocolPoolServer()` 时，`/health` 仍只返回调用者传入的 `health`。
 
-### summarizeAccounts(accounts)
+### summarizeAccounts(accounts, options?)
 
 输入账号数组，输出：
 
@@ -737,6 +779,8 @@ type AccountSummary = {
   alerts: Array<{ code: string; severity: string; message: string }>;
 };
 ~~~
+
+`byStatus` 保留账号持久化状态计数。传入 `options.now` 时，`active` / `unavailable` / `health` 会按当前可服务性计算：`status:"cooldown"` 且 `cooldownUntil` 缺失或已过期的账号视为可服务，避免 `/health` 在短冷却结束后仍误报 `no_active_accounts`。
 
 告警规则：
 
@@ -777,7 +821,7 @@ type HealthSnapshot = {
 
 ### buildCalibrationReadinessSnapshot(input)
 
-组合账号、协议配置和本地 protocol probe fixture，输出真实协议校准 readiness。它不触发网络，只判断四类验收：`protocolCalibration`、`codexClaudeE2E`、`toolLoopDecision`、`forbidden403`；其中 `protocolCalibration` 要求 protocol enabled、sendPath、sessionVerifyPath、active account、successful verifySession fixture 和 successful sendMessage fixture。`toolLoopDecision.decision` 来自 `config.compat.toolLoopMode`，默认 `client_executes_tools_first`，也可显式为 `disabled` 或 `local_executes_tools`。返回 `status` 为 `ready`、`partial` 或 `blocked`，并给出 `nextActions`。`tabbit-pool readiness --json` 使用该 helper。
+组合账号、协议配置和本地 protocol probe fixture，输出真实协议校准 readiness。它不触发网络，只判断四类验收：`protocolCalibration`、`codexClaudeE2E`、`toolLoopDecision`、`forbidden403`；其中 `protocolCalibration` 要求 protocol enabled、sendPath、sessionVerifyPath、active account、successful verifySession fixture 和 successful sendMessage fixture。若 `sendPath` 是真实 `/api/v1/chat/completion`，还要求 chat session context 已配置：账号元数据存在 `chatSessionId`、配置了 `TABBIT_POOL_PROTOCOL_CHAT_SESSION_ID`，或 `chatSessionAutoCreate` 同时具备 action path/id。缺口名为 `chat_session_context`，只输出布尔 evidence，不输出真实 ID。`toolLoopDecision.decision` 来自 `config.compat.toolLoopMode`，默认 `client_executes_tools_first`，也可显式为 `disabled` 或 `local_executes_tools`。返回 `status` 为 `ready`、`partial` 或 `blocked`，并给出 `nextActions`。`tabbit-pool readiness --json` 使用该 helper。
 
 ### buildProtocolFixtureAudit(input)
 
@@ -805,7 +849,7 @@ type HealthSnapshot = {
 
 ### createProtocolPoolGateway(options)
 
-已实现。该异步工厂返回 `{ config, store, secretStore, accountPool, runner, compat, server, start, close }`，默认从 `TABBIT_POOL_STATE_DIR` 加载 `<stateDir>/accounts.json`，创建 `FileSecretStore` 读取 `cookieJarRef`，通过 `StoredAccountPool` 持久化请求成功/失败状态，并在未传入 `options.health` 时使用 `createGatewayHealthProvider()` 为 `/health` 提供脱敏账号池摘要。显式协议 env opt-in 后，默认 `modelsProvider` 会调用 `ProtocolTabbitClient.listModels()`；未 opt-in 时 `/v1/models` 仍使用本地 fallback。详见 [启动工厂](modules/M06-兼容网关/启动工厂.md)。
+已实现。该异步工厂返回 `{ config, store, secretStore, accountPool, runner, compat, server, start, close }`，默认从 `TABBIT_POOL_STATE_DIR` 加载 `<stateDir>/accounts.json`，创建 `FileSecretStore` 读取 `cookieJarRef`，通过 `StoredAccountPool` 持久化请求成功/失败状态，并在未传入 `options.health` 时使用 `createGatewayHealthProvider()` 为 `/health` 提供脱敏账号池摘要。显式协议 env opt-in 后，默认原始 `modelsProvider` 会调用 `ProtocolTabbitClient.listModels()` 并传给 `PooledRequestRunner` 用于 paid 模型路由；公开 `/v1/models` 使用账号池过滤后的 provider，只展示当前可选账号能够承接的模型。未 opt-in 时 `/v1/models` 返回空列表。详见 [启动工厂](modules/M06-兼容网关/启动工厂.md)。
 
 ## 运维 CLI（当前实现）
 
@@ -815,15 +859,17 @@ CLI 入口是 package bin `tabbit-pool`，本地开发也可直接运行 `node b
 
 读取账号 store 并输出脱敏账号列表。`--json` 输出 `{ accounts }`；非 JSON 输出 tab 分隔表格。输出不包含 raw cookie/session/token/cookieJarRef。
 
-### tabbit-pool accounts import-session [--id <id>] [--email <email>] [--cookie-header <text> | --session <text> | --cookie-file <path> | --session-file <path>] [--json]
+### tabbit-pool accounts import-session [--id <id>] [--email <email>] [--access-tier <unknown|free|pro>] [--chat-session-id <id>] [--cookie-header <text> | --session <text> | --cookie-file <path> | --session-file <path>] [--json]
 
-导入本机已登录 Tabbit 的 cookie/session。命令只写本地 stateDir：原始 session 写入 secret store，账号元数据保存 active 状态和 `cookieJarRef`，输出会移除 `cookieJarRef` 并脱敏 email/error。四种 session 来源必须且只能选一个；文件不存在、来源为空或来源冲突返回 exitCode 2。
+导入本机已登录 Tabbit 的 cookie/session。`--id` 可选，省略时自动生成 `acct_<random>`；命令只写本地 stateDir：原始 session 写入 secret store，账号元数据保存 active 状态、`cookieJarRef` 和可选 `chatSessionId`，输出会移除 `cookieJarRef`、`chatSessionId` 并脱敏 email/error。四种 session 来源必须且只能选一个；文件不存在、来源为空或来源冲突返回 exitCode 2。
 
 建议优先使用文件输入，避免 shell history 保存 cookie：
 
 ~~~powershell
-node bin/tabbit-pool.js accounts import-session --id acct_default --email user@example.test --access-tier pro --cookie-file .\tabbit-cookie.txt --json
+node bin/tabbit-pool.js accounts import-session --id acct_default --email user@example.test --access-tier pro --chat-session-id <browser-chat-session-id> --cookie-file .\tabbit-cookie.txt --json
 ~~~
+
+`--chat-session-id` 是可选覆盖项，来自已登录浏览器页面或经审查的脱敏成功请求形状，用于真实 `/api/v1/chat/completion` 填充 `chat_session_id`；默认协议配置也可在发送前自动创建新的聊天会话。不要随机生成，也不要把真实值写入仓库、日志或公开文档。
 
 ### tabbit-pool accounts probe <id> [--read-only] [--json]
 
@@ -836,7 +882,7 @@ node bin/tabbit-pool.js accounts import-session --id acct_default --email user@e
 
 ### tabbit-pool readiness [--json]
 
-读取账号 store 和本地 protocol probe fixture，调用 `buildCalibrationReadinessSnapshot()` 输出四项 readiness：真实协议校准、Codex/Claude 端到端、工具 loop 决策和 403 fixture。工具 loop 决策来自 `TABBIT_POOL_TOOL_LOOP_MODE` / `config.compat.toolLoopMode`，只表达运行策略；`local_executes_tools` 仍需要 gateway 宿主注入 executor 才会执行工具，并会应用 `config.compat.localToolLoop` 的 allowlist、轮数、超时和截断策略。协议校准要求 session verify path 与 verifySession/sendMessage 成功 fixture。命令会对带 `ref` 的 fixture 摘要读取脱敏详情，以便识别 `result.error` 中的工具不支持和 403 证据；它不触发 Tabbit 网络，只帮助判断下一步该跑哪个 probe 或人工验收。
+读取账号 store 和本地 protocol probe fixture，调用 `buildCalibrationReadinessSnapshot()` 输出四项 readiness：真实协议校准、Codex/Claude 端到端、工具 loop 决策和 403 fixture。工具 loop 决策来自 `TABBIT_POOL_TOOL_LOOP_MODE` / `config.compat.toolLoopMode`，只表达运行策略；`local_executes_tools` 仍需要 gateway 宿主注入 executor 才会执行工具，并会应用 `config.compat.localToolLoop` 的 allowlist、轮数、超时和截断策略。协议校准要求 session verify path、verifySession/sendMessage 成功 fixture，以及真实 `/api/v1/chat/completion` 所需的 chat session context；该 context 可以由显式 id 或自动建会话 action 满足。命令会对带 `ref` 的 fixture 摘要读取脱敏详情，以便识别 `result.error` 中的工具不支持和 403 证据；它不触发 Tabbit 网络，只帮助判断下一步该跑哪个 probe 或人工验收。
 
 JSON 输出包含：
 
@@ -918,7 +964,7 @@ JSON 输出包含：
 }
 ~~~
 
-输出不会包含 API key、cookie、session、token、`cookieJarRef`、`TABBIT_POOL_PROTOCOL_REQ_CTX` 或 raw fixture payload。它用于把“默认状态目录 blocked”拆解成可执行下一步，或确认外部脱敏 evidence state 是否已满足 readiness/audit。`remainingWork:[]` 只代表基础 gateway/chat gate 没有剩余阻塞；`manualCookieMode.missing` 和 `manualCookieMode.blockingMissing` 只代表当前手动 cookie 发布阻塞项，plain `manual_cookie_mode` 行对应 `release_blocking_missing=<csv>`；`manualCookieMode.backlogMissing` 和 plain `backlog_missing=<csv>` 代表后续增强，`automated_session_refresh_strategy` 可继续出现在这里但不阻塞当前 manual-cookie 发布。若 `calibrationBacklog.status:"blocked"`，注册/登录、M05 副作用、session lifecycle 或真实上游 stream boundary 真实校准仍需继续补 evidence。非 JSON 输出除 backlog 计数外，也会为缺口打印 `capture_command` 行；这些行只包含 `<account-id>` / `<redacted-input.json>` 占位符、固定 reason，以及 template/validate/confirm_validate/probe 四段命令。JSON `captureCommands[*].confirmedValidateCommand` 只对已校准 side-effect operation 有值，等价于 `probe validate --require-confirmed-side-effect`；read-only operation 和 offline-only evidence 缺口为 `null`。所有 sendMessage capture command 会额外带 `requiresReviewedInput:true` 与 `reviewRequirement:"replace_redacted_message_content"`；plain 行对应 `review=replace_redacted_message_content`，表示必须替换 `<redacted-message-content>` 后才能运行真实 `probe protocol`。`validateCommand` 只运行本地 schema 与形状预检，`confirmedValidateCommand` 只离线确认 `confirmSideEffect:true`；二者都不读取账号/secret、不触网、不证明真实 endpoint/body 已校准。真实副作用 probe 仍需先人工审查 input file 与 `confirmSideEffect`。真实用券消耗缺口现在给出 `useResetCoupon` template/validate/confirm_validate/probe 命令，并要求 `TABBIT_POOL_PROTOCOL_BENEFIT_COUPON_USE_PATH` 前置配置；离线 `consumeResetCoupon` 模板仅保留给外部脱敏 evidence 导入。session scope 的当前恢复策略是 `manual_reimport_then_probe`，自动刷新路径仍为 `not_calibrated`；`automated_session_refresh_strategy` 只给出离线 `recoverSession` template/validate 命令且 `probeCommand:null`，不代表刷新 endpoint 已校准。upstream scope 只统计显式真实上游 evidence marker，不把本地 HTTP/compat/fake stream 测试当作真实上游校准。
+输出不会包含 API key、cookie、session、token、`cookieJarRef`、`TABBIT_POOL_PROTOCOL_REQ_CTX`、`TABBIT_POOL_PROTOCOL_CHAT_SESSION_ID` 或 raw fixture payload。它用于把“默认状态目录 blocked”拆解成可执行下一步，或确认外部脱敏 evidence state 是否已满足 readiness/audit。`remainingWork:[]` 只代表基础 gateway/chat gate 没有剩余阻塞；若 `remainingWork` 含 `chat_session_context`，表示登录 cookie 和历史 fixture 可能可用，但当前真实 chat completion 缺少可用聊天会话上下文，需要检查 `chatSessionContext.defaultConfigured`、`activeAccountsWithChatSession` 和 `autoCreateConfigured`，再决定是导入/设置显式 ID 还是恢复自动建会话 action 配置。`manualCookieMode.missing` 和 `manualCookieMode.blockingMissing` 只代表当前手动 cookie 发布阻塞项，plain `manual_cookie_mode` 行对应 `release_blocking_missing=<csv>`；`manualCookieMode.backlogMissing` 和 plain `backlog_missing=<csv>` 代表后续增强，`automated_session_refresh_strategy` 可继续出现在这里但不阻塞当前 manual-cookie 发布。若 `calibrationBacklog.status:"blocked"`，注册/登录、M05 副作用、session lifecycle 或真实上游 stream boundary 真实校准仍需继续补 evidence。非 JSON 输出除 backlog 计数外，也会为缺口打印 `capture_command` 行；这些行只包含 `<account-id>` / `<redacted-input.json>` 占位符、固定 reason，以及 template/validate/confirm_validate/probe 四段命令。JSON `captureCommands[*].confirmedValidateCommand` 只对已校准 side-effect operation 有值，等价于 `probe validate --require-confirmed-side-effect`；read-only operation 和 offline-only evidence 缺口为 `null`。所有 sendMessage capture command 会额外带 `requiresReviewedInput:true` 与 `reviewRequirement:"replace_redacted_message_content"`；plain 行对应 `review=replace_redacted_message_content`，表示必须替换 `<redacted-message-content>` 后才能运行真实 `probe protocol`。`validateCommand` 只运行本地 schema 与形状预检，`confirmedValidateCommand` 只离线确认 `confirmSideEffect:true`；二者都不读取账号/secret、不触网、不证明真实 endpoint/body 已校准。真实副作用 probe 仍需先人工审查 input file 与 `confirmSideEffect`。真实用券消耗缺口现在给出 `useResetCoupon` template/validate/confirm_validate/probe 命令，并要求 `TABBIT_POOL_PROTOCOL_BENEFIT_COUPON_USE_PATH` 前置配置；离线 `consumeResetCoupon` 模板仅保留给外部脱敏 evidence 导入。session scope 的当前恢复策略是 `manual_reimport_then_probe`，自动刷新路径仍为 `not_calibrated`；`automated_session_refresh_strategy` 只给出离线 `recoverSession` template/validate 命令且 `probeCommand:null`，不代表刷新 endpoint 已校准。upstream scope 只统计显式真实上游 evidence marker，不把本地 HTTP/compat/fake stream 测试当作真实上游校准。
 
 ### tabbit-pool production preflight [--json]
 

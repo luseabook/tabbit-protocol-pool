@@ -401,6 +401,9 @@ export class AccountProvisioner {
       status: "active",
       userId: input.userId || null,
       accessTier: input.accessTier || "unknown",
+      ...(typeof input.chatSessionId === "string" && input.chatSessionId.trim()
+        ? { chatSessionId: input.chatSessionId.trim() }
+        : {}),
       importedAt: this.nowIso(),
     });
     const cookieJarRef = this.secretRefFor(baseAccount, input);

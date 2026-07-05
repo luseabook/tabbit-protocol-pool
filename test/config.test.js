@@ -32,6 +32,10 @@ test("loadConfig returns safe local defaults", () => {
   assert.equal(config.apiKey, "sk-tabbit-local");
   assert.equal(config.protocolFixtureDir, null);
   assert.equal(config.yydsMailApiKey, null);
+  assert.deepEqual(config.admin, {
+    username: null,
+    password: null,
+  });
   assert.equal(config.mail.enabled, false);
   assert.deepEqual(config.compat, {
     stripClientTools: false,
@@ -45,6 +49,7 @@ test("loadConfig returns safe local defaults", () => {
   });
   assert.deepEqual(config.protocol, {
     enabled: false,
+    fetchTransport: "node",
     baseUrl: null,
     signKeyPath: null,
     modelCatalogPath: null,
@@ -76,6 +81,9 @@ test("loadConfig returns safe local defaults", () => {
     sessionVerifyMethod: "GET",
     reqCtx: null,
     defaultChatSessionId: null,
+    chatSessionCreatePath: null,
+    chatSessionCreateActionId: null,
+    chatSessionAutoCreate: false,
   });
   assert.match(config.stateDir, /tabbit-protocol-pool$/);
 });
@@ -94,6 +102,10 @@ test("loadConfig protocol enabled uses calibrated Tabbit defaults", () => {
   assert.equal(config.protocol.sessionVerifyPath, "/api/v0/user/base-info");
   assert.equal(config.protocol.sessionVerifyMethod, "GET");
   assert.equal(config.protocol.reqCtx, "MS4zLjI2KDEwMTAzMDI2KQ==");
+  assert.equal(config.protocol.chatSessionCreatePath, "/newtab");
+  assert.equal(config.protocol.chatSessionCreateActionId, "00b19386a3892f62370bef2ffacfbd5b58580fcb2a");
+  assert.equal(config.protocol.chatSessionAutoCreate, true);
+  assert.equal(config.protocol.fetchTransport, "node");
 });
 
 test("loadConfig adopts a complete external production state by default", () => {
@@ -124,6 +136,8 @@ test("loadConfig adopts a complete external production state by default", () => 
   assert.equal(config.protocol.baseUrl, "https://web.tabbit.ai");
   assert.equal(config.protocol.sendPath, "/api/v1/chat/completion");
   assert.equal(config.protocol.sessionVerifyPath, "/api/v0/user/base-info");
+  assert.equal(config.protocol.chatSessionCreatePath, "/newtab");
+  assert.equal(config.protocol.chatSessionAutoCreate, true);
 });
 
 test("loadConfig does not auto-discover legacy tabbit2api state by default", () => {
@@ -186,8 +200,11 @@ test("loadConfig applies environment overrides", () => {
     TABBIT_POOL_STATE_DIR: "E:/tmp/tabbit-pool",
     TABBIT_POOL_PROTOCOL_FIXTURE_DIR: "E:/tmp/tabbit-fixtures",
     TABBIT_POOL_RETRY_LIMIT: "3",
+    TABBIT_POOL_ADMIN_USERNAME: "admin",
+    TABBIT_POOL_ADMIN_PASSWORD: "page-password",
     YYDS_MAIL_API_KEY: "AC-test-key",
     TABBIT_POOL_PROTOCOL_ENABLED: "true",
+    TABBIT_POOL_PROTOCOL_FETCH_TRANSPORT: "powershell",
     TABBIT_POOL_PROTOCOL_BASE_URL: "https://fixture.tabbit.test",
     TABBIT_POOL_PROTOCOL_SIGN_KEY_PATH: "/fixture/sign-key",
     TABBIT_POOL_PROTOCOL_MODEL_CATALOG_PATH: "/fixture/models",
@@ -219,6 +236,9 @@ test("loadConfig applies environment overrides", () => {
     TABBIT_POOL_PROTOCOL_SESSION_VERIFY_METHOD: "post",
     TABBIT_POOL_PROTOCOL_REQ_CTX: "fixture-req-ctx",
     TABBIT_POOL_PROTOCOL_CHAT_SESSION_ID: "fixture-chat-session",
+    TABBIT_POOL_PROTOCOL_CHAT_SESSION_CREATE_PATH: "/fixture/newtab",
+    TABBIT_POOL_PROTOCOL_CHAT_SESSION_CREATE_ACTION_ID: "fixture-action-id",
+    TABBIT_POOL_PROTOCOL_CHAT_SESSION_AUTO_CREATE: "false",
     TABBIT_POOL_COMPAT_STRIP_CLIENT_TOOLS: "true",
     TABBIT_POOL_TOOL_LOOP_MODE: "disabled",
   }, { platform: "win32" });
@@ -230,6 +250,10 @@ test("loadConfig applies environment overrides", () => {
   assert.equal(config.protocolFixtureDir, "E:/tmp/tabbit-fixtures");
   assert.equal(config.retryLimit, 3);
   assert.equal(config.yydsMailApiKey, "AC-test-key");
+  assert.deepEqual(config.admin, {
+    username: "admin",
+    password: "page-password",
+  });
   assert.equal(config.mail.enabled, true);
   assert.deepEqual(config.compat, {
     stripClientTools: true,
@@ -243,6 +267,7 @@ test("loadConfig applies environment overrides", () => {
   });
   assert.deepEqual(config.protocol, {
     enabled: true,
+    fetchTransport: "powershell",
     baseUrl: "https://fixture.tabbit.test",
     signKeyPath: "/fixture/sign-key",
     modelCatalogPath: "/fixture/models",
@@ -274,6 +299,9 @@ test("loadConfig applies environment overrides", () => {
     sessionVerifyMethod: "POST",
     reqCtx: "fixture-req-ctx",
     defaultChatSessionId: "fixture-chat-session",
+    chatSessionCreatePath: "/fixture/newtab",
+    chatSessionCreateActionId: "fixture-action-id",
+    chatSessionAutoCreate: false,
   });
 });
 
@@ -302,6 +330,14 @@ test("loadConfig enables protocol wiring when an auth endpoint path is configure
 
 test("loadConfig rejects invalid protocol enabled flags", () => {
   assert.throws(() => loadConfig({ TABBIT_POOL_PROTOCOL_ENABLED: "maybe" }), /Invalid protocol enabled/);
+});
+
+test("loadConfig rejects invalid chat session auto-create flags", () => {
+  assert.throws(() => loadConfig({ TABBIT_POOL_PROTOCOL_CHAT_SESSION_AUTO_CREATE: "maybe" }), /Invalid chat session auto-create/);
+});
+
+test("loadConfig rejects unsupported protocol fetch transports", () => {
+  assert.throws(() => loadConfig({ TABBIT_POOL_PROTOCOL_FETCH_TRANSPORT: "browser" }), /Invalid protocol fetch transport/);
 });
 
 test("loadConfig rejects invalid compat strip client tools flags", () => {

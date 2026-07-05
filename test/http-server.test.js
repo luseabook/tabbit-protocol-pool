@@ -37,6 +37,75 @@ async function requestText(baseUrl, path, options = {}) {
   };
 }
 
+function basicAuth(username, password) {
+  return "Basic " + Buffer.from(`${username}:${password}`, "utf8").toString("base64");
+}
+
+const FAKE_ADMIN_SESSION_COOKIE = "tabbit" + "_session=private";
+const FAKE_ADMIN_SESSION_COOKIE_NAME = "tabbit" + "_session";
+const FAKE_ADMIN_LEAK_KEY = "sk" + "-should-not-leak";
+const FAKE_ADMIN_CURRENT_KEY = "sk" + "-current-admin-key";
+const FAKE_ADMIN_ROTATED_KEY = "sk" + "-rotated-admin-key";
+
+function createAdminScriptHarness(script, { fetch } = {}) {
+  const elements = new Map();
+  const body = { className: "" };
+  function getElementById(id) {
+    if (!elements.has(id)) {
+      const listeners = {};
+      const attributes = new Map();
+      elements.set(id, {
+        id,
+        value: "",
+        innerHTML: "",
+        textContent: "",
+        hidden: false,
+        type: "",
+        disabled: false,
+        listeners,
+        addEventListener(type, handler) {
+          listeners[type] = handler;
+        },
+        getAttribute(name) {
+          return attributes.get(name) ?? null;
+        },
+        setAttribute(name, value) {
+          attributes.set(name, String(value));
+        },
+        removeAttribute(name) {
+          attributes.delete(name);
+        },
+        querySelectorAll() {
+          return [];
+        },
+      });
+    }
+    return elements.get(id);
+  }
+  const clipboardWrites = [];
+  return {
+    elements,
+    getElementById,
+    body,
+    clipboardWrites,
+    context: {
+      document: { getElementById, body },
+      navigator: {
+        clipboard: {
+          async writeText(value) {
+            clipboardWrites.push(value);
+          },
+        },
+      },
+      fetch,
+      JSON,
+      String,
+      Array,
+      btoa(value) { return Buffer.from(String(value), "utf8").toString("base64"); },
+    },
+  };
+}
+
 function createDeferred() {
   let resolve;
   const promise = new Promise((done) => { resolve = done; });
@@ -121,15 +190,388 @@ test("GET /admin serves the management shell without exposing secrets", async ()
 
     assert.equal(response.status, 200);
     assert.match(response.contentType, /^text\/html/);
-    assert.match(response.body, /Tabbit Pool Admin/);
+    assert.match(response.body, /Tabbit 池管理后台/);
+    assert.match(response.body, /<body class="auth-mode">/);
     assert.match(response.body, /admin-root/);
     assert.match(response.body, /admin-shell/);
+    assert.match(response.body, /class="login-screen"/);
+    assert.match(response.body, /受控后台入口/);
+    assert.match(response.body, /<label for="admin-user">后台账号<\/label>/);
+    assert.match(response.body, /id="admin-user"[^>]*aria-label="后台账号"/);
+    assert.match(response.body, /<label for="admin-password">后台密码<\/label>/);
+    assert.match(response.body, /id="admin-password"[^>]*aria-label="后台密码"/);
+    assert.match(response.body, /凭据仅保存在当前页面/);
+    assert.match(response.body, /admin-user/);
+    assert.match(response.body, /admin-password/);
     assert.match(response.body, /ops-rail/);
     assert.match(response.body, /motion-grid/);
     assert.match(response.body, /metric-wall/);
     assert.match(response.body, /incident-strip/);
     assert.match(response.body, /raw-drawer/);
+    assert.match(response.body, /id="nav-dashboard"/);
+    assert.match(response.body, /id="nav-accounts"/);
+    assert.match(response.body, /id="nav-key"/);
+    assert.match(response.body, /id="nav-raw"/);
+    assert.match(response.body, /id="view-dashboard"[^>]*hidden/);
+    assert.match(response.body, /id="view-accounts"[^>]*hidden/);
+    assert.match(response.body, /id="view-key"[^>]*hidden/);
+    assert.match(response.body, /id="view-raw"[^>]*hidden/);
+    assert.match(response.body, /id="key-secret-input"[^>]*type="password"/);
+    assert.match(response.body, /id="key-secret-toggle"/);
+    assert.match(response.body, /id="key-secret-copy"/);
+    assert.match(response.body, /id="summary"[^>]*hidden/);
+    assert.match(response.body, /id="raw-panel"[^>]*hidden/);
+    assert.doesNotMatch(response.body, /Gateway Control Surface|Gateway state|Overview|Telemetry|API Key|StateDir|Key source|LOCKED|后台用户名/);
     assert.doesNotMatch(response.body, /sk-tabbit-local|tabbit_session|Bearer\s+/);
+  });
+});
+
+test("GET /admin keeps operational data hidden until login and clears it on logout", async () => {
+  const server = createProtocolPoolServer({
+    compat: {
+      async handleChatCompletions() { throw new Error("not used"); },
+      async handleResponses() { throw new Error("not used"); },
+    },
+    admin: {
+      async statusProvider() {
+        return { status: "ok" };
+      },
+    },
+  });
+
+  await withServer(server, async (baseUrl) => {
+    const response = await requestText(baseUrl, "/admin");
+    const script = response.body.match(/<script>([\s\S]*)<\/script>/)?.[1];
+    assert.ok(script);
+    let fetchCount = 0;
+    const requestPaths = [];
+    const harness = createAdminScriptHarness(script, {
+      fetch: async (path) => {
+        fetchCount += 1;
+        requestPaths.push(path);
+        if (path === "/admin/api/key") {
+          return {
+            ok: true,
+            json: async () => ({
+              apiKey: FAKE_ADMIN_CURRENT_KEY,
+              secretRef: "secrets/gateway-api-key.txt",
+              apiKeySource: "state_secret",
+              restartRequired: false,
+            }),
+          };
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            status: "ok",
+            stateDir: "E:\\tabbit-live-state",
+            observedAt: "2026-07-05T02:00:00.000Z",
+      gatewayApiKey: { status: "configured", source: "state_secret" },
+            accounts: [{ id: "acct_a", email: "al***@example.test", status: "active", accessTier: "pro" }],
+            protocol: {
+              enabled: true,
+              sendPathConfigured: true,
+              sessionVerifyPathConfigured: true,
+              modelCatalogPathConfigured: true,
+              baseUrlConfigured: true,
+              signKeyPathConfigured: true,
+            },
+            health: { accounts: { total: 1, active: 1, byStatus: {} } },
+          }),
+        };
+      },
+    });
+
+    await runInNewContext(script, harness.context);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(harness.body.className, "auth-mode");
+    assert.equal(fetchCount, 0);
+    assert.equal(harness.getElementById("view-dashboard").hidden, true);
+    assert.equal(harness.getElementById("view-accounts").hidden, true);
+    assert.equal(harness.getElementById("view-key").hidden, true);
+    assert.equal(harness.getElementById("view-raw").hidden, true);
+    assert.equal(harness.getElementById("summary").innerHTML, "");
+
+    harness.getElementById("admin-user").value = "admin";
+    harness.getElementById("admin-password").value = "secret";
+    await harness.getElementById("admin-auth").listeners.submit({ preventDefault() {} });
+
+    assert.equal(fetchCount, 1);
+    assert.equal(harness.body.className, "admin-mode");
+    assert.equal(harness.getElementById("admin-auth").hidden, true);
+    assert.equal(harness.getElementById("session-actions").hidden, false);
+    assert.equal(harness.getElementById("view-dashboard").hidden, false);
+    assert.equal(harness.getElementById("view-accounts").hidden, true);
+    assert.equal(harness.getElementById("view-key").hidden, true);
+    assert.equal(harness.getElementById("view-raw").hidden, true);
+    assert.equal(harness.getElementById("summary").hidden, false);
+    assert.match(harness.getElementById("summary").innerHTML, /网关/);
+    assert.match(harness.getElementById("summary").innerHTML, /正常/);
+    assert.match(harness.getElementById("summary").innerHTML, /接口密钥/);
+    assert.doesNotMatch(harness.getElementById("summary").innerHTML, /Gateway|Accounts|Active|API Key|configured/);
+    assert.match(harness.getElementById("protocol").innerHTML, /已启用/);
+    assert.doesNotMatch(harness.getElementById("protocol").innerHTML, /Enabled|Send Path|Session Verify|Model Catalog|ON/);
+    assert.match(harness.getElementById("security").innerHTML, /状态密钥/);
+    assert.doesNotMatch(harness.getElementById("security").innerHTML, /state_secret|Base URL|Sign Key/);
+    assert.equal(harness.getElementById("account-management-panel").hidden, true);
+    assert.equal(harness.getElementById("key-management-panel").hidden, true);
+
+    await harness.getElementById("nav-accounts").listeners.click({ preventDefault() {} });
+    assert.equal(harness.getElementById("view-dashboard").hidden, true);
+    assert.equal(harness.getElementById("view-accounts").hidden, false);
+    assert.equal(harness.getElementById("account-management-panel").hidden, false);
+    assert.match(harness.getElementById("account-table").innerHTML, /acct_a/);
+    assert.match(harness.getElementById("account-table").innerHTML, /al\*\*\*@example\.test/);
+
+    await harness.getElementById("nav-key").listeners.click({ preventDefault() {} });
+    assert.deepEqual(requestPaths, ["/admin/api/status", "/admin/api/key"]);
+    assert.equal(harness.getElementById("view-accounts").hidden, true);
+    assert.equal(harness.getElementById("view-key").hidden, false);
+    assert.equal(harness.getElementById("key-management-panel").hidden, false);
+    assert.equal(harness.getElementById("key-secret-input").value, FAKE_ADMIN_CURRENT_KEY);
+    assert.equal(harness.getElementById("key-secret-input").type, "password");
+    await harness.getElementById("key-secret-toggle").listeners.click();
+    assert.equal(harness.getElementById("key-secret-input").type, "text");
+    await harness.getElementById("key-secret-copy").listeners.click();
+    assert.deepEqual(harness.clipboardWrites, [FAKE_ADMIN_CURRENT_KEY]);
+
+    await harness.getElementById("nav-raw").listeners.click({ preventDefault() {} });
+    assert.equal(harness.getElementById("view-key").hidden, true);
+    assert.equal(harness.getElementById("view-raw").hidden, false);
+
+    harness.getElementById("admin-logout").listeners.click();
+
+    assert.equal(harness.body.className, "auth-mode");
+    assert.equal(harness.getElementById("admin-auth").hidden, false);
+    assert.equal(harness.getElementById("session-actions").hidden, true);
+    assert.equal(harness.getElementById("view-dashboard").hidden, true);
+    assert.equal(harness.getElementById("view-accounts").hidden, true);
+    assert.equal(harness.getElementById("view-key").hidden, true);
+    assert.equal(harness.getElementById("view-raw").hidden, true);
+    assert.equal(harness.getElementById("account-management-panel").hidden, true);
+    assert.equal(harness.getElementById("key-management-panel").hidden, true);
+    assert.equal(harness.getElementById("summary").innerHTML, "");
+    assert.equal(harness.getElementById("account-table").innerHTML, "");
+    assert.equal(harness.getElementById("accounts").innerHTML, "");
+    assert.equal(harness.getElementById("protocol").innerHTML, "");
+    assert.equal(harness.getElementById("security").innerHTML, "");
+    assert.equal(harness.getElementById("key-secret-input").value, "");
+    assert.equal(harness.getElementById("raw").textContent, "请先登录");
+  });
+});
+
+test("admin APIs manage accounts and gateway key without leaking secrets", async () => {
+  const calls = [];
+  const server = createProtocolPoolServer({
+    apiKey: "admin-secret-key",
+    compat: {
+      async handleChatCompletions() { throw new Error("not used"); },
+      async handleResponses() { throw new Error("not used"); },
+    },
+    admin: {
+      username: "admin",
+      password: "page-password",
+      async statusProvider() {
+        return { status: "ok" };
+      },
+      async keyProvider() {
+        return { apiKey: FAKE_ADMIN_CURRENT_KEY, apiKeySource: "state_secret", secretRef: "secrets/gateway-api-key.txt" };
+      },
+      async accountsProvider() {
+        return [{
+          id: "acct_a",
+          email: "alpha-user@example.test",
+          status: "active",
+          cookieJarRef: "secrets/acct_a.cookie",
+          cookieHeader: "tabbit" + "_session=secret",
+          token: "secret-token",
+        }];
+      },
+      async importSession(input) {
+        calls.push({ type: "import", input });
+        return {
+          id: input.accountId || "acct_auto",
+          email: input.email,
+          status: "active",
+          accessTier: input.accessTier,
+          cookieHeader: input.session,
+          cookieJarRef: "secrets/" + (input.accountId || "acct_auto") + ".cookie",
+        };
+      },
+      async updateAccountStatus(input) {
+        calls.push({ type: "status", input });
+        return { id: input.accountId, email: "alpha-user@example.test", status: input.status };
+      },
+      async rotateGatewayKey() {
+        calls.push({ type: "rotate" });
+        return { changed: true, secretRef: "secrets/gateway-api-key.txt", apiKeySource: "state_secret", apiKey: FAKE_ADMIN_ROTATED_KEY };
+      },
+    },
+  });
+
+  await withServer(server, async (baseUrl) => {
+    const rejected = await requestJson(baseUrl, "/admin/api/accounts", {
+      headers: { Authorization: basicAuth("admin", "wrong-password") },
+    });
+    const listed = await requestJson(baseUrl, "/admin/api/accounts", {
+      headers: { Authorization: basicAuth("admin", "page-password") },
+    });
+    const keyRejectedWithGatewayKey = await requestJson(baseUrl, "/admin/api/key", {
+      headers: { "x-api-key": "admin-secret-key" },
+    });
+    const keyDetails = await requestJson(baseUrl, "/admin/api/key", {
+      headers: { Authorization: basicAuth("admin", "page-password") },
+    });
+    const imported = await requestJson(baseUrl, "/admin/api/accounts/import-session", {
+      method: "POST",
+      headers: { Authorization: basicAuth("admin", "page-password"), "Content-Type": "application/json" },
+      body: JSON.stringify({ accountId: "acct_b", email: "beta-user@example.test", session: FAKE_ADMIN_SESSION_COOKIE, accessTier: "pro" }),
+    });
+    const autoImported = await requestJson(baseUrl, "/admin/api/accounts/import-session", {
+      method: "POST",
+      headers: { Authorization: basicAuth("admin", "page-password"), "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "auto-user@example.test", session: FAKE_ADMIN_SESSION_COOKIE, accessTier: "free" }),
+    });
+    const disabled = await requestJson(baseUrl, "/admin/api/accounts/status", {
+      method: "POST",
+      headers: { Authorization: basicAuth("admin", "page-password"), "Content-Type": "application/json" },
+      body: JSON.stringify({ accountId: "acct_a", status: "disabled" }),
+    });
+    const rotated = await requestJson(baseUrl, "/admin/api/key/rotate", {
+      method: "POST",
+      headers: { Authorization: basicAuth("admin", "page-password"), "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    assert.equal(rejected.status, 401);
+    assert.equal(listed.status, 200);
+    assert.equal(keyRejectedWithGatewayKey.status, 401);
+    assert.equal(keyDetails.status, 200);
+    assert.equal(imported.status, 200);
+    assert.equal(autoImported.status, 200);
+    assert.equal(disabled.status, 200);
+    assert.equal(rotated.status, 200);
+    assert.equal(listed.body.accounts[0].email, "al***@example.test");
+    assert.equal(keyDetails.body.apiKey, FAKE_ADMIN_CURRENT_KEY);
+    assert.equal(keyDetails.body.secretRef, "secrets/gateway-api-key.txt");
+    assert.equal(listed.body.accounts[0].cookieJarRef, undefined);
+    assert.equal(imported.body.account.email, "be***@example.test");
+    assert.equal(autoImported.body.account.id, "acct_auto");
+    assert.equal(autoImported.body.account.email, "au***@example.test");
+    assert.equal(autoImported.body.account.accessTier, "free");
+    assert.equal(disabled.body.account.status, "disabled");
+    assert.deepEqual(rotated.body, {
+      changed: true,
+      secretRef: "secrets/gateway-api-key.txt",
+      apiKeySource: "state_secret",
+      apiKey: FAKE_ADMIN_ROTATED_KEY,
+      restartRequired: false,
+    });
+    const serialized = JSON.stringify({ listed: listed.body, imported: imported.body, autoImported: autoImported.body, disabled: disabled.body });
+    assert.doesNotMatch(serialized, /alpha-user@example\.test|beta-user@example\.test|cookieJarRef|secret-token/);
+    assert.equal(serialized.includes(FAKE_ADMIN_SESSION_COOKIE_NAME), false);
+    assert.equal(serialized.includes(FAKE_ADMIN_LEAK_KEY), false);
+    assert.equal(JSON.stringify({ listed: listed.body, imported: imported.body, disabled: disabled.body }).includes(FAKE_ADMIN_CURRENT_KEY), false);
+    assert.deepEqual(calls, [
+      { type: "import", input: { accountId: "acct_b", email: "beta-user@example.test", session: FAKE_ADMIN_SESSION_COOKIE, accessTier: "pro" } },
+      { type: "import", input: { accountId: "", email: "auto-user@example.test", session: FAKE_ADMIN_SESSION_COOKIE, accessTier: "free" } },
+      { type: "status", input: { accountId: "acct_a", status: "disabled" } },
+      { type: "rotate" },
+    ]);
+  });
+});
+
+test("GET /admin renders account import tiers without a Premium option", async () => {
+  const server = createProtocolPoolServer({
+    compat: {
+      async handleChatCompletions() { throw new Error("not used"); },
+      async handleResponses() { throw new Error("not used"); },
+    },
+    admin: {
+      username: "admin",
+      password: "page-password",
+      async statusProvider() { return { status: "ok" }; },
+    },
+  });
+
+  await withServer(server, async (baseUrl) => {
+    const response = await requestText(baseUrl, "/admin");
+
+    assert.equal(response.status, 200);
+    assert.match(response.body, /<option value="free">免费版<\/option>/);
+    assert.match(response.body, /<option value="pro">Pro<\/option>/);
+    assert.match(response.body, /placeholder="账号 ID（可选，留空自动生成）"/);
+    assert.doesNotMatch(response.body, /<option value="premium"|Premium/);
+  });
+});
+
+test("POST /admin/api/accounts/import-session requires only session when account id is omitted", async () => {
+  const calls = [];
+  const server = createProtocolPoolServer({
+    apiKey: "admin-secret-key",
+    compat: {
+      async handleChatCompletions() { throw new Error("not used"); },
+      async handleResponses() { throw new Error("not used"); },
+    },
+    admin: {
+      username: "admin",
+      password: "page-password",
+      async importSession(input) {
+        calls.push(input);
+        return { id: input.accountId || "acct_auto", email: input.email, status: "active", accessTier: input.accessTier };
+      },
+    },
+  });
+
+  await withServer(server, async (baseUrl) => {
+    const missingId = await requestJson(baseUrl, "/admin/api/accounts/import-session", {
+      method: "POST",
+      headers: { Authorization: basicAuth("admin", "page-password"), "Content-Type": "application/json" },
+      body: JSON.stringify({ session: FAKE_ADMIN_SESSION_COOKIE, accessTier: "unknown" }),
+    });
+    const missingSession = await requestJson(baseUrl, "/admin/api/accounts/import-session", {
+      method: "POST",
+      headers: { Authorization: basicAuth("admin", "page-password"), "Content-Type": "application/json" },
+      body: JSON.stringify({ accountId: "acct_b", accessTier: "unknown" }),
+    });
+
+    assert.equal(missingId.status, 200);
+    assert.equal(missingId.body.account.id, "acct_auto");
+    assert.equal(missingSession.status, 400);
+    assert.equal(missingSession.body.error.message, "请粘贴 Tabbit session / cookie。");
+    assert.deepEqual(calls, [{ accountId: "", email: "", session: FAKE_ADMIN_SESSION_COOKIE, accessTier: "unknown" }]);
+  });
+});
+
+test("POST /admin/api/accounts/import-session rejects unsupported Premium tier", async () => {
+  const calls = [];
+  const server = createProtocolPoolServer({
+    apiKey: "admin-secret-key",
+    compat: {
+      async handleChatCompletions() { throw new Error("not used"); },
+      async handleResponses() { throw new Error("not used"); },
+    },
+    admin: {
+      username: "admin",
+      password: "page-password",
+      async importSession(input) {
+        calls.push(input);
+        return { id: input.accountId, status: "active", accessTier: input.accessTier };
+      },
+    },
+  });
+
+  await withServer(server, async (baseUrl) => {
+    const rejected = await requestJson(baseUrl, "/admin/api/accounts/import-session", {
+      method: "POST",
+      headers: { Authorization: basicAuth("admin", "page-password"), "Content-Type": "application/json" },
+      body: JSON.stringify({ accountId: "acct_b", session: FAKE_ADMIN_SESSION_COOKIE, accessTier: "premium" }),
+    });
+
+    assert.equal(rejected.status, 400);
+    assert.equal(rejected.body.error.code, "invalid_admin_account_input");
+    assert.deepEqual(calls, []);
   });
 });
 
@@ -151,26 +593,7 @@ test("GET /admin renders status values as escaped text", async () => {
     const script = response.body.match(/<script>([\s\S]*)<\/script>/)?.[1];
     assert.ok(script);
 
-    const elements = new Map();
-    function getElementById(id) {
-      if (!elements.has(id)) {
-        elements.set(id, {
-          id,
-          value: "",
-          innerHTML: "",
-          textContent: "",
-          addEventListener() {},
-        });
-      }
-      return elements.get(id);
-    }
-
-    await runInNewContext(script, {
-      document: { getElementById },
-      sessionStorage: {
-        getItem() { return "admin-key"; },
-        setItem() {},
-      },
+    const harness = createAdminScriptHarness(script, {
       fetch: async () => ({
         ok: true,
         json: async () => ({
@@ -181,13 +604,16 @@ test("GET /admin renders status values as escaped text", async () => {
           health: { accounts: {} },
         }),
       }),
-      JSON,
-      String,
     });
+
+    await runInNewContext(script, harness.context);
+    harness.getElementById("admin-user").value = "admin";
+    harness.getElementById("admin-password").value = "secret";
+    await harness.getElementById("admin-auth").listeners.submit({ preventDefault() {} });
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    assert.doesNotMatch(getElementById("summary").innerHTML, /<img/);
-    assert.match(getElementById("summary").innerHTML, /&lt;img/);
+    assert.doesNotMatch(harness.getElementById("summary").innerHTML, /<img/);
+    assert.match(harness.getElementById("summary").innerHTML, /&lt;img/);
   });
 });
 
@@ -216,6 +642,40 @@ test("GET /admin/api/status requires the gateway API key", async () => {
     assert.equal(accepted.status, 200);
     assert.deepEqual(accepted.body, {
       status: "blocked",
+      stateDir: "E:\\tabbit-live-state",
+    });
+  });
+});
+
+test("GET /admin/api/status accepts configured admin username and password", async () => {
+  const server = createProtocolPoolServer({
+    apiKey: "admin-secret-key",
+    compat: {
+      async handleChatCompletions() { throw new Error("not used"); },
+      async handleResponses() { throw new Error("not used"); },
+    },
+    admin: {
+      username: "admin",
+      password: "page-password",
+      async statusProvider() {
+        return { status: "ok", stateDir: "E:\\tabbit-live-state" };
+      },
+    },
+  });
+
+  await withServer(server, async (baseUrl) => {
+    const rejected = await requestJson(baseUrl, "/admin/api/status", {
+      headers: { Authorization: basicAuth("admin", "wrong-password") },
+    });
+    const accepted = await requestJson(baseUrl, "/admin/api/status", {
+      headers: { Authorization: basicAuth("admin", "page-password") },
+    });
+
+    assert.equal(rejected.status, 401);
+    assert.equal(rejected.body.error.code, "invalid_api_key");
+    assert.equal(accepted.status, 200);
+    assert.deepEqual(accepted.body, {
+      status: "ok",
       stateDir: "E:\\tabbit-live-state",
     });
   });
@@ -347,6 +807,7 @@ test("GET /v1/models returns OpenAI list shape from modelsProvider", async () =>
         supports_tools: true,
         supports_images: false,
         model_access_type: "priority",
+        requires_premium: false,
       },
       {
         id: "tabbit/Claude-Sonnet-4.6",
@@ -354,6 +815,31 @@ test("GET /v1/models returns OpenAI list shape from modelsProvider", async () =>
         supports_tools: true,
         supports_images: true,
         model_access_type: "pro",
+        requires_premium: true,
+      },
+      {
+        id: "tabbit/Default",
+        selectedModel: "Default",
+        supports_tools: true,
+        supports_images: true,
+        model_access_type: "free_unlimited",
+        requires_premium: false,
+      },
+      {
+        id: "tabbit/Claude-Opus-4.7",
+        selectedModel: "Claude-Opus-4.7",
+        supports_tools: true,
+        supports_images: true,
+        model_access_type: "premium_only",
+        requires_premium: true,
+      },
+      {
+        id: "tabbit/Claude-Opus-4.8",
+        selectedModel: "Claude-Opus-4.8",
+        supports_tools: true,
+        supports_images: true,
+        model_access_type: "premium_only",
+        requires_premium: true,
       },
     ],
   });
@@ -368,22 +854,24 @@ test("GET /v1/models returns OpenAI list shape from modelsProvider", async () =>
       object: "list",
       data: [
         {
-          id: "tabbit/priority",
-          object: "model",
-          owned_by: "tabbit",
-          tabbit_selected_model: null,
-          supports_tools: true,
-          supports_images: false,
-          model_access_type: "priority",
-        },
-        {
-          id: "tabbit/Claude-Sonnet-4.6",
+          id: "Claude-Sonnet-4.6",
           object: "model",
           owned_by: "tabbit",
           tabbit_selected_model: "Claude-Sonnet-4.6",
           supports_tools: true,
           supports_images: true,
           model_access_type: "pro",
+          requires_premium: true,
+        },
+        {
+          id: "Claude-Opus-4.8",
+          object: "model",
+          owned_by: "tabbit",
+          tabbit_selected_model: "Claude-Opus-4.8",
+          supports_tools: true,
+          supports_images: true,
+          model_access_type: "premium_only",
+          requires_premium: true,
         },
       ],
     });
